@@ -3,6 +3,7 @@ from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
 from db import Base
 
+
 class Message(Base):
     __tablename__ = "messages"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -13,6 +14,7 @@ class Message(Base):
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -34,3 +36,11 @@ class Task(Base):
     auto_created: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SystemEvent(Base):
+    """Small idempotency log for recurring jobs such as daily briefs."""
+    __tablename__ = "system_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

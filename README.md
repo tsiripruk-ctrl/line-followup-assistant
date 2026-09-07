@@ -1,44 +1,40 @@
-# LINE Follow-up Assistant v0.2
+# LINE Follow-up Assistant v0.3
 
-AI secretary for LINE group follow-up.
+AI เลขานุการติดตามงานจากกลุ่ม LINE แบบเงียบในกลุ่มและรายงานเจ้าของระบบทางแชตส่วนตัว
 
-## v0.2 features
-- Detect follow-up tasks from LINE group messages.
-- Quiet in the group when a task is created; privately acknowledge the owner.
-- Automatic reminders before/after due time.
-- Quiet hours (default 20:00-07:00 Asia/Bangkok).
-- Detect replies such as "กำลังทำ", "รอ supplier", "เรียบร้อยแล้ว" and update task status.
-- Stop reminders automatically when completed.
-- Owner private commands:
-  - `สรุปงานค้าง`
-  - `วันนี้มีอะไรต้องตาม`
-  - `งานเลยกำหนด`
-  - `งานที่ปิดแล้ว`
-  - `ปิด FU-xxxxxx-xxxx`
+## ความสามารถ v0.3
+- จับคำสั่งงานจากข้อความในกลุ่มและสร้าง FU Task อัตโนมัติ
+- แจ้งเจ้าของทางแชตส่วนตัวเมื่อรับงานใหม่
+- อ่านคำตอบในกลุ่มและเปลี่ยนสถานะ OPEN / IN_PROGRESS / WAITING / COMPLETED
+- เตือนก่อนกำหนดและตามซ้ำเมื่อเลยกำหนด
+- Escalation: เมื่อตามหลายครั้งแล้วยังไม่ปิด จะขอ ETA/สาเหตุและแจ้งเจ้าของส่วนตัว
+- Quiet hours ป้องกันการตามงานช่วงกลางคืน
+- Daily Brief อัตโนมัติ: เช้า 07:30 และเย็น 18:30 (ปรับได้จาก Environment)
+- คำสั่งส่วนตัว: งานค้าง / วันนี้ / พรุ่งนี้ / เลยกำหนด / รอข้อมูล / งานที่ปิดแล้ว / สรุปเช้า / สรุปเย็น / ปิด FU-...
+- `/jobs/*` endpoints สำหรับต่อ external cron ในกรณี host มีการ sleep
 
-## Render
-Build command:
+## Deploy บน Render
+Build Command:
+`pip install -r requirements.txt`
 
-```bash
-pip install -r requirements.txt
-```
+Start Command:
+`uvicorn main:app --host 0.0.0.0 --port $PORT`
 
-Start command:
+หลัง Deploy ตรวจ:
+`GET /health`
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port $PORT
-```
+ควรได้ version `0.3.0`
 
-Health check:
+## Environment ใหม่ที่แนะนำ
+ค่าหลักเดิมยังใช้เหมือน v0.2 และเพิ่ม/ปรับได้ดังนี้:
 
-`/health`
+- `ESCALATION_AFTER_REMINDERS=2`
+- `DAILY_BRIEF_ENABLED=true`
+- `MORNING_BRIEF_HOUR=7`
+- `MORNING_BRIEF_MINUTE=30`
+- `EVENING_BRIEF_HOUR=18`
+- `EVENING_BRIEF_MINUTE=30`
+- `CRON_SECRET=` (เว้นว่างได้ถ้ายังไม่ใช้ external cron)
 
-LINE webhook:
-
-`/webhook`
-
-## Important: background reminders on Render Free
-The in-process scheduler only runs while the web service is awake. A free/sleeping instance is suitable for testing, but it is not reliable for exact business reminders. For production, use an always-on instance or an external scheduled trigger/worker.
-
-## Environment variables
-Copy `.env.example` values into Render Environment. Never commit real secrets to GitHub.
+## หมายเหตุเรื่อง Render Free
+Scheduler ภายในทำงานเมื่อ Web Service กำลังรันอยู่ หากบริการ sleep การแจ้งเตือนอาจเลื่อนจน service ตื่นอีกครั้ง สำหรับใช้งานจริงแบบต้องตรงเวลา ให้ใช้ instance ที่ไม่ sleep หรือเรียก `/jobs/reminder` จาก scheduler ภายนอกโดยตั้ง `CRON_SECRET`.
