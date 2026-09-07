@@ -7,3 +7,5 @@ httpx==0.28.1
 openai>=1.100.0
 apscheduler==3.11.0
 python-dateutil==2.9.0.post0
+
+psycopg[binary]>=3.2,<4

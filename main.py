@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 import asyncio
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi import FastAPI, Request, HTTPException, Header, Query
 from sqlalchemy import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -18,7 +18,7 @@ from service import (
     event_exists, record_event
 )
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -26,22 +26,29 @@ scheduler = AsyncIOScheduler(timezone=settings.timezone)
 @app.on_event("startup")
 async def startup():
     Base.metadata.create_all(bind=engine)
-    scheduler.add_job(
-        reminder_scan, "interval", seconds=settings.reminder_check_seconds,
-        id="reminder_scan", replace_existing=True, max_instances=1, coalesce=True
-    )
-    if settings.daily_brief_enabled:
+    # If CRON_SECRET is configured, v0.3.1 uses /jobs/tick as the single
+    # authoritative reminder scheduler. This avoids duplicate sends when an
+    # internal timer and an external cron fire at nearly the same time.
+    if not settings.cron_secret:
         scheduler.add_job(
-            morning_brief,
-            CronTrigger(hour=settings.morning_brief_hour, minute=settings.morning_brief_minute, timezone=settings.timezone),
-            id="morning_brief", replace_existing=True, max_instances=1, coalesce=True,
+            reminder_scan, "interval", seconds=settings.reminder_check_seconds,
+            id="reminder_scan", replace_existing=True, max_instances=1, coalesce=True
         )
-        scheduler.add_job(
-            evening_brief,
-            CronTrigger(hour=settings.evening_brief_hour, minute=settings.evening_brief_minute, timezone=settings.timezone),
-            id="evening_brief", replace_existing=True, max_instances=1, coalesce=True,
-        )
-    scheduler.start()
+        if settings.daily_brief_enabled:
+            scheduler.add_job(
+                morning_brief,
+                CronTrigger(hour=settings.morning_brief_hour, minute=settings.morning_brief_minute, timezone=settings.timezone),
+                id="morning_brief", replace_existing=True, max_instances=1, coalesce=True,
+            )
+            scheduler.add_job(
+                evening_brief,
+                CronTrigger(hour=settings.evening_brief_hour, minute=settings.evening_brief_minute, timezone=settings.timezone),
+                id="evening_brief", replace_existing=True, max_instances=1, coalesce=True,
+            )
+        scheduler.start()
+        print("scheduler mode: internal fallback")
+    else:
+        print("scheduler mode: external /jobs/tick")
     print(f"LINE Follow-up Assistant v{VERSION} started")
 
 
@@ -63,11 +70,36 @@ def _require_cron_secret(secret: str | None):
         raise HTTPException(status_code=401, detail="Invalid cron secret")
 
 
+@app.get("/jobs/tick")
+@app.post("/jobs/tick")
+async def external_tick(
+    x_cron_secret: str | None = Header(default=None),
+    secret: str | None = Query(default=None),
+):
+    """Reliable scheduler entrypoint. Call every 5 minutes from an external cron.
+
+    Header X-Cron-Secret is preferred. Query ?secret= is supported only for
+    schedulers that cannot send custom headers.
+    """
+    _require_cron_secret(x_cron_secret or secret)
+    reminder_stats = await reminder_scan(force=False)
+    brief_stats = await catch_up_daily_briefs()
+    return {
+        "ok": True,
+        "job": "tick",
+        "local_time": datetime.now(ZoneInfo(settings.timezone)).isoformat(),
+        "quiet_hours": in_quiet_hours(),
+        "reminders": reminder_stats,
+        "briefs": brief_stats,
+    }
+
+
 @app.post("/jobs/reminder")
 async def external_reminder(x_cron_secret: str | None = Header(default=None)):
     _require_cron_secret(x_cron_secret)
-    await reminder_scan(force=True)
-    return {"ok": True, "job": "reminder"}
+    # External reminder calls MUST respect quiet hours.
+    stats = await reminder_scan(force=False)
+    return {"ok": True, "job": "reminder", "stats": stats}
 
 
 @app.post("/jobs/morning-brief")
@@ -82,6 +114,46 @@ async def external_evening_brief(x_cron_secret: str | None = Header(default=None
     _require_cron_secret(x_cron_secret)
     await evening_brief()
     return {"ok": True, "job": "evening-brief"}
+
+
+@app.get("/jobs/test")
+@app.post("/jobs/test")
+async def external_job_test(
+    x_cron_secret: str | None = Header(default=None),
+    secret: str | None = Query(default=None),
+):
+    _require_cron_secret(x_cron_secret or secret)
+    if not settings.owner_line_user_id:
+        raise HTTPException(status_code=400, detail="OWNER_LINE_USER_ID not configured")
+    local = datetime.now(ZoneInfo(settings.timezone))
+    await push_text(
+        settings.owner_line_user_id,
+        f"ทดสอบ Reliable Reminder สำเร็จครับ\nเวลา: {local.strftime('%d/%m/%Y %H:%M:%S')}\nเวอร์ชัน: {VERSION}"
+    )
+    return {"ok": True, "job": "test", "local_time": local.isoformat()}
+
+
+@app.get("/jobs/status")
+async def external_job_status(
+    x_cron_secret: str | None = Header(default=None),
+    secret: str | None = Query(default=None),
+):
+    _require_cron_secret(x_cron_secret or secret)
+    now = datetime.utcnow()
+    with SessionLocal() as db:
+        due = list(db.scalars(select(Task).where(
+            Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
+            Task.next_reminder_at != None,
+            Task.next_reminder_at <= now,
+        ).order_by(Task.next_reminder_at.asc()).limit(20)).all())
+    return {
+        "ok": True,
+        "version": VERSION,
+        "local_time": datetime.now(ZoneInfo(settings.timezone)).isoformat(),
+        "quiet_hours": in_quiet_hours(),
+        "due_reminder_count": len(due),
+        "due_tasks": [t.task_code for t in due],
+    }
 
 
 @app.post("/webhook")
@@ -281,15 +353,29 @@ def in_quiet_hours() -> bool:
 
 
 async def reminder_scan(force: bool = False):
-    if not force and in_quiet_hours():
-        return
+    stats = {"due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0}
     now = datetime.utcnow()
+
+    # Do not lose a due reminder during quiet hours. It remains due and will be
+    # delivered by the first tick after quiet hours end.
+    if not force and in_quiet_hours():
+        with SessionLocal() as db:
+            stats["due"] = db.query(Task).filter(
+                Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
+                Task.next_reminder_at != None,
+                Task.next_reminder_at <= now,
+            ).count()
+        stats["skipped_quiet"] = stats["due"]
+        print("reminder scan skipped: quiet hours, due=", stats["due"] )
+        return stats
+
     with SessionLocal() as db:
         tasks = list(db.scalars(select(Task).where(
             Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
             Task.next_reminder_at != None,
             Task.next_reminder_at <= now,
         ).order_by(Task.next_reminder_at.asc())).all())
+        stats["due"] = len(tasks)
 
         for t in tasks:
             try:
@@ -333,6 +419,7 @@ async def reminder_scan(force: bool = False):
                 t.reminder_count += 1
                 t.last_reminded_at = now
                 db.commit()
+                stats["sent"] += 1
                 print("reminder sent:", t.task_code, t.status, "count=", t.reminder_count)
 
                 if settings.owner_escalation_alerts and settings.owner_line_user_id:
@@ -348,7 +435,47 @@ async def reminder_scan(force: bool = False):
                         )
             except Exception as exc:
                 db.rollback()
+                stats["failed"] += 1
                 print("reminder push failed:", t.task_code, repr(exc))
+
+    return stats
+
+
+async def catch_up_daily_briefs():
+    """Send today's brief after its scheduled time if it has not been sent yet.
+
+    This makes a 5-minute external tick reliable even when the Render service
+    was sleeping at the exact scheduled minute.
+    """
+    result = {"morning": False, "evening": False}
+    if not settings.daily_brief_enabled or not settings.owner_line_user_id:
+        return result
+
+    local = datetime.now(ZoneInfo(settings.timezone))
+    morning_at = local.replace(
+        hour=settings.morning_brief_hour, minute=settings.morning_brief_minute,
+        second=0, microsecond=0
+    )
+    evening_at = local.replace(
+        hour=settings.evening_brief_hour, minute=settings.evening_brief_minute,
+        second=0, microsecond=0
+    )
+
+    with SessionLocal() as db:
+        morning_key = f"daily-brief:morning:{local.strftime('%Y-%m-%d')}"
+        evening_key = f"daily-brief:evening:{local.strftime('%Y-%m-%d')}"
+        morning_needed = local >= morning_at and not event_exists(db, morning_key)
+        evening_needed = local >= evening_at and not event_exists(db, evening_key)
+
+    # Do not send a missed morning brief in the evening. Once evening time has
+    # arrived, the evening brief is the useful catch-up summary for the owner.
+    if local < evening_at and morning_needed:
+        await morning_brief()
+        result["morning"] = True
+    if evening_needed:
+        await evening_brief()
+        result["evening"] = True
+    return result
 
 
 async def morning_brief():

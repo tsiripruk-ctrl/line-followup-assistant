@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     evening_brief_hour: int = 18
     evening_brief_minute: int = 30
 
-    # Optional secret for external cron/uptime service calls.
+    # Secret for external cron calls. v0.3.1 recommends calling /jobs/tick every 5 minutes.
     # When set, /jobs/* endpoints require header X-Cron-Secret.
     cron_secret: str = ""
 
