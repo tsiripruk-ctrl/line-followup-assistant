@@ -53,6 +53,11 @@ async def process_message(event: dict):
         db.add(Message(line_message_id=msg["id"], source_type=source_type, source_id=group_id, user_id=user_id, display_name=display_name, text=text))
         db.commit()
 
+    # ช่วงตั้งค่าครั้งแรก: ถ้ายังใช้ OWNER_LINE_USER_ID=TEMP ให้ตอบ LINE User ID กลับในแชตส่วนตัว
+    if source_type == "user" and settings.owner_line_user_id.strip().upper() == "TEMP":
+        await push_text(user_id, f"เชื่อมต่อสำเร็จครับ\nLINE User ID ของคุณคือ:\n{user_id}\n\nให้นำค่านี้ไปใส่ใน Render ที่ OWNER_LINE_USER_ID แล้ว Deploy ใหม่ครับ")
+        return
+
     # คำสั่งส่วนตัวของเจ้าของ: ไม่ส่งเข้ากลุ่ม
     if source_type == "user" and user_id == settings.owner_line_user_id:
         await handle_owner_command(user_id, text)
