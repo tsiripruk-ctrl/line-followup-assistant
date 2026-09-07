@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./followup.db"
     reminder_check_seconds: int = 60
     auto_create_confidence: float = 0.86
+    remind_before_due_hours: int = 3
+    reminder_repeat_hours: int = 4
+    quiet_hour_start: int = 20
+    quiet_hour_end: int = 7
+    owner_task_ack: bool = True
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()

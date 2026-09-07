@@ -6,22 +6,47 @@ from sqlalchemy.orm import Session
 from models import Task
 from config import settings
 
-THAI_OPEN = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
+OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
+STATUS_THAI = {
+    "OPEN": "รอดำเนินการ",
+    "IN_PROGRESS": "กำลังดำเนินการ",
+    "WAITING": "รอข้อมูล/บุคคลอื่น",
+    "OVERDUE": "เลยกำหนด",
+    "COMPLETED": "เสร็จแล้ว",
+    "CANCELLED": "ยกเลิก",
+}
+
+def utcnow() -> datetime:
+    return datetime.utcnow()
+
+def local_now() -> datetime:
+    return datetime.now(ZoneInfo(settings.timezone))
 
 def task_code(task_id: int) -> str:
-    return f"FU-{datetime.now().strftime('%y%m%d')}-{task_id:04d}"
+    return f"FU-{local_now().strftime('%y%m%d')}-{task_id:04d}"
+
+def parse_due(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dtparser.isoparse(value)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        # AI is instructed to return timezone. If it does not, treat as Thailand/local setting.
+        return parsed.replace(tzinfo=ZoneInfo(settings.timezone)).astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+def first_reminder_at(due: datetime | None) -> datetime:
+    now = utcnow()
+    if not due:
+        return now + timedelta(days=1)
+    candidate = due - timedelta(hours=settings.remind_before_due_hours)
+    # If the task is already close to/past due, check shortly instead of scheduling in the past.
+    return max(candidate, now + timedelta(minutes=1))
 
 def create_task(db: Session, group_id: str, source_message_id: str, extraction) -> Task:
-    due = None
-    if extraction.due_at_iso:
-        try:
-            parsed = dtparser.isoparse(extraction.due_at_iso)
-            if parsed.tzinfo is not None:
-                due = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-            else:
-                due = parsed
-        except Exception:
-            pass
+    due = parse_due(extraction.due_at_iso)
     t = Task(
         task_code="TEMP",
         group_id=group_id,
@@ -32,20 +57,94 @@ def create_task(db: Session, group_id: str, source_message_id: str, extraction) 
         due_at=due,
         confidence=extraction.confidence,
         status="OPEN",
-        next_reminder_at=due - timedelta(hours=3) if due else datetime.utcnow() + timedelta(days=1),
+        next_reminder_at=first_reminder_at(due),
         auto_created=True,
     )
-    db.add(t); db.flush(); t.task_code = task_code(t.id); db.commit(); db.refresh(t)
+    db.add(t)
+    db.flush()
+    t.task_code = task_code(t.id)
+    db.commit()
+    db.refresh(t)
     return t
 
 def open_tasks(db: Session, group_id: str | None = None):
-    q = select(Task).where(Task.status.in_(THAI_OPEN)).order_by(Task.due_at.asc().nullslast(), Task.id.desc())
+    q = select(Task).where(Task.status.in_(OPEN_STATUSES)).order_by(Task.due_at.asc().nullslast(), Task.id.desc())
     if group_id:
         q = q.where(Task.group_id == group_id)
     return list(db.scalars(q).all())
 
+def completed_tasks(db: Session, limit: int = 10):
+    q = select(Task).where(Task.status == "COMPLETED").order_by(Task.updated_at.desc(), Task.id.desc()).limit(limit)
+    return list(db.scalars(q).all())
+
+def get_task_by_code(db: Session, code: str) -> Task | None:
+    return db.scalar(select(Task).where(Task.task_code == code.upper().strip()))
+
+def tasks_due_today(db: Session):
+    tz = ZoneInfo(settings.timezone)
+    now_local = datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+    q = select(Task).where(
+        Task.status.in_(OPEN_STATUSES),
+        Task.due_at >= start_utc,
+        Task.due_at < end_utc,
+    ).order_by(Task.due_at.asc())
+    return list(db.scalars(q).all())
+
+def overdue_tasks(db: Session):
+    now = utcnow()
+    q = select(Task).where(Task.status.in_(OPEN_STATUSES), Task.due_at != None, Task.due_at < now).order_by(Task.due_at.asc())
+    return list(db.scalars(q).all())
+
+def format_due_local(t: Task) -> str:
+    if not t.due_at:
+        return "ยังไม่ระบุ"
+    return t.due_at.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(settings.timezone)).strftime("%d/%m/%Y %H:%M")
+
 def format_task(t: Task) -> str:
-    due = (t.due_at.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(settings.timezone)).strftime("%d/%m/%Y %H:%M") if t.due_at else "ยังไม่ระบุ")
     who = t.assignee_name or "ยังไม่ระบุ"
     proj = f" | {t.project}" if t.project else ""
-    return f"{t.task_code} {t.title}{proj}\nผู้รับผิดชอบ: {who}\nกำหนด: {due}\nสถานะ: {t.status}"
+    status = STATUS_THAI.get(t.status, t.status)
+    return f"{t.task_code} {t.title}{proj}\nผู้รับผิดชอบ: {who}\nกำหนด: {format_due_local(t)}\nสถานะ: {status}"
+
+def normalize_name(value: str | None) -> str:
+    if not value:
+        return ""
+    x = value.strip().lower()
+    for prefix in ("คุณ", "พี่", "น้อง", "นาย", "นาง", "น.ส.", "นางสาว"):
+        if x.startswith(prefix):
+            x = x[len(prefix):].strip()
+    return "".join(x.split())
+
+def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None) -> Task | None:
+    if not tasks:
+        return None
+    sender = normalize_name(sender_name)
+    extracted_assignee = normalize_name(assignee_name)
+    hint_low = (hint or "").lower().strip()
+
+    # Prefer task assigned to the person who is actually replying.
+    if sender:
+        matches = [t for t in tasks if normalize_name(t.assignee_name) == sender]
+        if len(matches) == 1:
+            return matches[0]
+        if hint_low:
+            for t in matches:
+                if hint_low in t.title.lower() or t.title.lower() in hint_low:
+                    return t
+        if matches:
+            return matches[0]
+
+    if extracted_assignee:
+        for t in tasks:
+            if normalize_name(t.assignee_name) == extracted_assignee:
+                return t
+    if hint_low:
+        for t in tasks:
+            title = t.title.lower()
+            if hint_low in title or title in hint_low:
+                return t
+    return tasks[0]
