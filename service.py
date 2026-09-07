@@ -3,8 +3,8 @@ from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from .models import Task
-from .config import settings
+from models import Task
+from config import settings
 
 THAI_OPEN = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
 

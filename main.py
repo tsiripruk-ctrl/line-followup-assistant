@@ -3,12 +3,12 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from sqlalchemy import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from .db import Base, engine, SessionLocal
-from .models import Message, Task
-from .config import settings
-from .line_api import verify_signature, get_member_profile, push_text
-from .ai import extract_task
-from .service import create_task, open_tasks, format_task
+from db import Base, engine, SessionLocal
+from models import Message, Task
+from config import settings
+from line_api import verify_signature, get_member_profile, push_text
+from ai import extract_task
+from service import create_task, open_tasks, format_task
 
 app = FastAPI(title="LINE Follow-up Assistant", version="0.1.0")
 scheduler = AsyncIOScheduler(timezone=settings.timezone)

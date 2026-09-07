@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
-from .db import Base
+from db import Base
 
 class Message(Base):
     __tablename__ = "messages"

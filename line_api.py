@@ -1,6 +1,6 @@
 import base64, hashlib, hmac
 import httpx
-from .config import settings
+from config import settings
 
 LINE_API = "https://api.line.me/v2/bot"
 

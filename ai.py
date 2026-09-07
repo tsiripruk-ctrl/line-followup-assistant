@@ -3,7 +3,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 from openai import OpenAI
-from .config import settings
+from config import settings
 
 class TaskExtraction(BaseModel):
     is_task: bool
