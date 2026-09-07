@@ -18,7 +18,7 @@ from service import (
     event_exists, record_event
 )
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -83,7 +83,10 @@ async def external_tick(
     """
     _require_cron_secret(x_cron_secret or secret)
     reminder_stats = await reminder_scan(force=False)
-    brief_stats = await catch_up_daily_briefs()
+    if settings.brief_catchup_on_tick:
+        brief_stats = await catch_up_daily_briefs()
+    else:
+        brief_stats = {"morning": False, "evening": False, "mode": "separate-brief-jobs"}
     return {
         "ok": True,
         "job": "tick",
@@ -128,7 +131,10 @@ async def external_job_test(
     local = datetime.now(ZoneInfo(settings.timezone))
     await push_text(
         settings.owner_line_user_id,
-        f"ทดสอบ Reliable Reminder สำเร็จครับ\nเวลา: {local.strftime('%d/%m/%Y %H:%M:%S')}\nเวอร์ชัน: {VERSION}"
+        f"✅ TEST ONLY — Scheduler → Render → LINE สำเร็จครับ\n"
+        f"เวลาทดสอบ: {local.strftime('%d/%m/%Y %H:%M:%S')}\n"
+        f"เวอร์ชัน: {VERSION}\n\n"
+        "ข้อความนี้มาจาก /jobs/test เท่านั้น และจะไม่สั่ง Reminder หรือ Daily Brief ครับ"
     )
     return {"ok": True, "job": "test", "local_time": local.isoformat()}
 

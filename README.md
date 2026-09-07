@@ -1,8 +1,8 @@
-# LINE Follow-up Assistant v0.3.1
+# LINE Follow-up Assistant v0.3.2
 
 AI เลขานุการติดตามงานจากกลุ่ม LINE แบบเงียบในกลุ่มและรายงานเจ้าของระบบทางแชตส่วนตัว
 
-## ความสามารถ v0.3.1
+## ความสามารถ v0.3.2
 - จับคำสั่งงานจากข้อความในกลุ่มและสร้าง FU Task อัตโนมัติ
 - แจ้งเจ้าของทางแชตส่วนตัวเมื่อรับงานใหม่
 - อ่านคำตอบในกลุ่มและเปลี่ยนสถานะ OPEN / IN_PROGRESS / WAITING / COMPLETED
@@ -40,7 +40,7 @@ Start Command:
 Scheduler ภายในทำงานเมื่อ Web Service กำลังรันอยู่ หากบริการ sleep การแจ้งเตือนอาจเลื่อนจน service ตื่นอีกครั้ง สำหรับใช้งานจริงแบบต้องตรงเวลา ให้ใช้ instance ที่ไม่ sleep หรือเรียก `/jobs/reminder` จาก scheduler ภายนอกโดยตั้ง `CRON_SECRET`.
 
 
-## Reliable Reminder Engine (v0.3.1)
+## Reliable Reminder Engine (v0.3.2)
 
 เพื่อไม่ให้ Render Free sleep แล้วพลาดเวลาเตือน ให้ตั้ง `CRON_SECRET` ใน Render แล้วใช้ external scheduler เรียก:
 
@@ -60,7 +60,7 @@ Scheduler ภายในทำงานเมื่อ Web Service กำลั
 ตรวจสถานะ scheduler ได้ที่ `/jobs/status` โดยใช้ secret แบบเดียวกัน
 
 ### สำคัญเรื่องฐานข้อมูล
-SQLite บน Render Free เป็น filesystem ชั่วคราวและอาจสูญข้อมูลเมื่อ instance ถูกสร้างใหม่หรือ redeploy สำหรับใช้งานจริงควรตั้ง `DATABASE_URL` เป็น PostgreSQL ถาวร ระบบ v0.3.1 รองรับ PostgreSQL แล้ว (`postgresql://...`).
+SQLite บน Render Free เป็น filesystem ชั่วคราวและอาจสูญข้อมูลเมื่อ instance ถูกสร้างใหม่หรือ redeploy สำหรับใช้งานจริงควรตั้ง `DATABASE_URL` เป็น PostgreSQL ถาวร ระบบ v0.3.2 รองรับ PostgreSQL แล้ว (`postgresql://...`).
 
 
 ### ทดสอบหลัง Deploy
@@ -71,3 +71,18 @@ SQLite บน Render Free เป็น filesystem ชั่วคราวแล
 5. ตรวจ `/jobs/status` เพื่อดูจำนวน Task ที่ถึงเวลาเตือนและสถานะ Quiet Hours
 
 หมายเหตุ: `/jobs/tick` เคารพ Quiet Hours เสมอ งานที่ถึงกำหนดกลางคืนจะยังค้างเป็น due และส่งในการ tick แรกหลัง Quiet Hours จบ ไม่ถูกทิ้งหาย
+
+
+## v0.3.2: Test endpoint is isolated from real jobs
+
+`POST /jobs/test` now performs exactly one action: it sends a private LINE message to the owner confirming that Scheduler → Render → LINE connectivity works. It does **not** run reminders, morning brief, evening brief, or catch-up logic.
+
+By default, `POST /jobs/tick` now handles **reminders only**. Daily briefs should be scheduled separately so a 5-minute reminder tick cannot unexpectedly send an evening summary while you are testing.
+
+Recommended cron-job.org jobs (all `POST` and all use `X-Cron-Secret`):
+
+1. `/jobs/tick` — every 5 minutes.
+2. `/jobs/morning-brief` — daily at 07:30 Asia/Bangkok.
+3. `/jobs/evening-brief` — daily at 18:30 Asia/Bangkok.
+
+Optional compatibility setting: `BRIEF_CATCHUP_ON_TICK=true` restores the v0.3.1 behavior where `/jobs/tick` can catch up a missed daily brief. Leave it `false` for predictable production behavior.

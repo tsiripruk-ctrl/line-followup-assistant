@@ -35,8 +35,10 @@ class Settings(BaseSettings):
     morning_brief_minute: int = 30
     evening_brief_hour: int = 18
     evening_brief_minute: int = 30
+    # v0.3.2 default: /jobs/tick handles reminders only. Daily briefs use dedicated jobs.
+    brief_catchup_on_tick: bool = False
 
-    # Secret for external cron calls. v0.3.1 recommends calling /jobs/tick every 5 minutes.
+    # Secret for external cron calls. v0.3.2 recommends separate reminder/brief jobs.
     # When set, /jobs/* endpoints require header X-Cron-Secret.
     cron_secret: str = ""
 
