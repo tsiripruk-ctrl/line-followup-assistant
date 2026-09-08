@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import asyncio
+import os
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Query
 from sqlalchemy import select
@@ -61,19 +62,26 @@ def root():
 
 @app.get("/health")
 def health():
-    is_postgres = settings.database_url.startswith(
-        ("postgres://", "postgresql://", "postgresql+psycopg://")
-    )
-
+    raw_database_url = os.getenv("DATABASE_URL", "")
+    
     return {
         "ok": True,
         "service": "line-followup-assistant",
         "version": VERSION,
         "scheduler": "external" if settings.cron_secret else "internal",
         "dashboard": bool(settings.dashboard_token),
-        "database": "postgresql" if is_postgres else "sqlite",
+        "database_env_found": bool(raw_database_url),
+        "database_env_type": (
+            "postgresql"
+            if raw_database_url.startswith(("postgresql://", "postgresql+psycopg://", "postgres://"))
+            else "sqlite_or_missing"
+        ),
+        "settings_database_type": (
+            "postgresql"
+            if settings.database_url.startswith(("postgresql://", "postgresql+psycopg://", "postgres://"))
+            else "sqlite"
+        ),
     }
-
 
 def _require_cron_secret(secret: str | None):
     # When CRON_SECRET is blank, external job endpoints are disabled.
