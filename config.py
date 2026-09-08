@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # When set, /jobs/* endpoints require header X-Cron-Secret.
     cron_secret: str = ""
 
+    # v0.4 web dashboard (set a long random secret in Render)
+    dashboard_token: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

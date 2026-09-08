@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Query
 from sqlalchemy import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi.responses import HTMLResponse
+from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
 from db import Base, engine, SessionLocal
@@ -15,10 +17,10 @@ from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
     format_task, choose_status_target, STATUS_THAI, brief_counts,
-    event_exists, record_event
+    event_exists, record_event, search_open_tasks, task_stats
 )
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -59,7 +61,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "line-followup-assistant", "version": VERSION}
+    return {"ok": True, "service": "line-followup-assistant", "version": VERSION, "scheduler": "external" if settings.cron_secret else "internal", "dashboard": bool(settings.dashboard_token), "database": "postgresql" if settings.database_url.startswith(("postgres://", "postgresql://")) else "sqlite"}
 
 
 def _require_cron_secret(secret: str | None):
@@ -160,6 +162,167 @@ async def external_job_status(
         "due_reminder_count": len(due),
         "due_tasks": [t.task_code for t in due],
     }
+
+
+def _require_dashboard_token(token: str | None):
+    if not settings.dashboard_token:
+        raise HTTPException(status_code=404, detail="Dashboard disabled")
+    if token != settings.dashboard_token:
+        raise HTTPException(status_code=401, detail="Invalid dashboard token")
+
+
+def _task_dict(t: Task):
+    due_text = "ยังไม่ระบุ"
+    if t.due_at:
+        due_text = format_task(t).split("กำหนด: ", 1)[1].split("\n", 1)[0]
+    return {
+        "task_code": t.task_code,
+        "title": t.title,
+        "project": t.project,
+        "assignee_name": t.assignee_name,
+        "due": due_text,
+        "status": t.status,
+        "status_th": STATUS_THAI.get(t.status, t.status),
+        "reminder_count": t.reminder_count,
+    }
+
+
+@app.get("/api/stats")
+def api_stats(token: str | None = Query(default=None)):
+    _require_dashboard_token(token)
+    with SessionLocal() as db:
+        return {"ok": True, "version": VERSION, "stats": task_stats(db)}
+
+
+@app.get("/api/tasks")
+def api_tasks(
+    token: str | None = Query(default=None),
+    q: str = Query(default=""),
+    project: str = Query(default=""),
+    assignee: str = Query(default=""),
+    status: str = Query(default="ACTIVE"),
+):
+    _require_dashboard_token(token)
+    with SessionLocal() as db:
+        tasks = search_open_tasks(db, q, project, assignee, status)
+        return {"ok": True, "count": len(tasks), "tasks": [_task_dict(t) for t in tasks]}
+
+
+@app.post("/api/tasks/{task_code}/status")
+def api_task_status(
+    task_code: str,
+    status: str = Query(...),
+    token: str | None = Query(default=None),
+):
+    _require_dashboard_token(token)
+    new_status = status.upper().strip()
+    allowed = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE", "COMPLETED", "CANCELLED"}
+    if new_status not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    with SessionLocal() as db:
+        t = get_task_by_code(db, task_code)
+        if not t:
+            raise HTTPException(status_code=404, detail="Task not found")
+        t.status = new_status
+        if new_status in {"COMPLETED", "CANCELLED"}:
+            t.next_reminder_at = None
+        elif t.next_reminder_at is None:
+            t.next_reminder_at = datetime.utcnow() + timedelta(minutes=5)
+        db.commit()
+        db.refresh(t)
+        return {"ok": True, "task": _task_dict(t)}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(
+    token: str | None = Query(default=None),
+    q: str = Query(default=""),
+    project: str = Query(default=""),
+    assignee: str = Query(default=""),
+    status: str = Query(default="ACTIVE"),
+):
+    _require_dashboard_token(token)
+    with SessionLocal() as db:
+        stats = task_stats(db)
+        tasks = search_open_tasks(db, q, project, assignee, status)
+
+    cards = [
+        ("งานค้าง", stats["open"]),
+        ("ครบกำหนดวันนี้", stats["today"]),
+        ("เลยกำหนด", stats["overdue"]),
+        ("รอข้อมูล", stats["waiting"]),
+        ("ปิดวันนี้", stats["completed_today"]),
+        ("พรุ่งนี้", stats["tomorrow"]),
+    ]
+    card_html = "".join(
+        f'<div class="card"><b>{escape(label)}</b><span>{value}</span></div>'
+        for label, value in cards
+    )
+    rows = []
+    for t in tasks:
+        d = _task_dict(t)
+        code = escape(d["task_code"])
+        rows.append(
+            "<tr>"
+            f"<td><b>{code}</b><br><small>{escape(d['status_th'])}</small></td>"
+            f"<td>{escape(d['title'])}</td>"
+            f"<td>{escape(d['project'] or '-')}</td>"
+            f"<td>{escape(d['assignee_name'] or '-')}</td>"
+            f"<td>{escape(d['due'])}</td>"
+            f"<td>{d['reminder_count']}</td>"
+            f"<td><button onclick=\"setStatus('{code}','COMPLETED')\">ปิดงาน</button> "
+            f"<button class=\"secondary\" onclick=\"setStatus('{code}','WAITING')\">รอข้อมูล</button></td>"
+            "</tr>"
+        )
+    rows_html = "".join(rows) or '<tr><td colspan="7">ไม่มีรายการ</td></tr>'
+    safe_token = escape(token or "", quote=True)
+    selected = status.upper()
+    options = []
+    for value, label in [
+        ("ACTIVE", "งานค้าง"), ("OVERDUE", "เลยกำหนด"),
+        ("WAITING", "รอข้อมูล"), ("COMPLETED", "เสร็จแล้ว"),
+        ("CANCELLED", "ยกเลิก"),
+    ]:
+        sel = " selected" if selected == value else ""
+        options.append(f'<option value="{value}"{sel}>{label}</option>')
+    options_html = "".join(options)
+    token_js = repr(token or "")
+
+    return f"""<!doctype html>
+<html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LINE Follow-up Dashboard</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#f6f7f8;margin:0;color:#202124}}
+main{{max-width:1280px;margin:auto;padding:24px}} h1{{margin:0 0 4px}} .sub{{color:#666;margin-bottom:18px}}
+.cards{{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:18px}}
+.card{{background:white;border:1px solid #ddd;border-radius:12px;padding:14px}} .card span{{display:block;font-size:28px;margin-top:7px}}
+form{{background:white;padding:14px;border-radius:12px;border:1px solid #ddd;margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap}}
+input,select{{padding:9px;border:1px solid #bbb;border-radius:8px}} button{{padding:8px 10px;border:0;border-radius:8px;background:#1677ff;color:white;cursor:pointer}}
+button.secondary{{background:#6b7280}} table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden}}
+th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}} th{{background:#f0f2f5}} small{{color:#666}}
+@media(max-width:900px){{.cards{{grid-template-columns:repeat(2,1fr)}} table{{font-size:13px;display:block;overflow-x:auto}}}}
+</style></head>
+<body><main><h1>LINE Follow-up Assistant</h1><div class="sub">Command Center v{VERSION}</div>
+<div class="cards">{card_html}</div>
+<form method="get">
+<input type="hidden" name="token" value="{safe_token}">
+<input name="q" value="{escape(q, quote=True)}" placeholder="ค้นหางาน">
+<input name="project" value="{escape(project, quote=True)}" placeholder="โครงการ">
+<input name="assignee" value="{escape(assignee, quote=True)}" placeholder="ผู้รับผิดชอบ">
+<select name="status">{options_html}</select><button type="submit">ค้นหา</button>
+</form>
+<table><thead><tr><th>รหัส/สถานะ</th><th>งาน</th><th>โครงการ</th><th>ผู้รับผิดชอบ</th><th>กำหนด</th><th>ตามแล้ว</th><th>จัดการ</th></tr></thead>
+<tbody>{rows_html}</tbody></table>
+</main>
+<script>
+const token={token_js};
+async function setStatus(code,status){{
+  if(!confirm('ยืนยัน '+code+' → '+status+' ?')) return;
+  const u='/api/tasks/'+encodeURIComponent(code)+'/status?status='+encodeURIComponent(status)+'&token='+encodeURIComponent(token);
+  const r=await fetch(u,{{method:'POST'}});
+  if(r.ok) location.reload(); else alert(await r.text());
+}}
+</script></body></html>"""
 
 
 @app.post("/webhook")
@@ -285,6 +448,25 @@ async def handle_owner_command(user_id: str, text: str):
             await push_text(user_id, f"ปิดงาน {task.task_code} เรียบร้อยครับ\n{task.title}")
         return
 
+    if low.startswith("งานของ "):
+        name = raw.split(" ", 1)[1].strip()
+        with SessionLocal() as db:
+            tasks = search_open_tasks(db, assignee=name, status="ACTIVE")
+        await send_task_list(user_id, f"งานค้างของ {name}", tasks)
+        return
+    if low.startswith("โครงการ "):
+        project = raw.split(" ", 1)[1].strip()
+        with SessionLocal() as db:
+            tasks = search_open_tasks(db, project=project, status="ACTIVE")
+        await send_task_list(user_id, f"งานค้างโครงการ {project}", tasks)
+        return
+    if low.startswith("ค้นหา "):
+        query = raw.split(" ", 1)[1].strip()
+        with SessionLocal() as db:
+            tasks = search_open_tasks(db, query=query, status="ACTIVE")
+        await send_task_list(user_id, f"ผลค้นหา {query}", tasks)
+        return
+
     if "สรุปเช้า" in low or "brief เช้า" in low:
         await send_daily_brief(user_id, "morning", force=True)
         return
@@ -330,6 +512,9 @@ async def handle_owner_command(user_id: str, text: str):
         "• งานเลยกำหนด\n"
         "• งานรอข้อมูล\n"
         "• งานที่ปิดแล้ว\n"
+        "• งานของ ต้น\n"
+        "• โครงการ ปากน้ำประแส\n"
+        "• ค้นหา กล้อง\n"
         "• สรุปเช้า / สรุปเย็น\n"
         "• ปิด FU-xxxxxx-xxxx"
     )

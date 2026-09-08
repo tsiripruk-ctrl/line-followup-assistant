@@ -212,3 +212,26 @@ def brief_counts(db: Session) -> dict:
         "waiting": len(waiting_tasks(db)),
         "completed_today": len(completed_today(db)),
     }
+
+
+def search_open_tasks(db: Session, query: str = "", project: str = "", assignee: str = "", status: str = ""):
+    q = select(Task).order_by(Task.due_at.asc().nullslast(), Task.id.desc())
+    if status:
+        if status.upper() == "ACTIVE":
+            q = q.where(Task.status.in_(OPEN_STATUSES))
+        else:
+            q = q.where(Task.status == status.upper())
+    else:
+        q = q.where(Task.status.in_(OPEN_STATUSES))
+    if query:
+        term = f"%{query.strip()}%"
+        q = q.where((Task.title.ilike(term)) | (Task.project.ilike(term)) | (Task.assignee_name.ilike(term)))
+    if project:
+        q = q.where(Task.project.ilike(f"%{project.strip()}%"))
+    if assignee:
+        q = q.where(Task.assignee_name.ilike(f"%{assignee.strip()}%"))
+    return list(db.scalars(q.limit(200)).all())
+
+
+def task_stats(db: Session) -> dict:
+    return brief_counts(db)
