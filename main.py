@@ -61,7 +61,18 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "line-followup-assistant", "version": VERSION, "scheduler": "external" if settings.cron_secret else "internal", "dashboard": bool(settings.dashboard_token), "database": "postgresql" if settings.database_url.startswith(("postgres://", "postgresql://")) else "sqlite"}
+    is_postgres = settings.database_url.startswith(
+        ("postgres://", "postgresql://", "postgresql+psycopg://")
+    )
+
+    return {
+        "ok": True,
+        "service": "line-followup-assistant",
+        "version": VERSION,
+        "scheduler": "external" if settings.cron_secret else "internal",
+        "dashboard": bool(settings.dashboard_token),
+        "database": "postgresql" if is_postgres else "sqlite",
+    }
 
 
 def _require_cron_secret(secret: str | None):
