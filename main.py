@@ -22,7 +22,7 @@ from service import (
     task_timeline, backfill_task_created_events
 )
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -513,6 +513,15 @@ async def _process_message(event: dict):
                 target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
                 db.commit()
                 print("task comment recorded:", target.task_code)
+                if settings.owner_status_updates and settings.owner_line_user_id:
+                    await push_text(
+                        settings.owner_line_user_id,
+                        f"มีการตอบกลับงานแล้วค่ะ\n\n"
+                        f"{target.task_code} {target.title}\n"
+                        f"ผู้ตอบ: {canonical_sender or '-'}\n"
+                        f"ข้อความ: {text}\n\n"
+                        f"สถานะยังเป็น: {STATUS_THAI.get(target.status, target.status)}"
+                    )
                 return
 
     if extraction.is_task and extraction.confidence >= settings.auto_create_confidence:

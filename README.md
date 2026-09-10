@@ -153,3 +153,9 @@ Timeline ใหม่จะเก็บรายละเอียดเต็�
 พราวคะ ขออัปเดตเรื่องเช็กสถานะ LG ใหม่หน่อยค่ะ
 ถ้าเรียบร้อยแล้ว รบกวนแจ้งพี่ต้องด้วยนะคะ
 ```
+
+
+## v0.5.3 — Reply Awareness
+- AI judges task replies semantically, not only by keywords.
+- A final result such as “สถานะใช้ได้ปกติ” can close a status-check task.
+- Any related reply/comment now notifies the owner privately even when status is unchanged.
