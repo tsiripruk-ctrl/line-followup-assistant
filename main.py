@@ -22,7 +22,7 @@ from service import (
     task_timeline, backfill_task_created_events
 )
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -146,10 +146,10 @@ async def external_job_test(
     local = datetime.now(ZoneInfo(settings.timezone))
     await push_text(
         settings.owner_line_user_id,
-        f"✅ TEST ONLY — Scheduler → Render → LINE สำเร็จครับ\n"
+        f"✅ TEST ONLY — Scheduler → Render → LINE สำเร็จค่ะ\n"
         f"เวลาทดสอบ: {local.strftime('%d/%m/%Y %H:%M:%S')}\n"
         f"เวอร์ชัน: {VERSION}\n\n"
-        "ข้อความนี้มาจาก /jobs/test เท่านั้น และจะไม่สั่ง Reminder หรือ Daily Brief ครับ"
+        "ข้อความนี้มาจาก /jobs/test เท่านั้น และจะไม่สั่ง Reminder หรือ Daily Brief ค่ะ"
     )
     return {"ok": True, "job": "test", "local_time": local.isoformat()}
 
@@ -482,7 +482,7 @@ async def _process_message(event: dict):
         db.commit()
 
     if source_type == "user" and settings.owner_line_user_id.strip().upper() == "TEMP":
-        await push_text(user_id, f"เชื่อมต่อสำเร็จครับ\nLINE User ID ของคุณคือ:\n{user_id}\n\nให้นำค่านี้ไปใส่ใน Render ที่ OWNER_LINE_USER_ID แล้ว Deploy ใหม่ครับ")
+        await push_text(user_id, f"เชื่อมต่อสำเร็จค่ะ\nLINE User ID ของคุณคือ:\n{user_id}\n\nให้นำค่านี้ไปใส่ใน Render ที่ OWNER_LINE_USER_ID แล้ว Deploy ใหม่ค่ะ")
         return
 
     if source_type == "user" and user_id == settings.owner_line_user_id:
@@ -521,7 +521,7 @@ async def _process_message(event: dict):
             confirmation = format_task(task)
         print("task created:", task.task_code, task.title)
         if settings.owner_task_ack and settings.owner_line_user_id:
-            await push_text(settings.owner_line_user_id, "ผมรับเรื่องติดตามจากกลุ่มแล้วครับ\n\n" + confirmation)
+            await push_text(settings.owner_line_user_id, "รับเรื่องติดตามจากกลุ่มแล้วค่ะ\n\n" + confirmation)
 
 
 async def try_update_task_from_status(group_id: str, sender_name: str | None, extraction, text: str) -> str | None:
@@ -558,7 +558,7 @@ async def try_update_task_from_status(group_id: str, sender_name: str | None, ex
             return None
         status_th = STATUS_THAI.get(new_status, new_status)
         return (
-            f"อัปเดตงานจากบทสนทนาในกลุ่มแล้วครับ\n\n"
+            f"อัปเดตงานจากบทสนทนาในกลุ่มแล้วค่ะ\n\n"
             f"{target.task_code} {target.title}\n"
             f"ผู้ตอบ: {canonical_sender or '-'}\nสถานะใหม่: {status_th}"
         )
@@ -574,7 +574,7 @@ async def handle_owner_command(user_id: str, text: str):
         with SessionLocal() as db:
             task = get_task_by_code(db, code)
             if not task:
-                await push_text(user_id, f"ไม่พบงาน {code} ครับ")
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
                 return
             old_status = task.status
             task.status = "COMPLETED"
@@ -584,7 +584,7 @@ async def handle_owner_command(user_id: str, text: str):
                 text="ปิดงานจาก LINE ส่วนตัว", old_status=old_status, new_status="COMPLETED", commit=False,
             )
             db.commit()
-            await push_text(user_id, f"ปิดงาน {task.task_code} เรียบร้อยครับ\n{task.title}")
+            await push_text(user_id, f"ปิดงาน {task.task_code} เรียบร้อยค่ะ\n{task.title}")
         return
 
     if low.startswith("ประวัติ "):
@@ -592,7 +592,7 @@ async def handle_owner_command(user_id: str, text: str):
         with SessionLocal() as db:
             task = get_task_by_code(db, code)
             if not task:
-                await push_text(user_id, f"ไม่พบงาน {code} ครับ")
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
                 return
             events = task_timeline(db, task)
         lines = [f"ประวัติ {task.task_code} — {task.title}", ""]
@@ -612,7 +612,7 @@ async def handle_owner_command(user_id: str, text: str):
         alias_name, canonical_name = [x.strip() for x in body.split("=", 1)]
         with SessionLocal() as db:
             person, updated = set_person_alias(db, alias_name, canonical_name)
-        await push_text(user_id, f"ตั้งชื่อมาตรฐานแล้วครับ\n{alias_name} → {person.canonical_name}\nปรับงานเดิม {updated} รายการ")
+        await push_text(user_id, f"ตั้งชื่อมาตรฐานแล้วค่ะ\n{alias_name} → {person.canonical_name}\nปรับงานเดิม {updated} รายการ")
         return
 
     if low.startswith("งานของ "):
@@ -672,7 +672,7 @@ async def handle_owner_command(user_id: str, text: str):
         return
 
     await push_text(user_id,
-        "สั่งผมได้แบบนี้ครับ\n"
+        "สั่งได้แบบนี้ค่ะ\n"
         "• สรุปงานค้าง\n"
         "• วันนี้มีอะไรต้องตาม\n"
         "• พรุ่งนี้มีอะไรต้องตาม\n"
@@ -691,9 +691,9 @@ async def handle_owner_command(user_id: str, text: str):
 
 async def send_task_list(user_id: str, title: str, tasks: list[Task]):
     if not tasks:
-        await push_text(user_id, f"{title}: ไม่มีรายการครับ")
+        await push_text(user_id, f"{title}: ไม่มีรายการค่ะ")
         return
-    lines = [f"{title}ครับ", ""]
+    lines = [f"{title}ค่ะ", ""]
     for t in tasks[:15]:
         lines.append(format_task(t))
         lines.append("")
@@ -743,45 +743,46 @@ async def reminder_scan(force: bool = False):
                 if t.due_at and now > t.due_at:
                     t.status = "OVERDUE"
 
-                prefix = f"{t.assignee_name}ครับ " if t.assignee_name else "รบกวนทีมครับ "
+                assignee = t.assignee_name.strip() if t.assignee_name else "ทีม"
+                greeting = f"{assignee}คะ" if assignee != "ทีม" else "ทีมคะ"
                 is_pre_due = bool(t.due_at and now < t.due_at)
 
                 if is_pre_due:
                     due_text = format_due_local(t)
                     body = (
-                        f"{prefix}แจ้งเตือนเรื่อง ‘{t.title}’ ไว้ล่วงหน้าครับ "
-                        f"งานนี้กำหนด {due_text} ถ้าเรียบร้อยก่อนกำหนดแจ้งได้เลยครับ"
+                        f"{greeting} ขอแจ้งเตือนเรื่อง{t.title}ค่ะ\n"
+                        f"งานนี้กำหนด {due_text} ถ้าเรียบร้อยแล้วแจ้ง{settings.owner_display_name}ได้เลยนะคะ"
                     )
                     # After the advance reminder, the next check is the due time itself.
                     t.next_reminder_at = t.due_at
                 elif t.status == "OVERDUE":
                     if t.reminder_count >= settings.escalation_after_reminders:
                         body = (
-                            f"{prefix}ขออัปเดตเรื่อง ‘{t.title}’ อีกครั้งครับ "
-                            f"เรื่องนี้เลยกำหนดแล้ว หากยังติดปัญหา รบกวนแจ้งสาเหตุและวันที่คาดว่าจะเรียบร้อยให้{settings.owner_display_name}ทราบด้วยครับ"
+                            f"{greeting} ขออัปเดตเรื่อง{t.title}อีกครั้งค่ะ\n"
+                            f"ตอนนี้เลยกำหนดแล้ว หากยังติดปัญหาตรงไหน รบกวนแจ้งสาเหตุและวันที่คาดว่าจะเรียบร้อยให้{settings.owner_display_name}ทราบด้วยนะคะ"
                         )
                     else:
                         body = (
-                            f"{prefix}ขออัปเดตเรื่อง ‘{t.title}’ หน่อยครับ "
-                            f"เรื่องนี้เลยกำหนดแล้ว ถ้ายังติดอะไรอยู่แจ้งไว้ได้เลยครับ"
+                            f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                            f"ตอนนี้เลยกำหนดแล้ว หากยังติดอะไรอยู่แจ้ง{settings.owner_display_name}ไว้ได้เลยนะคะ"
                         )
                     t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
                 elif t.status == "WAITING":
                     body = (
-                        f"{prefix}ขออัปเดตเรื่อง ‘{t.title}’ หน่อยครับ "
-                        f"เรื่องที่รออยู่ตอนนี้มีความคืบหน้าเพิ่มเติมไหมครับ"
+                        f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                        f"เรื่องที่รออยู่มีความคืบหน้าเพิ่มเติมไหมคะ"
                     )
                     t.next_reminder_at = now + timedelta(hours=6)
                 elif t.status == "IN_PROGRESS":
                     body = (
-                        f"{prefix}ขออัปเดตความคืบหน้าเรื่อง ‘{t.title}’ ให้{settings.owner_display_name}หน่อยครับ "
-                        f"ถ้าเรียบร้อยแล้วแจ้งได้เลยครับ"
+                        f"{greeting} ขออัปเดตความคืบหน้าเรื่อง{t.title}หน่อยค่ะ\n"
+                        f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
                     )
                     t.next_reminder_at = now + timedelta(hours=6)
                 else:
                     body = (
-                        f"{prefix}ขออัปเดตเรื่อง ‘{t.title}’ ให้{settings.owner_display_name}หน่อยครับ "
-                        f"ถ้าเรียบร้อยแล้วแจ้งได้เลยครับ"
+                        f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                        f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
                     )
                     t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
 
@@ -804,12 +805,12 @@ async def reminder_scan(force: bool = False):
                     if became_overdue:
                         await push_text(
                             settings.owner_line_user_id,
-                            f"งานเลยกำหนดแล้วครับ\n\n{format_task(t)}"
+                            f"งานเลยกำหนดแล้วค่ะ\n\n{format_task(t)}"
                         )
                     elif t.status == "OVERDUE" and t.reminder_count >= settings.escalation_after_reminders:
                         await push_text(
                             settings.owner_line_user_id,
-                            f"งานนี้ตามแล้ว {t.reminder_count} ครั้งและยังไม่ปิดครับ\n\n{format_task(t)}"
+                            f"งานนี้ตามแล้ว {t.reminder_count} ครั้งและยังไม่ปิดค่ะ\n\n{format_task(t)}"
                         )
             except Exception as exc:
                 db.rollback()
