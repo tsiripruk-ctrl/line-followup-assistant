@@ -13,6 +13,7 @@ class TaskExtraction(BaseModel):
     assignee_name: str | None = None
     due_at_iso: str | None = None
     status_signal: Literal["none", "completed", "in_progress", "waiting"] = "none"
+    is_task_reply: bool = False
     related_task_hint: str | None = None
     reason: str = ""
 
@@ -23,6 +24,8 @@ SYSTEM = """คุณคือ AI เลขานุการติดตาม�
 ถ้าพบคำว่า เสร็จแล้ว/เรียบร้อย/ส่งแล้ว/ปิดงาน ให้ status_signal=completed
 ถ้าพบคำว่า กำลังทำ/กำลังเช็ก ให้ in_progress
 ถ้าพบคำว่า รอ supplier/รอข้อมูล/รออนุมัติ ให้ waiting
+ถ้าข้อความเป็นการตอบ/อัปเดต/ให้รายละเอียดต่อจากงานเดิม แม้ยังไม่เปลี่ยนสถานะ ให้ is_task_reply=true และใส่ related_task_hint เป็นหัวข้อสั้นๆ ที่ช่วยจับคู่งานเดิม
+ถ้าเป็นข้อความทั่วไปที่ไม่เกี่ยวกับงานเดิม ให้ is_task_reply=false
 ตีความวันเวลาโดยใช้ประเทศไทย Asia/Bangkok และคืน due_at_iso แบบ ISO 8601 พร้อม timezone เมื่อระบุได้
 ชื่อ title ต้องสั้น ชัดเจน และคงสาระจากข้อความต้นฉบับ
 """

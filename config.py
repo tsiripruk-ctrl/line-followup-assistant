@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Reminder policy
     reminder_check_seconds: int = 60
     remind_before_due_hours: int = 3
+    adaptive_short_notice_hours: int = 1
+    adaptive_medium_notice_hours: int = 3
+    adaptive_medium_lead_minutes: int = 30
     reminder_repeat_hours: int = 4
     escalation_after_reminders: int = 2
 

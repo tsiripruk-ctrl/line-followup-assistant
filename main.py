@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 import asyncio
-import os
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Query
 from sqlalchemy import select
@@ -18,10 +17,12 @@ from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
     format_task, choose_status_target, STATUS_THAI, brief_counts,
-    event_exists, record_event, search_open_tasks, task_stats
+    event_exists, record_event, search_open_tasks, task_stats,
+    resolve_canonical_name, set_person_alias, list_people, record_task_event,
+    task_timeline, backfill_task_created_events
 )
 
-VERSION = "0.4.0"
+VERSION = "0.5.1"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -29,6 +30,10 @@ scheduler = AsyncIOScheduler(timezone=settings.timezone)
 @app.on_event("startup")
 async def startup():
     Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        imported = backfill_task_created_events(db)
+        if imported:
+            print(f"v0.5 timeline backfill: {imported} tasks")
     # If CRON_SECRET is configured, v0.3.1 uses /jobs/tick as the single
     # authoritative reminder scheduler. This avoids duplicate sends when an
     # internal timer and an external cron fire at nearly the same time.
@@ -62,26 +67,15 @@ def root():
 
 @app.get("/health")
 def health():
-    raw_database_url = os.getenv("DATABASE_URL", "")
-    
+    dialect = engine.url.get_backend_name()
     return {
-        "ok": True,
-        "service": "line-followup-assistant",
-        "version": VERSION,
+        "ok": True, "service": "line-followup-assistant", "version": VERSION,
         "scheduler": "external" if settings.cron_secret else "internal",
         "dashboard": bool(settings.dashboard_token),
-        "database_env_found": bool(raw_database_url),
-        "database_env_type": (
-            "postgresql"
-            if raw_database_url.startswith(("postgresql://", "postgresql+psycopg://", "postgres://"))
-            else "sqlite_or_missing"
-        ),
-        "settings_database_type": (
-            "postgresql"
-            if settings.database_url.startswith(("postgresql://", "postgresql+psycopg://", "postgres://"))
-            else "sqlite"
-        ),
+        "database": "postgresql" if dialect == "postgresql" else dialect,
+        "timeline": True, "assignee_normalization": True,
     }
+
 
 def _require_cron_secret(secret: str | None):
     # When CRON_SECRET is blank, external job endpoints are disabled.
@@ -242,14 +236,64 @@ def api_task_status(
         t = get_task_by_code(db, task_code)
         if not t:
             raise HTTPException(status_code=404, detail="Task not found")
+        old_status = t.status
         t.status = new_status
         if new_status in {"COMPLETED", "CANCELLED"}:
             t.next_reminder_at = None
         elif t.next_reminder_at is None:
             t.next_reminder_at = datetime.utcnow() + timedelta(minutes=5)
+        record_task_event(
+            db, t, "DASHBOARD_STATUS_CHANGE", actor_name=settings.owner_display_name,
+            text=f"เปลี่ยนสถานะจาก Dashboard → {STATUS_THAI.get(new_status, new_status)}",
+            old_status=old_status, new_status=new_status, commit=False,
+        )
         db.commit()
         db.refresh(t)
         return {"ok": True, "task": _task_dict(t)}
+
+
+
+@app.get("/api/tasks/{task_code}/timeline")
+def api_task_timeline(task_code: str, token: str | None = Query(default=None)):
+    _require_dashboard_token(token)
+    with SessionLocal() as db:
+        task = get_task_by_code(db, task_code)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        events = task_timeline(db, task)
+        result = []
+        for ev in events:
+            local_time = ev.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
+            result.append({
+                "event_type": ev.event_type,
+                "actor_name": ev.actor_name or "System",
+                "text": ev.text or "",
+                "old_status": ev.old_status,
+                "new_status": ev.new_status,
+                "created_at": local_time.strftime("%d/%m/%Y %H:%M:%S"),
+            })
+        return {"ok": True, "task": _task_dict(task), "events": result}
+
+
+@app.get("/api/people")
+def api_people(token: str | None = Query(default=None)):
+    _require_dashboard_token(token)
+    with SessionLocal() as db:
+        return {"ok": True, "people": list_people(db)}
+
+
+@app.post("/api/people/alias")
+def api_people_alias(
+    alias: str = Query(...), canonical: str = Query(...),
+    token: str | None = Query(default=None),
+):
+    _require_dashboard_token(token)
+    try:
+        with SessionLocal() as db:
+            person, updated = set_person_alias(db, alias, canonical)
+            return {"ok": True, "canonical_name": person.canonical_name, "updated_tasks": updated}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -264,6 +308,7 @@ def dashboard(
     with SessionLocal() as db:
         stats = task_stats(db)
         tasks = search_open_tasks(db, q, project, assignee, status)
+        people = list_people(db)
 
     cards = [
         ("งานค้าง", stats["open"]),
@@ -289,7 +334,8 @@ def dashboard(
             f"<td>{escape(d['assignee_name'] or '-')}</td>"
             f"<td>{escape(d['due'])}</td>"
             f"<td>{d['reminder_count']}</td>"
-            f"<td><button onclick=\"setStatus('{code}','COMPLETED')\">ปิดงาน</button> "
+            f"<td><button onclick=\"showTimeline('{code}')\">ประวัติ</button> "
+            f"<button onclick=\"setStatus('{code}','COMPLETED')\">ปิดงาน</button> "
             f"<button class=\"secondary\" onclick=\"setStatus('{code}','WAITING')\">รอข้อมูล</button></td>"
             "</tr>"
         )
@@ -306,6 +352,13 @@ def dashboard(
         options.append(f'<option value="{value}"{sel}>{label}</option>')
     options_html = "".join(options)
     token_js = repr(token or "")
+    people_rows = []
+    for p in people:
+        aliases = ", ".join(p["aliases"]) or "-"
+        people_rows.append(
+            f"<tr><td><b>{escape(p['canonical_name'])}</b></td><td>{escape(aliases)}</td></tr>"
+        )
+    people_html = "".join(people_rows) or '<tr><td colspan="2">ยังไม่มีชื่อมาตรฐาน</td></tr>'
 
     return f"""<!doctype html>
 <html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -319,6 +372,11 @@ form{{background:white;padding:14px;border-radius:12px;border:1px solid #ddd;mar
 input,select{{padding:9px;border:1px solid #bbb;border-radius:8px}} button{{padding:8px 10px;border:0;border-radius:8px;background:#1677ff;color:white;cursor:pointer}}
 button.secondary{{background:#6b7280}} table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden}}
 th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}} th{{background:#f0f2f5}} small{{color:#666}}
+.section{{margin-top:22px}} .section h2{{margin:0 0 10px}}
+.modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);align-items:center;justify-content:center;padding:20px}}
+.modalbox{{background:white;max-width:760px;width:100%;max-height:80vh;overflow:auto;border-radius:14px;padding:18px}}
+.timeline-item{{border-left:3px solid #1677ff;padding:8px 12px;margin:8px 0;background:#f8fafc}}
+.timeline-time{{font-size:12px;color:#666}}
 @media(max-width:900px){{.cards{{grid-template-columns:repeat(2,1fr)}} table{{font-size:13px;display:block;overflow-x:auto}}}}
 </style></head>
 <body><main><h1>LINE Follow-up Assistant</h1><div class="sub">Command Center v{VERSION}</div>
@@ -332,7 +390,19 @@ th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:
 </form>
 <table><thead><tr><th>รหัส/สถานะ</th><th>งาน</th><th>โครงการ</th><th>ผู้รับผิดชอบ</th><th>กำหนด</th><th>ตามแล้ว</th><th>จัดการ</th></tr></thead>
 <tbody>{rows_html}</tbody></table>
+
+<div class="section"><h2>จัดการชื่อผู้รับผิดชอบ</h2>
+<form onsubmit="saveAlias(event)">
+<input id="aliasName" placeholder="ชื่อที่พบ เช่น Tong Thanakrit" required>
+<input id="canonicalName" placeholder="ชื่อมาตรฐาน เช่น ต้น" required>
+<button type="submit">รวมชื่อ</button>
+</form>
+<table><thead><tr><th>ชื่อมาตรฐาน</th><th>ชื่อที่ระบบรู้จัก</th></tr></thead><tbody>{people_html}</tbody></table>
+</div>
 </main>
+<div id="timelineModal" class="modal" onclick="if(event.target===this)closeTimeline()"><div class="modalbox">
+<div style="display:flex;justify-content:space-between;gap:10px"><h2 id="timelineTitle">ประวัติงาน</h2><button class="secondary" onclick="closeTimeline()">ปิด</button></div>
+<div id="timelineBody"></div></div></div>
 <script>
 const token={token_js};
 async function setStatus(code,status){{
@@ -340,6 +410,30 @@ async function setStatus(code,status){{
   const u='/api/tasks/'+encodeURIComponent(code)+'/status?status='+encodeURIComponent(status)+'&token='+encodeURIComponent(token);
   const r=await fetch(u,{{method:'POST'}});
   if(r.ok) location.reload(); else alert(await r.text());
+}}
+async function showTimeline(code){{
+  const r=await fetch('/api/tasks/'+encodeURIComponent(code)+'/timeline?token='+encodeURIComponent(token));
+  if(!r.ok){{alert(await r.text());return;}}
+  const d=await r.json();
+  document.getElementById('timelineTitle').textContent=code+' — '+d.task.title;
+  const body=document.getElementById('timelineBody'); body.innerHTML='';
+  if(!d.events.length) body.innerHTML='<p>ยังไม่มีประวัติ</p>';
+  d.events.forEach(e=>{{
+    const item=document.createElement('div'); item.className='timeline-item';
+    item.innerHTML='<div class="timeline-time">'+e.created_at+' • '+esc(e.actor_name)+'</div><b>'+esc(e.event_type)+'</b><div>'+esc(e.text||'')+'</div>';
+    body.appendChild(item);
+  }});
+  document.getElementById('timelineModal').style.display='flex';
+}}
+function closeTimeline(){{document.getElementById('timelineModal').style.display='none';}}
+function esc(s){{return String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
+async function saveAlias(ev){{
+  ev.preventDefault();
+  const alias=document.getElementById('aliasName').value.trim();
+  const canonical=document.getElementById('canonicalName').value.trim();
+  const u='/api/people/alias?alias='+encodeURIComponent(alias)+'&canonical='+encodeURIComponent(canonical)+'&token='+encodeURIComponent(token);
+  const r=await fetch(u,{{method:'POST'}});
+  if(r.ok){{const d=await r.json();alert('รวมชื่อแล้ว และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}} else alert(await r.text());
 }}
 </script></body></html>"""
 
@@ -406,9 +500,24 @@ async def _process_message(event: dict):
             await push_text(settings.owner_line_user_id, changed)
         return
 
+    if extraction.is_task_reply:
+        with SessionLocal() as db:
+            tasks = open_tasks(db, source_id)
+            canonical_sender = resolve_canonical_name(db, display_name) or display_name
+            target = choose_status_target(tasks, canonical_sender, extraction.assignee_name, extraction.related_task_hint)
+            if target:
+                record_task_event(
+                    db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
+                    text=text, new_status=target.status, commit=False,
+                )
+                target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
+                db.commit()
+                print("task comment recorded:", target.task_code)
+                return
+
     if extraction.is_task and extraction.confidence >= settings.auto_create_confidence:
         with SessionLocal() as db:
-            task = create_task(db, source_id, msg["id"], extraction)
+            task = create_task(db, source_id, msg["id"], extraction, source_text=text, actor_name=display_name, actor_user_id=user_id)
             confirmation = format_task(task)
         print("task created:", task.task_code, task.title)
         if settings.owner_task_ack and settings.owner_line_user_id:
@@ -418,7 +527,9 @@ async def _process_message(event: dict):
 async def try_update_task_from_status(group_id: str, sender_name: str | None, extraction, text: str) -> str | None:
     with SessionLocal() as db:
         tasks = open_tasks(db, group_id)
-        target = choose_status_target(tasks, sender_name, extraction.assignee_name, extraction.related_task_hint)
+        canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
+        canonical_extracted = resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name
+        target = choose_status_target(tasks, canonical_sender, canonical_extracted, extraction.related_task_hint)
         if not target:
             return None
 
@@ -429,13 +540,17 @@ async def try_update_task_from_status(group_id: str, sender_name: str | None, ex
 
         old_status = target.status
         target.status = new_status
-        target.notes = ((target.notes or "") + f"\n{datetime.now()}: {sender_name or '-'}: {text}").strip()
+        target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
         if new_status == "COMPLETED":
             target.next_reminder_at = None
         elif target.due_at and datetime.utcnow() > target.due_at:
             target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
         else:
             target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
+        record_task_event(
+            db, target, "STATUS_REPLY", actor_name=canonical_sender, text=text,
+            old_status=old_status, new_status=new_status, commit=False,
+        )
         db.commit()
         db.refresh(target)
 
@@ -445,7 +560,7 @@ async def try_update_task_from_status(group_id: str, sender_name: str | None, ex
         return (
             f"อัปเดตงานจากบทสนทนาในกลุ่มแล้วครับ\n\n"
             f"{target.task_code} {target.title}\n"
-            f"ผู้ตอบ: {sender_name or '-'}\nสถานะใหม่: {status_th}"
+            f"ผู้ตอบ: {canonical_sender or '-'}\nสถานะใหม่: {status_th}"
         )
 
 
@@ -461,10 +576,43 @@ async def handle_owner_command(user_id: str, text: str):
             if not task:
                 await push_text(user_id, f"ไม่พบงาน {code} ครับ")
                 return
+            old_status = task.status
             task.status = "COMPLETED"
             task.next_reminder_at = None
+            record_task_event(
+                db, task, "OWNER_STATUS_CHANGE", actor_name=settings.owner_display_name, actor_user_id=user_id,
+                text="ปิดงานจาก LINE ส่วนตัว", old_status=old_status, new_status="COMPLETED", commit=False,
+            )
             db.commit()
             await push_text(user_id, f"ปิดงาน {task.task_code} เรียบร้อยครับ\n{task.title}")
+        return
+
+    if low.startswith("ประวัติ "):
+        code = raw.split(maxsplit=1)[1].strip()
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ครับ")
+                return
+            events = task_timeline(db, task)
+        lines = [f"ประวัติ {task.task_code} — {task.title}", ""]
+        for ev in events[-12:]:
+            when = ev.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone)).strftime("%d/%m %H:%M")
+            actor = ev.actor_name or "System"
+            detail = ev.text or ev.event_type
+            lines.append(f"• {when} | {actor} | {detail}")
+        await push_text(user_id, "\n".join(lines))
+        return
+
+    if low.startswith("รวมชื่อ "):
+        body = raw[len("รวมชื่อ "):].strip()
+        if "=" not in body:
+            await push_text(user_id, "รูปแบบ: รวมชื่อ ชื่อเดิม = ชื่อมาตรฐาน\nเช่น รวมชื่อ Tong Thanakrit = ต้น")
+            return
+        alias_name, canonical_name = [x.strip() for x in body.split("=", 1)]
+        with SessionLocal() as db:
+            person, updated = set_person_alias(db, alias_name, canonical_name)
+        await push_text(user_id, f"ตั้งชื่อมาตรฐานแล้วครับ\n{alias_name} → {person.canonical_name}\nปรับงานเดิม {updated} รายการ")
         return
 
     if low.startswith("งานของ "):
@@ -534,6 +682,8 @@ async def handle_owner_command(user_id: str, text: str):
         "• งานของ ต้น\n"
         "• โครงการ ปากน้ำประแส\n"
         "• ค้นหา กล้อง\n"
+        "• ประวัติ FU-xxxxxx-xxxx\n"
+        "• รวมชื่อ Tong Thanakrit = ต้น\n"
         "• สรุปเช้า / สรุปเย็น\n"
         "• ปิด FU-xxxxxx-xxxx"
     )
@@ -594,7 +744,17 @@ async def reminder_scan(force: bool = False):
                     t.status = "OVERDUE"
 
                 prefix = f"{t.assignee_name}ครับ " if t.assignee_name else "รบกวนทีมครับ "
-                if t.status == "OVERDUE":
+                is_pre_due = bool(t.due_at and now < t.due_at)
+
+                if is_pre_due:
+                    due_text = format_due_local(t)
+                    body = (
+                        f"{prefix}แจ้งเตือนเรื่อง ‘{t.title}’ ไว้ล่วงหน้าครับ "
+                        f"งานนี้กำหนด {due_text} ถ้าเรียบร้อยก่อนกำหนดแจ้งได้เลยครับ"
+                    )
+                    # After the advance reminder, the next check is the due time itself.
+                    t.next_reminder_at = t.due_at
+                elif t.status == "OVERDUE":
                     if t.reminder_count >= settings.escalation_after_reminders:
                         body = (
                             f"{prefix}ขออัปเดตเรื่อง ‘{t.title}’ อีกครั้งครับ "
@@ -626,11 +786,19 @@ async def reminder_scan(force: bool = False):
                     t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
 
                 await push_text(t.group_id, body)
-                t.reminder_count += 1
+                # Advance reminders are logged, but do not count toward escalation.
+                # `reminder_count` remains a count of actual follow-ups at/after due time.
+                if not is_pre_due:
+                    t.reminder_count += 1
                 t.last_reminded_at = now
+                record_task_event(
+                    db, t, "PRE_DUE_REMINDER_SENT" if is_pre_due else "REMINDER_SENT",
+                    actor_name="LINE Follow-up Assistant",
+                    text=body, old_status=None, new_status=t.status, commit=False,
+                )
                 db.commit()
                 stats["sent"] += 1
-                print("reminder sent:", t.task_code, t.status, "count=", t.reminder_count)
+                print("reminder sent:", t.task_code, t.status, "pre_due=", is_pre_due, "count=", t.reminder_count)
 
                 if settings.owner_escalation_alerts and settings.owner_line_user_id:
                     if became_overdue:
