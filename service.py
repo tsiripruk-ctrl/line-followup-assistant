@@ -74,16 +74,26 @@ def first_reminder_at(due: datetime | None) -> datetime:
 def create_task(
     db: Session, group_id: str, source_message_id: str, extraction,
     source_text: str | None = None, actor_name: str | None = None, actor_user_id: str | None = None,
+    assignee_name_override: str | None = None, assignee_user_id: str | None = None,
 ) -> Task:
     due = parse_due(extraction.due_at_iso)
-    canonical_assignee = resolve_or_register_assignee(db, extraction.assignee_name)
+    raw_assignee = assignee_name_override or extraction.assignee_name
+    canonical_assignee = resolve_or_register_assignee(db, raw_assignee)
+    if assignee_user_id:
+        person = bind_person_identity(db, canonical_assignee or raw_assignee or "ผู้รับผิดชอบ", assignee_user_id, raw_assignee)
+        canonical_assignee = person.canonical_name
+    else:
+        person = get_person_by_alias(db, canonical_assignee or raw_assignee)
+        if person and person.line_user_id:
+            assignee_user_id = person.line_user_id
     t = Task(
         task_code="TEMP",
         group_id=group_id,
         source_message_id=source_message_id,
         title=extraction.title or "งานติดตามจาก LINE",
         project=extraction.project,
-        assignee_name=canonical_assignee or extraction.assignee_name,
+        assignee_name=canonical_assignee or raw_assignee,
+        assignee_user_id=assignee_user_id,
         due_at=due,
         confidence=extraction.confidence,
         status="OPEN",
@@ -193,12 +203,24 @@ def normalize_name(value: str | None) -> str:
     return "".join(x.split())
 
 
-def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None) -> Task | None:
+def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> Task | None:
     if not tasks:
         return None
     sender = normalize_name(sender_name)
     extracted_assignee = normalize_name(assignee_name)
     hint_low = (hint or "").lower().strip()
+
+    # LINE userId is the strongest identity signal. Prefer it over display names.
+    if sender_user_id:
+        id_matches = [t for t in tasks if t.assignee_user_id == sender_user_id]
+        if len(id_matches) == 1:
+            return id_matches[0]
+        if hint_low:
+            for t in id_matches:
+                if hint_low in t.title.lower() or t.title.lower() in hint_low:
+                    return t
+        if id_matches:
+            return id_matches[0]
 
     if sender:
         matches = [t for t in tasks if normalize_name(t.assignee_name) == sender]
@@ -282,6 +304,31 @@ def ensure_person(db: Session, canonical_name: str, line_user_id: str | None = N
     if key and not db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key)):
         db.add(PersonAlias(person_id=person.id, alias=canonical_name, normalized_alias=key))
         db.flush()
+    return person
+
+
+def bind_person_identity(db: Session, canonical_name: str, line_user_id: str, alias_name: str | None = None) -> Person:
+    """Bind a stable LINE userId to the People Registry and learn aliases.
+
+    LINE userId is treated as the strongest identity key. If a person with that
+    userId already exists, new display names are added as aliases instead of
+    creating a duplicate person.
+    """
+    canonical_name = clean_display_name(canonical_name) or clean_display_name(alias_name) or "ผู้รับผิดชอบ"
+    person = db.scalar(select(Person).where(Person.line_user_id == line_user_id))
+    if not person:
+        person = db.scalar(select(Person).where(func.lower(Person.canonical_name) == canonical_name.lower()))
+        if person and not person.line_user_id:
+            person.line_user_id = line_user_id
+        elif not person:
+            person = Person(canonical_name=canonical_name, line_user_id=line_user_id)
+            db.add(person)
+            db.flush()
+    for alias_value in {canonical_name, clean_display_name(alias_name)}:
+        key = normalize_name(alias_value)
+        if key and not db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key)):
+            db.add(PersonAlias(person_id=person.id, alias=alias_value, normalized_alias=key))
+    db.flush()
     return person
 
 

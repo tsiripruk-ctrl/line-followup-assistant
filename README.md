@@ -1,161 +1,43 @@
-# LINE Follow-up Assistant v0.5.2
+# LINE Follow-up Assistant v0.6.0
 
-v0.5 เพิ่ม **Task Timeline + Conversation History + Assignee Normalization** บนฐานเดิมของ v0.4 โดยไม่ลบ Task เก่า
+## New in v0.6.0 — Mention-based Assignee Identity
 
-## ความสามารถใหม่
+This release makes assignee identity LINE-aware instead of relying only on display-name text.
 
-### 1) Task Timeline
-ทุก Task มีประวัติแบบ append-only เช่น
-- สร้างงานจาก LINE
-- ข้อความตอบ/อัปเดตจากผู้รับผิดชอบ
-- เปลี่ยนสถานะจากบทสนทนา
-- Reminder ที่ระบบส่ง
-- เปลี่ยนสถานะจาก Dashboard
-- ปิดงานจาก LINE ส่วนตัว
-- การปรับชื่อผู้รับผิดชอบให้เป็นมาตรฐาน
+### What changed
 
-Dashboard มีปุ่ม **ประวัติ** ต่อ Task เพื่อเปิด Timeline โดยไม่ออกจากหน้า Command Center
+- Parses LINE webhook `message.mention.mentionees[]`.
+- If a task message explicitly @mentions one user, that LINE user becomes the primary assignee.
+- Stores the assignee's stable LINE `userId` in `Task.assignee_user_id`.
+- Learns group participants into the People Registry from their LINE `userId` and display name.
+- If a later task names a known person without @mention, the system can reuse their stored LINE `userId`.
+- Reply matching now prefers `assignee_user_id` over display-name matching.
+- Reminder messages use LINE `textV2` mention substitution when `assignee_user_id` is known, so the responsible person receives a real @mention.
+- Falls back to the existing plain-name reminder if LINE mention sending is unavailable.
+- Owner acknowledgement says whether the responsible person's LINE identity has been linked.
 
-ใน LINE ส่วนตัวใช้คำสั่ง:
+### Recommended task style
 
-```text
-ประวัติ FU-260909-0006
-```
+For the most accurate assignment, use LINE's mention UI:
 
-### 2) Conversation History
-AI แยกข้อความที่เป็นการตอบ/อัปเดตงานเดิม แม้ยังไม่เปลี่ยนสถานะ และบันทึกเป็น `COMMENT` ใน Timeline
+`@Proud วันนี้ 15:30 ช่วยเช็กสถานะ LG แล้วแจ้งพี่ด้วย`
 
-### 3) Assignee Normalization
-ระบบตัดคำนำหน้าพื้นฐาน เช่น `พี่ต้น` → `ต้น` อัตโนมัติ และสามารถรวมชื่อข้ามรูปแบบได้ เช่น
+Priority order:
+1. Explicit LINE @mention with userId
+2. Known People Registry alias/name
+3. AI-extracted assignee name
+4. Unassigned task if no reliable assignee exists
 
-```text
-Tong Thanakrit = ต้น
-```
+### Notes
 
-ทำได้ 2 ทาง:
-- Dashboard → ส่วน **จัดการชื่อผู้รับผิดชอบ**
-- LINE ส่วนตัว:
+- A LINE mention webhook may omit the mentioned user's `userId` when that user's profile-consent conditions do not allow it. In that case the app falls back to visible mention/name matching.
+- v0.6.0 supports one primary assignee per task. If multiple users are mentioned, the first matching/explicit user is treated as primary.
+- Existing v0.5.x PostgreSQL tables are reused. No destructive migration is required because `assignee_user_id` already exists on `tasks`.
 
-```text
-รวมชื่อ Tong Thanakrit = ต้น
-```
+## Deploy
 
-เมื่อรวมชื่อ ระบบจะปรับ Task เดิมที่ใช้ alias นั้นให้เป็นชื่อมาตรฐาน และบันทึกเหตุการณ์ลง Timeline
-
-## Upgrade จาก v0.4
-
-1. อัปโหลดไฟล์ v0.5 ทับ Repository เดิม
-2. Commit
-3. Render → Deploy latest commit
-4. `/health` ต้องขึ้น `version: 0.5.0`
-5. เปิด Dashboard เดิม
-
-ระบบใช้ `Base.metadata.create_all()` เพื่อสร้างตารางใหม่:
-- `task_events`
-- `people`
-- `person_aliases`
-
-**ไม่ drop ตาราง Task เดิม** และมี backfill สร้าง event `IMPORTED` ให้ Task เก่าที่มีอยู่แล้ว
-
-## PostgreSQL
-รองรับ Render Datastore URL โดย `db.py` จะแปลงอัตโนมัติ:
-- `postgres://...`
-- `postgresql://...`
-
-เป็น `postgresql+psycopg://...` สำหรับ psycopg v3
-
-ใช้ `Datastore URL` ของ Render ใน Environment Variable ชื่อ:
-
-```text
-DATABASE_URL
-```
-
-## Environment เดิม
-v0.5 ไม่ต้องเพิ่ม secret ใหม่ ใช้ค่าจาก v0.4 ต่อได้ เช่น:
-
-```env
-LINE_CHANNEL_SECRET=...
-LINE_CHANNEL_ACCESS_TOKEN=...
-OPENAI_API_KEY=...
-OWNER_LINE_USER_ID=...
-CRON_SECRET=...
-DASHBOARD_TOKEN=...
-DATABASE_URL=...
-```
-
-## Health check
-
-```text
-/health
-```
-
-ตัวอย่าง:
-
-```json
-{
-  "ok": true,
-  "service": "line-followup-assistant",
-  "version": "0.5.0",
-  "scheduler": "external",
-  "dashboard": true,
-  "database": "postgresql",
-  "timeline": true,
-  "assignee_normalization": true
-}
-```
-
-## Owner LINE commands
-
-- `สรุปงานค้าง`
-- `วันนี้มีอะไรต้องตาม`
-- `พรุ่งนี้มีอะไรต้องตาม`
-- `งานเลยกำหนด`
-- `งานรอข้อมูล`
-- `งานที่ปิดแล้ว`
-- `งานของ ต้น`
-- `โครงการ ปากน้ำประแส`
-- `ค้นหา กล้อง`
-- `ประวัติ FU-xxxxxx-xxxx`
-- `รวมชื่อ Tong Thanakrit = ต้น`
-- `สรุปเช้า`
-- `สรุปเย็น`
-- `ปิด FU-xxxxxx-xxxx`
-
-## หมายเหตุ
-Timeline ใหม่จะเก็บรายละเอียดเต็มตั้งแต่ v0.5 เป็นต้นไป ส่วน Task เก่าจะมี baseline `IMPORTED` และยังคงข้อมูล notes เดิมไว้
-
-
-## v0.5.1 Adaptive Reminder Policy
-
-แก้ปัญหาเพิ่งสร้างงานแล้ว OA ตามทันที เพราะเวลาการเตือนล่วงหน้าเดิมผ่านไปแล้ว
-
-กติกาใหม่:
-- เหลือมากกว่า 3 ชั่วโมง: เตือนล่วงหน้า 3 ชั่วโมง
-- เหลือ 1–3 ชั่วโมง: เตือนก่อนกำหนด 30 นาที
-- เหลือน้อยกว่า 1 ชั่วโมง: รอถึงเวลาครบกำหนด
-- งานที่ครบกำหนดไปแล้วตอนสร้าง: เริ่มติดตามหลังสร้างประมาณ 1 นาที
-- การเตือนก่อนกำหนดจะไม่เพิ่ม `reminder_count` และไม่ถูกนับเป็น escalation
-
-ตัวอย่าง: สร้างงาน 13:23 กำหนด 15:30 -> เตือนล่วงหน้าเวลา 15:00 และถ้ายังไม่ปิดงาน จะตรวจอีกครั้งเมื่อถึง 15:30
-
-
-## v0.5.2 Natural Female Secretary Voice
-
-- LINE OA ใช้บุคลิกผู้หญิง และใช้คำลงท้าย `คะ/ค่ะ` ให้เหมาะกับประโยค
-- ปรับข้อความติดตามในกลุ่มให้สั้นและเป็นธรรมชาติขึ้น
-- ตัดเครื่องหมายอัญประกาศรอบชื่องานออก
-- จัดข้อความเป็น 2 บรรทัด เพื่ออ่านง่ายใน LINE
-- เปลี่ยนคำพูดแข็ง ๆ เช่น “ให้พี่ต้องหน่อย” เป็น “รบกวนแจ้งพี่ต้องด้วยนะคะ”
-
-ตัวอย่าง:
-
-```text
-พราวคะ ขออัปเดตเรื่องเช็กสถานะ LG ใหม่หน่อยค่ะ
-ถ้าเรียบร้อยแล้ว รบกวนแจ้งพี่ต้องด้วยนะคะ
-```
-
-
-## v0.5.3 — Reply Awareness
-- AI judges task replies semantically, not only by keywords.
-- A final result such as “สถานะใช้ได้ปกติ” can close a status-check task.
-- Any related reply/comment now notifies the owner privately even when status is unchanged.
+1. Upload these files over the existing GitHub repository.
+2. Commit changes.
+3. Render → Deploy latest commit.
+4. Check `/health` and confirm `version` is `0.6.0`.
+5. Test in a LINE group by @mentioning one responsible person in a new task.

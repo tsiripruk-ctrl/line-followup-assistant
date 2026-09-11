@@ -1,3 +1,4 @@
+import random
 from datetime import datetime, timedelta
 import asyncio
 from zoneinfo import ZoneInfo
@@ -9,9 +10,9 @@ from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
 from db import Base, engine, SessionLocal
-from models import Message, Task
+from models import Message, Task, OutboundTaskMessage, Person, PersonAlias
 from config import settings
-from line_api import verify_signature, get_member_profile, push_text
+from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
@@ -19,10 +20,10 @@ from service import (
     format_task, choose_status_target, STATUS_THAI, brief_counts,
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
-    task_timeline, backfill_task_created_events
+    task_timeline, backfill_task_created_events, bind_person_identity
 )
 
-VERSION = "0.5.3"
+VERSION = "0.6.0"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -74,6 +75,7 @@ def health():
         "dashboard": bool(settings.dashboard_token),
         "database": "postgresql" if dialect == "postgresql" else dialect,
         "timeline": True, "assignee_normalization": True,
+        "mention_assignment": True, "mention_followup": True,
     }
 
 
@@ -451,6 +453,94 @@ async def webhook(request: Request):
     return {"ok": True}
 
 
+async def acknowledge_task_reply(reply_token: str | None, group_id: str, status_signal: str):
+    """Reply like a natural Thai female secretary, with light variation.
+
+    Only messages successfully matched to an existing task reach this function.
+    The wording intentionally avoids system-like phrases and repetitive templates.
+    """
+    reply_pool = {
+        "completed": [
+            "ขอบคุณมากค่ะ เรียบร้อยแล้วนะคะ ขอบคุณที่ช่วยจัดการให้ค่ะ",
+            "ขอบคุณนะคะ งานนี้เรียบร้อยแล้วค่ะ จัดการให้เรียบร้อยดีมากเลยค่ะ",
+            "ขอบคุณมากค่ะ รับทราบว่าเรียบร้อยแล้วนะคะ งานนี้ปิดได้เลยค่ะ",
+            "ขอบคุณค่ะ เรียบร้อยแล้วนะคะ ขอบคุณที่อัปเดตให้ค่ะ",
+        ],
+        "waiting": [
+            "ขอบคุณที่อัปเดตนะคะ รับทราบเรื่องที่ยังรออยู่ค่ะ เดี๋ยวขออนุญาตติดตามต่ออีกครั้งนะคะ",
+            "ขอบคุณค่ะ รับทราบว่ายังรอข้อมูลอยู่นะคะ เดี๋ยวช่วยติดตามต่อค่ะ",
+            "รับทราบค่ะ ขอบคุณที่แจ้งนะคะ เรื่องนี้เดี๋ยวขออนุญาตติดตามต่อจนเรียบร้อยค่ะ",
+        ],
+        "in_progress": [
+            "ขอบคุณที่อัปเดตนะคะ รับทราบค่ะ เดี๋ยวขออนุญาตติดตามต่อจนเรียบร้อยนะคะ",
+            "ขอบคุณค่ะ รับทราบว่ากำลังดำเนินการอยู่นะคะ ไว้เดี๋ยวขอติดตามต่ออีกครั้งค่ะ",
+            "รับทราบค่ะ ขอบคุณที่อัปเดตนะคะ เดี๋ยวช่วยติดตามความคืบหน้าต่อค่ะ",
+        ],
+        "none": [
+            "ขอบคุณนะคะ รับทราบค่ะ",
+            "ขอบคุณที่แจ้งนะคะ รับทราบค่ะ",
+            "รับทราบค่ะ ขอบคุณที่อัปเดตนะคะ",
+            "ขอบคุณค่ะ รับทราบแล้วนะคะ",
+        ],
+    }
+    text = random.choice(reply_pool.get(status_signal, reply_pool["none"]))
+    try:
+        if reply_token:
+            await reply_text(reply_token, text)
+        else:
+            await push_text(group_id, text)
+    except Exception as exc:
+        print("task reply acknowledgement failed:", repr(exc))
+        try:
+            await push_text(group_id, text)
+        except Exception as fallback_exc:
+            print("task reply acknowledgement fallback failed:", repr(fallback_exc))
+
+
+def _mention_text(text: str, mentionee: dict) -> str | None:
+    """Best-effort visible @name extraction for mention entries without userId."""
+    try:
+        start = int(mentionee.get("index", 0))
+        length = int(mentionee.get("length", 0))
+        value = text[start:start + length].strip()
+        return value.lstrip("@").strip() or None
+    except Exception:
+        return None
+
+
+async def resolve_message_mentions(msg: dict, group_id: str) -> list[dict]:
+    """Return real user mentions, excluding @All and mentions to the bot itself."""
+    result = []
+    mention = msg.get("mention") or {}
+    text = msg.get("text", "")
+    for item in mention.get("mentionees") or []:
+        if item.get("type") != "user" or item.get("isSelf") is True:
+            continue
+        uid = item.get("userId")
+        visible = _mention_text(text, item)
+        display = None
+        if uid:
+            display = await get_member_profile(group_id, uid)
+        result.append({"user_id": uid, "display_name": display or visible, "visible_name": visible})
+    return result
+
+
+def select_primary_mention(mentions: list[dict], extracted_assignee: str | None) -> dict | None:
+    if not mentions:
+        return None
+    if len(mentions) == 1:
+        return mentions[0]
+    wanted = (extracted_assignee or "").strip().lower()
+    if wanted:
+        for m in mentions:
+            for value in (m.get("display_name"), m.get("visible_name")):
+                if value and (wanted in value.lower() or value.lower() in wanted):
+                    return m
+    # One task currently has one primary assignee. The first explicit user mention
+    # is treated as primary; future versions can add co-assignees.
+    return mentions[0]
+
+
 async def process_message(event: dict):
     try:
         await _process_message(event)
@@ -464,6 +554,7 @@ async def _process_message(event: dict):
     source_type = source.get("type", "unknown")
     source_id = source.get("groupId") or source.get("userId") or source.get("roomId")
     user_id = source.get("userId")
+    reply_token = event.get("replyToken")
     if not source_id:
         return
 
@@ -472,6 +563,15 @@ async def _process_message(event: dict):
         display_name = await get_member_profile(source_id, user_id)
 
     text = msg.get("text", "").strip()
+    quoted_message_id = msg.get("quotedMessageId")
+    mentions = await resolve_message_mentions(msg, source_id) if source_type == "group" else []
+
+    # Learn every group participant from the stable LINE userId. This lets later
+    # plain-name assignments resolve to the same person even if their display name changes.
+    if source_type == "group" and user_id and display_name:
+        with SessionLocal() as db:
+            bind_person_identity(db, display_name, user_id, display_name)
+            db.commit()
     with SessionLocal() as db:
         if db.scalar(select(Message).where(Message.line_message_id == msg["id"])):
             return
@@ -494,17 +594,33 @@ async def _process_message(event: dict):
 
     extraction = await asyncio.to_thread(extract_task, text, display_name)
 
+    # v0.5.4: if the user used LINE's quote/reply feature on one of the
+    # assistant's reminder messages, resolve the exact task by quotedMessageId.
+    # This is much more reliable than guessing from display names such as
+    # "พราว" vs "Proud🤍" or from short reply text.
+    if quoted_message_id:
+        changed = await handle_quoted_task_reply(
+            source_id, user_id, display_name, quoted_message_id, extraction, text
+        )
+        if changed is not None:
+            await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
+            if changed and settings.owner_status_updates and settings.owner_line_user_id:
+                await push_text(settings.owner_line_user_id, changed)
+            return
+
     if extraction.status_signal != "none":
         changed = await try_update_task_from_status(source_id, display_name, extraction, text)
-        if changed and settings.owner_status_updates and settings.owner_line_user_id:
-            await push_text(settings.owner_line_user_id, changed)
-        return
+        if changed is not None:
+            await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
+            if changed and settings.owner_status_updates and settings.owner_line_user_id:
+                await push_text(settings.owner_line_user_id, changed)
+            return
 
     if extraction.is_task_reply:
         with SessionLocal() as db:
             tasks = open_tasks(db, source_id)
             canonical_sender = resolve_canonical_name(db, display_name) or display_name
-            target = choose_status_target(tasks, canonical_sender, extraction.assignee_name, extraction.related_task_hint)
+            target = choose_status_target(tasks, canonical_sender, extraction.assignee_name, extraction.related_task_hint, user_id)
             if target:
                 record_task_event(
                     db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
@@ -513,6 +629,7 @@ async def _process_message(event: dict):
                 target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
                 db.commit()
                 print("task comment recorded:", target.task_code)
+                await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
                 if settings.owner_status_updates and settings.owner_line_user_id:
                     await push_text(
                         settings.owner_line_user_id,
@@ -525,12 +642,105 @@ async def _process_message(event: dict):
                 return
 
     if extraction.is_task and extraction.confidence >= settings.auto_create_confidence:
+        primary_mention = select_primary_mention(mentions, extraction.assignee_name)
+        mention_name = primary_mention.get("display_name") if primary_mention else None
+        mention_user_id = primary_mention.get("user_id") if primary_mention else None
         with SessionLocal() as db:
-            task = create_task(db, source_id, msg["id"], extraction, source_text=text, actor_name=display_name, actor_user_id=user_id)
+            task = create_task(
+                db, source_id, msg["id"], extraction, source_text=text,
+                actor_name=display_name, actor_user_id=user_id,
+                assignee_name_override=mention_name, assignee_user_id=mention_user_id,
+            )
+            # If AI found a plain-text assignee and that person is already known in
+            # People Registry, attach their stable LINE userId too.
+            if not task.assignee_user_id and task.assignee_name:
+                person = db.scalar(select(Person).where(Person.canonical_name == task.assignee_name))
+                if person and person.line_user_id:
+                    task.assignee_user_id = person.line_user_id
+                    db.commit()
+                    db.refresh(task)
             confirmation = format_task(task)
-        print("task created:", task.task_code, task.title)
+        print("task created:", task.task_code, task.title, "assignee_user_id=", bool(task.assignee_user_id))
         if settings.owner_task_ack and settings.owner_line_user_id:
-            await push_text(settings.owner_line_user_id, "รับเรื่องติดตามจากกลุ่มแล้วค่ะ\n\n" + confirmation)
+            identity_note = "\nผูก LINE ผู้รับผิดชอบแล้วค่ะ" if task.assignee_user_id else "\nยังไม่ได้ผูก LINE ผู้รับผิดชอบค่ะ"
+            await push_text(settings.owner_line_user_id, "รับเรื่องติดตามจากกลุ่มแล้วค่ะ\n\n" + confirmation + identity_note)
+
+
+async def handle_quoted_task_reply(
+    group_id: str, user_id: str | None, sender_name: str | None, quoted_message_id: str, extraction, text: str
+) -> str | None:
+    """Apply a LINE quote-reply to the exact task whose reminder was quoted.
+
+    Returns:
+      None  -> quote wasn't one of our tracked task messages; continue normal matching.
+      ""    -> handled but owner notification disabled/not needed.
+      str   -> owner notification text.
+    """
+    with SessionLocal() as db:
+        link = db.scalar(select(OutboundTaskMessage).where(
+            OutboundTaskMessage.line_message_id == str(quoted_message_id),
+            OutboundTaskMessage.group_id == group_id,
+        ))
+        if not link:
+            return None
+        target = db.get(Task, link.task_id)
+        if not target or target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+            return ""
+
+        canonical_sender = resolve_canonical_name(db, sender_name) or sender_name or "-"
+
+        # Once somebody quote-replies to a reminder addressed to this task, bind the
+        # LINE user ID to the task and learn their display-name alias automatically.
+        if user_id:
+            target.assignee_user_id = user_id
+            if target.assignee_name:
+                person = db.scalar(select(Person).where(Person.canonical_name == target.assignee_name))
+                if not person:
+                    person = Person(canonical_name=target.assignee_name, line_user_id=user_id)
+                    db.add(person)
+                    db.flush()
+                elif not person.line_user_id:
+                    person.line_user_id = user_id
+                alias_key = ''.join((sender_name or '').strip().lower().split())
+                if alias_key and not db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == alias_key)):
+                    db.add(PersonAlias(person_id=person.id, alias=sender_name or target.assignee_name, normalized_alias=alias_key))
+                canonical_sender = target.assignee_name
+
+        mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
+        new_status = mapping.get(extraction.status_signal)
+        old_status = target.status
+
+        if new_status:
+            target.status = new_status
+            if new_status == "COMPLETED":
+                target.next_reminder_at = None
+            elif new_status == "WAITING":
+                target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
+            else:
+                target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
+            event_type = "QUOTED_STATUS_REPLY"
+        else:
+            # Any genuine human response should suppress an immediate repeat chase.
+            # Keep the task open, record the comment, and snooze by the normal repeat window.
+            target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
+            event_type = "QUOTED_COMMENT_REPLY"
+
+        target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender}: {text}").strip()
+        record_task_event(
+            db, target, event_type, actor_name=canonical_sender, actor_user_id=user_id, text=text,
+            old_status=old_status, new_status=target.status, commit=False,
+        )
+        db.commit()
+        db.refresh(target)
+
+        status_th = STATUS_THAI.get(target.status, target.status)
+        return (
+            f"มีการตอบกลับงานแล้วค่ะ\n\n"
+            f"{target.task_code} {target.title}\n"
+            f"ผู้ตอบ: {canonical_sender}\n"
+            f"ข้อความ: {text}\n"
+            f"สถานะ: {status_th}"
+        )
 
 
 async def try_update_task_from_status(group_id: str, sender_name: str | None, extraction, text: str) -> str | None:
@@ -538,7 +748,7 @@ async def try_update_task_from_status(group_id: str, sender_name: str | None, ex
         tasks = open_tasks(db, group_id)
         canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
         canonical_extracted = resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name
-        target = choose_status_target(tasks, canonical_sender, canonical_extracted, extraction.related_task_hint)
+        target = choose_status_target(tasks, canonical_sender, canonical_extracted, extraction.related_task_hint, user_id)
         if not target:
             return None
 
@@ -564,7 +774,7 @@ async def try_update_task_from_status(group_id: str, sender_name: str | None, ex
         db.refresh(target)
 
         if old_status == new_status and new_status != "COMPLETED":
-            return None
+            return ""
         status_th = STATUS_THAI.get(new_status, new_status)
         return (
             f"อัปเดตงานจากบทสนทนาในกลุ่มแล้วค่ะ\n\n"
@@ -753,7 +963,8 @@ async def reminder_scan(force: bool = False):
                     t.status = "OVERDUE"
 
                 assignee = t.assignee_name.strip() if t.assignee_name else "ทีม"
-                greeting = f"{assignee}คะ" if assignee != "ทีม" else "ทีมคะ"
+                use_mention = bool(t.assignee_user_id)
+                greeting = "{assignee}คะ" if use_mention else (f"{assignee}คะ" if assignee != "ทีม" else "ทีมคะ")
                 is_pre_due = bool(t.due_at and now < t.due_at)
 
                 if is_pre_due:
@@ -795,7 +1006,21 @@ async def reminder_scan(force: bool = False):
                     )
                     t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
 
-                await push_text(t.group_id, body)
+                if use_mention:
+                    try:
+                        sent_message_id = await push_text_mention(t.group_id, body, t.assignee_user_id)
+                    except Exception as mention_exc:
+                        print("mention reminder failed; fallback plain text:", t.task_code, repr(mention_exc))
+                        plain_body = body.replace("{assignee}", assignee)
+                        sent_message_id = await push_text(t.group_id, plain_body)
+                        body = plain_body
+                else:
+                    sent_message_id = await push_text(t.group_id, body)
+                if sent_message_id:
+                    db.add(OutboundTaskMessage(
+                        line_message_id=sent_message_id, task_id=t.id, group_id=t.group_id,
+                        message_kind="PRE_DUE" if is_pre_due else "REMINDER",
+                    ))
                 # Advance reminders are logged, but do not count toward escalation.
                 # `reminder_count` remains a count of actual follow-ups at/after due time.
                 if not is_pre_due:

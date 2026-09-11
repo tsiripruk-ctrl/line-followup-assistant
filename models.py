@@ -38,6 +38,20 @@ class Task(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class OutboundTaskMessage(Base):
+    """LINE message IDs sent by the assistant and linked to a task.
+
+    This lets us resolve a user's LINE quote-reply directly back to the exact task.
+    """
+    __tablename__ = "outbound_task_messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    line_message_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    group_id: Mapped[str] = mapped_column(String(128), index=True)
+    message_kind: Mapped[str] = mapped_column(String(64), default="REMINDER")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class TaskEvent(Base):
     """Append-only timeline for a task."""
     __tablename__ = "task_events"
