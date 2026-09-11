@@ -23,7 +23,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity
 )
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -615,6 +615,17 @@ async def _process_message(event: dict):
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
                 await push_text(settings.owner_line_user_id, changed)
             return
+        # A status-like reply that cannot be matched confidently must never close a
+        # random task. Surface it privately for manual review instead.
+        if settings.owner_status_updates and settings.owner_line_user_id:
+            await push_text(
+                settings.owner_line_user_id,
+                f"พบข้อความอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจนค่ะ\n\n"
+                f"ผู้ส่ง: {display_name or '-'}\n"
+                f"ข้อความ: {text}\n\n"
+                f"ระบบจึงยังไม่เปลี่ยนสถานะงานใดนะคะ"
+            )
+        return
 
     if extraction.is_task_reply:
         with SessionLocal() as db:
@@ -681,9 +692,18 @@ async def handle_quoted_task_reply(
             OutboundTaskMessage.line_message_id == str(quoted_message_id),
             OutboundTaskMessage.group_id == group_id,
         ))
-        if not link:
+        target = None
+        if link:
+            target = db.get(Task, link.task_id)
+        else:
+            # A staff member may quote/reply to the original assignment message rather
+            # than the assistant reminder. source_message_id gives us the exact task too.
+            target = db.scalar(select(Task).where(
+                Task.source_message_id == str(quoted_message_id),
+                Task.group_id == group_id,
+            ))
+        if not target:
             return None
-        target = db.get(Task, link.task_id)
         if not target or target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
             return ""
 

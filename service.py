@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import re
+from difflib import SequenceMatcher
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, func
@@ -203,47 +205,77 @@ def normalize_name(value: str | None) -> str:
     return "".join(x.split())
 
 
+def _match_text(value: str | None) -> str:
+    """Normalize Thai/English task text for conservative task matching."""
+    if not value:
+        return ""
+    x = value.lower().strip()
+    x = re.sub(r"[^0-9a-zA-Zก-๙]+", " ", x)
+    return " ".join(x.split())
+
+
+def _task_text_score(task: Task, hint: str | None) -> float:
+    """Return 0..1 lexical similarity between a reply hint and a task.
+
+    This deliberately favors distinctive words such as PostgreSQL/LG/TSP and avoids
+    matching generic status replies to an unrelated open task.
+    """
+    h = _match_text(hint)
+    if not h:
+        return 0.0
+    target = _match_text(" ".join(x for x in [task.title, task.project or ""] if x))
+    if not target:
+        return 0.0
+    if h in target or target in h:
+        return 0.95
+    ht = {w for w in h.split() if len(w) >= 2}
+    tt = {w for w in target.split() if len(w) >= 2}
+    overlap = len(ht & tt) / max(1, len(ht))
+    seq = SequenceMatcher(None, h, target).ratio()
+    # Exact distinctive token overlap should dominate fuzzy sequence similarity.
+    return min(1.0, 0.75 * overlap + 0.25 * seq)
+
+
 def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> Task | None:
+    """Conservatively match a human reply to one open task.
+
+    Never select an arbitrary first task. Identity is useful, but when one person owns
+    several tasks the content must distinguish which task is being discussed.
+    """
     if not tasks:
         return None
+
     sender = normalize_name(sender_name)
     extracted_assignee = normalize_name(assignee_name)
-    hint_low = (hint or "").lower().strip()
 
-    # LINE userId is the strongest identity signal. Prefer it over display names.
-    if sender_user_id:
-        id_matches = [t for t in tasks if t.assignee_user_id == sender_user_id]
-        if len(id_matches) == 1:
-            return id_matches[0]
-        if hint_low:
-            for t in id_matches:
-                if hint_low in t.title.lower() or t.title.lower() in hint_low:
-                    return t
-        if id_matches:
-            return id_matches[0]
+    scored: list[tuple[float, Task]] = []
+    for t in tasks:
+        score = _task_text_score(t, hint)
+        identity_match = False
+        if sender_user_id and t.assignee_user_id == sender_user_id:
+            score += 0.45
+            identity_match = True
+        elif sender and normalize_name(t.assignee_name) == sender:
+            score += 0.30
+            identity_match = True
+        elif extracted_assignee and normalize_name(t.assignee_name) == extracted_assignee:
+            score += 0.20
 
-    if sender:
-        matches = [t for t in tasks if normalize_name(t.assignee_name) == sender]
-        if len(matches) == 1:
-            return matches[0]
-        if hint_low:
-            for t in matches:
-                if hint_low in t.title.lower() or t.title.lower() in hint_low:
-                    return t
-        if matches:
-            return matches[0]
+        # A single task owned by the sender can be accepted even with a weak hint, but
+        # multiple tasks for the same person require content evidence.
+        scored.append((score, t))
 
-    if extracted_assignee:
-        for t in tasks:
-            if normalize_name(t.assignee_name) == extracted_assignee:
-                return t
-    if hint_low:
-        for t in tasks:
-            title = t.title.lower()
-            if hint_low in title or title in hint_low:
-                return t
-    # Never guess the first task in a busy group. A wrong automatic close is
-    # worse than leaving an ambiguous reply for manual review.
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else -1.0
+
+    sender_owned = [t for t in tasks if (sender_user_id and t.assignee_user_id == sender_user_id) or (sender and normalize_name(t.assignee_name) == sender)]
+    if len(sender_owned) == 1 and best is sender_owned[0] and best_score >= 0.35:
+        return best
+
+    # Require a meaningful lexical/identity score and separation from the runner-up.
+    if best_score >= 0.58 and (best_score - second_score) >= 0.12:
+        return best
     return None
 
 

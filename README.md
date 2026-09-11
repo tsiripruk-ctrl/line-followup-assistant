@@ -1,6 +1,6 @@
-# LINE Follow-up Assistant v0.6.0
+# LINE Follow-up Assistant v0.6.2
 
-## New in v0.6.0 — Mention-based Assignee Identity
+## New in v0.6.2 — Mention-based Assignee Identity
 
 This release makes assignee identity LINE-aware instead of relying only on display-name text.
 
@@ -31,7 +31,7 @@ Priority order:
 ### Notes
 
 - A LINE mention webhook may omit the mentioned user's `userId` when that user's profile-consent conditions do not allow it. In that case the app falls back to visible mention/name matching.
-- v0.6.0 supports one primary assignee per task. If multiple users are mentioned, the first matching/explicit user is treated as primary.
+- v0.6.2 supports one primary assignee per task. If multiple users are mentioned, the first matching/explicit user is treated as primary.
 - Existing v0.5.x PostgreSQL tables are reused. No destructive migration is required because `assignee_user_id` already exists on `tasks`.
 
 ## Deploy
@@ -43,9 +43,16 @@ Priority order:
 5. Test in a LINE group by @mentioning one responsible person in a new task.
 
 
-## v0.6.1 Reply/Identity hotfix
+## v0.6.2 Reply/Identity hotfix
 - Fixes status-reply processing to pass the sender LINE userId into task matching.
 - Prevents a NameError that could make normal completion replies fail silently.
 - Stores actor_user_id in status timeline events.
 - Prevents quote replies from silently reassigning a task already bound to another LINE user.
 - Removes unsafe fallback that could update the first open task when a reply is ambiguous.
+
+
+## v0.6.2 — Conservative Task Matching
+- Prevents an unrelated completion reply from closing another open task.
+- Uses exact LINE quote/reply first, including replies to the original assignment message.
+- Uses assignee LINE userId plus task-content similarity when no quote exists.
+- If matching is ambiguous, no task is changed and the owner receives a private review notice.
