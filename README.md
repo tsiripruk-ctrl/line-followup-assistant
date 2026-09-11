@@ -41,3 +41,11 @@ Priority order:
 3. Render → Deploy latest commit.
 4. Check `/health` and confirm `version` is `0.6.0`.
 5. Test in a LINE group by @mentioning one responsible person in a new task.
+
+
+## v0.6.1 Reply/Identity hotfix
+- Fixes status-reply processing to pass the sender LINE userId into task matching.
+- Prevents a NameError that could make normal completion replies fail silently.
+- Stores actor_user_id in status timeline events.
+- Prevents quote replies from silently reassigning a task already bound to another LINE user.
+- Removes unsafe fallback that could update the first open task when a reply is ambiguous.

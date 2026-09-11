@@ -23,7 +23,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity
 )
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -609,7 +609,7 @@ async def _process_message(event: dict):
             return
 
     if extraction.status_signal != "none":
-        changed = await try_update_task_from_status(source_id, display_name, extraction, text)
+        changed = await try_update_task_from_status(source_id, user_id, display_name, extraction, text)
         if changed is not None:
             await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
@@ -692,8 +692,11 @@ async def handle_quoted_task_reply(
         # Once somebody quote-replies to a reminder addressed to this task, bind the
         # LINE user ID to the task and learn their display-name alias automatically.
         if user_id:
-            target.assignee_user_id = user_id
-            if target.assignee_name:
+            # A quote-reply identifies the task exactly, but it must not silently
+            # reassign a task that is already bound to a different LINE account.
+            if not target.assignee_user_id:
+                target.assignee_user_id = user_id
+            if target.assignee_name and target.assignee_user_id == user_id:
                 person = db.scalar(select(Person).where(Person.canonical_name == target.assignee_name))
                 if not person:
                     person = Person(canonical_name=target.assignee_name, line_user_id=user_id)
@@ -743,7 +746,7 @@ async def handle_quoted_task_reply(
         )
 
 
-async def try_update_task_from_status(group_id: str, sender_name: str | None, extraction, text: str) -> str | None:
+async def try_update_task_from_status(group_id: str, user_id: str | None, sender_name: str | None, extraction, text: str) -> str | None:
     with SessionLocal() as db:
         tasks = open_tasks(db, group_id)
         canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
@@ -767,7 +770,7 @@ async def try_update_task_from_status(group_id: str, sender_name: str | None, ex
         else:
             target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
         record_task_event(
-            db, target, "STATUS_REPLY", actor_name=canonical_sender, text=text,
+            db, target, "STATUS_REPLY", actor_name=canonical_sender, actor_user_id=user_id, text=text,
             old_status=old_status, new_status=new_status, commit=False,
         )
         db.commit()

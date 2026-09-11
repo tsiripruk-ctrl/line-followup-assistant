@@ -242,7 +242,9 @@ def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_na
             title = t.title.lower()
             if hint_low in title or title in hint_low:
                 return t
-    return tasks[0]
+    # Never guess the first task in a busy group. A wrong automatic close is
+    # worse than leaving an ambiguous reply for manual review.
+    return None
 
 
 
