@@ -23,7 +23,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity
 )
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -631,7 +631,8 @@ async def _process_message(event: dict):
         with SessionLocal() as db:
             tasks = open_tasks(db, source_id)
             canonical_sender = resolve_canonical_name(db, display_name) or display_name
-            target = choose_status_target(tasks, canonical_sender, extraction.assignee_name, extraction.related_task_hint, user_id)
+            match_hint = extraction.related_task_hint or text
+            target = choose_status_target(tasks, canonical_sender, extraction.assignee_name, match_hint, user_id)
             if target:
                 record_task_event(
                     db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
@@ -771,7 +772,8 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
         tasks = open_tasks(db, group_id)
         canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
         canonical_extracted = resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name
-        target = choose_status_target(tasks, canonical_sender, canonical_extracted, extraction.related_task_hint, user_id)
+        match_hint = extraction.related_task_hint or text
+        target = choose_status_target(tasks, canonical_sender, canonical_extracted, match_hint, user_id)
         if not target:
             return None
 

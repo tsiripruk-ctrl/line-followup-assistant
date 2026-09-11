@@ -215,10 +215,12 @@ def _match_text(value: str | None) -> str:
 
 
 def _task_text_score(task: Task, hint: str | None) -> float:
-    """Return 0..1 lexical similarity between a reply hint and a task.
+    """Return 0..1 lexical similarity between a reply and a task.
 
-    This deliberately favors distinctive words such as PostgreSQL/LG/TSP and avoids
-    matching generic status replies to an unrelated open task.
+    v0.6.3 gives strong weight to distinctive exact tokens (PostgreSQL, LG, TSP,
+    model numbers, project codes, etc.) while keeping generic status language weak.
+    This lets replies such as "PostgreSQL ตรวจสอบแล้ว ใช้งานได้ปกติค่ะ" match
+    the PostgreSQL task even when the sender is the owner rather than the assignee.
     """
     h = _match_text(hint)
     if not h:
@@ -228,12 +230,30 @@ def _task_text_score(task: Task, hint: str | None) -> float:
         return 0.0
     if h in target or target in h:
         return 0.95
+
     ht = {w for w in h.split() if len(w) >= 2}
     tt = {w for w in target.split() if len(w) >= 2}
-    overlap = len(ht & tt) / max(1, len(ht))
+    shared = ht & tt
+
+    # Distinctive technical/project tokens are very strong evidence.
+    # Latin/numeric tokens such as PostgreSQL, LG, TSP, CCTV, FU-... are useful
+    # discriminators even when the surrounding Thai wording differs.
+    distinctive = {
+        w for w in shared
+        if re.search(r"[a-zA-Z0-9]", w) and len(w) >= 2
+    }
+    if distinctive:
+        # One exact technical token is enough for a strong content match.
+        return 0.86 if len(distinctive) == 1 else 0.95
+
+    # Longer Thai words can also provide useful evidence, but less aggressively.
+    long_shared = {w for w in shared if len(w) >= 5}
+    overlap = len(shared) / max(1, len(ht))
     seq = SequenceMatcher(None, h, target).ratio()
-    # Exact distinctive token overlap should dominate fuzzy sequence similarity.
-    return min(1.0, 0.75 * overlap + 0.25 * seq)
+    score = 0.65 * overlap + 0.35 * seq
+    if long_shared:
+        score = max(score, min(0.82, 0.58 + 0.08 * len(long_shared)))
+    return min(1.0, score)
 
 
 def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> Task | None:
