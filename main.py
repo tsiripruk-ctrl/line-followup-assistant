@@ -23,7 +23,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity
 )
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 

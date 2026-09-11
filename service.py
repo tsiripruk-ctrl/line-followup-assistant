@@ -257,10 +257,13 @@ def _task_text_score(task: Task, hint: str | None) -> float:
 
 
 def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> Task | None:
-    """Conservatively match a human reply to one open task.
+    """Safely match a human reply to one open task.
 
-    Never select an arbitrary first task. Identity is useful, but when one person owns
-    several tasks the content must distinguish which task is being discussed.
+    v0.6.4 matching policy:
+    1) Strong content/topic evidence wins first (PostgreSQL, LG, TSP, CCTV, project/model codes).
+    2) LINE userId / assignee identity is only a tie-breaker or fallback when content is weak.
+    3) Identity must never override a clearly different technical topic.
+    4) If still ambiguous, return None rather than changing the wrong task.
     """
     if not tasks:
         return None
@@ -268,34 +271,67 @@ def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_na
     sender = normalize_name(sender_name)
     extracted_assignee = normalize_name(assignee_name)
 
-    scored: list[tuple[float, Task]] = []
+    rows = []
     for t in tasks:
-        score = _task_text_score(t, hint)
+        content_score = _task_text_score(t, hint)
+        identity_score = 0.0
         identity_match = False
         if sender_user_id and t.assignee_user_id == sender_user_id:
-            score += 0.45
+            identity_score = 0.45
             identity_match = True
         elif sender and normalize_name(t.assignee_name) == sender:
-            score += 0.30
+            identity_score = 0.30
             identity_match = True
         elif extracted_assignee and normalize_name(t.assignee_name) == extracted_assignee:
-            score += 0.20
+            identity_score = 0.20
 
-        # A single task owned by the sender can be accepted even with a weak hint, but
-        # multiple tasks for the same person require content evidence.
-        scored.append((score, t))
+        rows.append({
+            "task": t,
+            "content": content_score,
+            "identity": identity_score,
+            "identity_match": identity_match,
+            "combined": content_score + identity_score,
+        })
 
-    scored.sort(key=lambda item: item[0], reverse=True)
-    best_score, best = scored[0]
-    second_score = scored[1][0] if len(scored) > 1 else -1.0
+    # CONTENT-FIRST RULE: if the reply clearly names a topic/technology/project,
+    # select by content before considering ownership. This prevents a sender's
+    # other assigned task from stealing a reply such as "PostgreSQL ...".
+    strong = [r for r in rows if r["content"] >= 0.75]
+    if strong:
+        strong.sort(key=lambda r: (r["content"], r["identity"]), reverse=True)
+        best = strong[0]
+        second = strong[1] if len(strong) > 1 else None
+        # If one topic is clearly stronger, use it. If two are equally strong,
+        # allow identity to break the tie; otherwise refuse to guess.
+        if second is None:
+            return best["task"]
+        if best["content"] - second["content"] >= 0.10:
+            return best["task"]
+        if best["identity"] > second["identity"]:
+            return best["task"]
+        return None
 
-    sender_owned = [t for t in tasks if (sender_user_id and t.assignee_user_id == sender_user_id) or (sender and normalize_name(t.assignee_name) == sender)]
-    if len(sender_owned) == 1 and best is sender_owned[0] and best_score >= 0.35:
-        return best
+    # Medium content evidence can combine with identity, but still requires a
+    # meaningful separation from other candidates.
+    medium = [r for r in rows if r["content"] >= 0.35]
+    if medium:
+        medium.sort(key=lambda r: r["combined"], reverse=True)
+        best = medium[0]
+        second_score = medium[1]["combined"] if len(medium) > 1 else -1.0
+        if best["combined"] >= 0.58 and (best["combined"] - second_score) >= 0.12:
+            return best["task"]
+        return None
 
-    # Require a meaningful lexical/identity score and separation from the runner-up.
-    if best_score >= 0.58 and (best_score - second_score) >= 0.12:
-        return best
+    # Identity-only fallback is allowed only when the sender owns exactly one
+    # open task in this group. If the sender owns multiple tasks, do not guess.
+    sender_owned = [
+        r for r in rows
+        if (sender_user_id and r["task"].assignee_user_id == sender_user_id)
+        or (sender and normalize_name(r["task"].assignee_name) == sender)
+    ]
+    if len(sender_owned) == 1:
+        return sender_owned[0]["task"]
+
     return None
 
 

@@ -1,3 +1,7 @@
+# LINE Follow-up Assistant v0.6.4
+
+Hotfix: content-first safe task matching. Strong topic keywords such as PostgreSQL, LG, TSP, CCTV and project/model codes now select the task before LINE user identity is considered. Identity is a tie-breaker/fallback only. Ambiguous replies are left unmatched instead of updating the wrong task.
+
 # LINE Follow-up Assistant v0.6.2
 
 ## New in v0.6.2 — Mention-based Assignee Identity
