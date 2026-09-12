@@ -385,11 +385,18 @@ def ensure_person(db: Session, canonical_name: str, line_user_id: str | None = N
     canonical_name = clean_display_name(canonical_name)
     person = db.scalar(select(Person).where(func.lower(Person.canonical_name) == canonical_name.lower()))
     if not person:
-        person = Person(canonical_name=canonical_name, line_user_id=line_user_id or None)
+        person = Person(
+            canonical_name=canonical_name, display_name=canonical_name, call_name=canonical_name,
+            role="EMPLOYEE", line_user_id=line_user_id or None, active=True,
+        )
         db.add(person)
         db.flush()
     elif line_user_id and not person.line_user_id:
         person.line_user_id = line_user_id
+    if not person.call_name:
+        person.call_name = person.canonical_name
+    if not person.role:
+        person.role = "EMPLOYEE"
     key = normalize_name(canonical_name)
     if key and not db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key)):
         db.add(PersonAlias(person_id=person.id, alias=canonical_name, normalized_alias=key))
@@ -398,12 +405,8 @@ def ensure_person(db: Session, canonical_name: str, line_user_id: str | None = N
 
 
 def bind_person_identity(db: Session, canonical_name: str, line_user_id: str, alias_name: str | None = None) -> Person:
-    """Bind a stable LINE userId to the People Registry and learn aliases.
-
-    LINE userId is treated as the strongest identity key. If a person with that
-    userId already exists, new display names are added as aliases instead of
-    creating a duplicate person.
-    """
+    """Bind a stable LINE userId and learn the latest display name without duplicating people."""
+    raw_display = (alias_name or canonical_name or "").strip() or None
     canonical_name = clean_display_name(canonical_name) or clean_display_name(alias_name) or "ผู้รับผิดชอบ"
     person = db.scalar(select(Person).where(Person.line_user_id == line_user_id))
     if not person:
@@ -411,16 +414,25 @@ def bind_person_identity(db: Session, canonical_name: str, line_user_id: str, al
         if person and not person.line_user_id:
             person.line_user_id = line_user_id
         elif not person:
-            person = Person(canonical_name=canonical_name, line_user_id=line_user_id)
+            person = Person(
+                canonical_name=canonical_name, display_name=raw_display, call_name=canonical_name,
+                role="EMPLOYEE", line_user_id=line_user_id, active=True,
+            )
             db.add(person)
             db.flush()
-    for alias_value in {canonical_name, clean_display_name(alias_name)}:
+    if raw_display:
+        person.display_name = raw_display
+    if not person.call_name:
+        person.call_name = person.canonical_name
+    if not person.role:
+        person.role = "EMPLOYEE"
+    person.active = True
+    for alias_value in {canonical_name, clean_display_name(alias_name), raw_display}:
         key = normalize_name(alias_value)
         if key and not db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key)):
-            db.add(PersonAlias(person_id=person.id, alias=alias_value, normalized_alias=key))
+            db.add(PersonAlias(person_id=person.id, alias=str(alias_value).strip(), normalized_alias=key))
     db.flush()
     return person
-
 
 def set_person_alias(db: Session, alias_name: str, canonical_name: str) -> tuple[Person, int]:
     """Map alias_name to canonical_name and normalize existing task rows."""
@@ -457,19 +469,78 @@ def set_person_alias(db: Session, alias_name: str, canonical_name: str) -> tuple
     return person, updated
 
 
-def list_people(db: Session) -> list[dict]:
-    people = list(db.scalars(select(Person).where(Person.active == True).order_by(Person.canonical_name.asc())).all())
+def update_person_profile(
+    db: Session, person_id: int, *, canonical_name: str, call_name: str | None = None,
+    role: str = "EMPLOYEE", active: bool = True, display_name: str | None = None,
+) -> tuple[Person, int]:
+    person = db.get(Person, person_id)
+    if not person:
+        raise ValueError("person not found")
+    new_canonical = clean_display_name(canonical_name)
+    if not new_canonical:
+        raise ValueError("canonical name is required")
+    duplicate = db.scalar(select(Person).where(
+        func.lower(Person.canonical_name) == new_canonical.lower(), Person.id != person.id
+    ))
+    if duplicate:
+        raise ValueError("canonical name is already used by another person")
+
+    old_canonical = person.canonical_name
+    old_key = normalize_name(old_canonical)
+    person.canonical_name = new_canonical
+    person.call_name = (call_name or new_canonical).strip()
+    person.role = (role or "EMPLOYEE").strip().upper()
+    person.active = bool(active)
+    if display_name is not None and display_name.strip():
+        person.display_name = display_name.strip()
+
+    for alias_value in {old_canonical, new_canonical, person.display_name}:
+        key = normalize_name(alias_value)
+        if key:
+            existing = db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key))
+            if not existing:
+                db.add(PersonAlias(person_id=person.id, alias=str(alias_value).strip(), normalized_alias=key))
+            elif existing.person_id == person.id:
+                existing.alias = str(alias_value).strip()
+
+    updated = 0
+    if old_key != normalize_name(new_canonical):
+        for task in db.scalars(select(Task)).all():
+            if normalize_name(task.assignee_name) == old_key:
+                old = task.assignee_name
+                task.assignee_name = new_canonical
+                if person.line_user_id and not task.assignee_user_id:
+                    task.assignee_user_id = person.line_user_id
+                record_task_event(
+                    db, task, "ASSIGNEE_PROFILE_UPDATED", actor_name="Owner",
+                    text=f"ปรับชื่อผู้รับผิดชอบจาก {old or '-'} → {new_canonical}", commit=False,
+                )
+                updated += 1
+    db.commit()
+    db.refresh(person)
+    return person, updated
+
+
+def list_people(db: Session, include_inactive: bool = True) -> list[dict]:
+    q = select(Person).order_by(Person.active.desc(), Person.canonical_name.asc())
+    if not include_inactive:
+        q = q.where(Person.active == True)
+    people = list(db.scalars(q).all())
     result = []
     for p in people:
         aliases = list(db.scalars(select(PersonAlias).where(PersonAlias.person_id == p.id).order_by(PersonAlias.alias.asc())).all())
         result.append({
             "id": p.id,
             "canonical_name": p.canonical_name,
+            "display_name": p.display_name,
+            "call_name": p.call_name or p.canonical_name,
+            "role": p.role or "EMPLOYEE",
             "line_user_id": p.line_user_id,
+            "line_bound": bool(p.line_user_id),
+            "active": bool(p.active),
             "aliases": [a.alias for a in aliases],
         })
     return result
-
 
 def record_task_event(
     db: Session, task: Task, event_type: str, *, actor_name: str | None = None,

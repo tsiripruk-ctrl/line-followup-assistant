@@ -1,4 +1,5 @@
 import random
+import json
 from datetime import datetime, timedelta
 import asyncio
 from zoneinfo import ZoneInfo
@@ -9,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
-from db import Base, engine, SessionLocal
+from db import Base, engine, SessionLocal, ensure_people_registry_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
@@ -20,10 +21,10 @@ from service import (
     format_task, choose_status_target, STATUS_THAI, brief_counts,
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
-    task_timeline, backfill_task_created_events, bind_person_identity
+    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile
 )
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -31,6 +32,7 @@ scheduler = AsyncIOScheduler(timezone=settings.timezone)
 @app.on_event("startup")
 async def startup():
     Base.metadata.create_all(bind=engine)
+    ensure_people_registry_schema()
     with SessionLocal() as db:
         imported = backfill_task_created_events(db)
         if imported:
@@ -76,6 +78,8 @@ def health():
         "database": "postgresql" if dialect == "postgresql" else dialect,
         "timeline": True, "assignee_normalization": True,
         "mention_assignment": True, "mention_followup": True,
+        "people_registry": True, "people_registry_profile": True,
+        "safe_task_matching": True,
     }
 
 
@@ -298,6 +302,27 @@ def api_people_alias(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.post("/api/people/{person_id}/profile")
+def api_people_profile(
+    person_id: int, canonical_name: str = Query(...), call_name: str = Query(default=""),
+    role: str = Query(default="EMPLOYEE"), active: bool = Query(default=True),
+    display_name: str = Query(default=""), token: str | None = Query(default=None),
+):
+    _require_dashboard_token(token)
+    try:
+        with SessionLocal() as db:
+            person, updated = update_person_profile(
+                db, person_id, canonical_name=canonical_name, call_name=call_name or None,
+                role=role, active=active, display_name=display_name or None,
+            )
+            return {
+                "ok": True, "person_id": person.id, "canonical_name": person.canonical_name,
+                "updated_tasks": updated,
+            }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(
     token: str | None = Query(default=None),
@@ -357,10 +382,22 @@ def dashboard(
     people_rows = []
     for p in people:
         aliases = ", ".join(p["aliases"]) or "-"
+        bound = "ผูกแล้ว" if p["line_bound"] else "ยังไม่ผูก"
+        active_label = "ใช้งาน" if p["active"] else "ปิดใช้งาน"
+        uid_short = (p["line_user_id"][:10] + "…") if p["line_user_id"] else "-"
         people_rows.append(
-            f"<tr><td><b>{escape(p['canonical_name'])}</b></td><td>{escape(aliases)}</td></tr>"
+            "<tr>"
+            f"<td><b>{escape(p['canonical_name'])}</b><br><small>{escape(active_label)}</small></td>"
+            f"<td>{escape(p['call_name'] or p['canonical_name'])}</td>"
+            f"<td>{escape(p['display_name'] or '-')}</td>"
+            f"<td>{escape(p['role'])}</td>"
+            f"<td>{escape(bound)}<br><small>{escape(uid_short)}</small></td>"
+            f"<td>{escape(aliases)}</td>"
+            f"<td><button onclick=\"editPerson({p['id']})\">แก้ไข</button></td>"
+            "</tr>"
         )
-    people_html = "".join(people_rows) or '<tr><td colspan="2">ยังไม่มีชื่อมาตรฐาน</td></tr>'
+    people_html = "".join(people_rows) or '<tr><td colspan="7">ยังไม่มีข้อมูลบุคลากร</td></tr>'
+    people_json = json.dumps(people, ensure_ascii=False)
 
     return f"""<!doctype html>
 <html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -393,20 +430,33 @@ th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:
 <table><thead><tr><th>รหัส/สถานะ</th><th>งาน</th><th>โครงการ</th><th>ผู้รับผิดชอบ</th><th>กำหนด</th><th>ตามแล้ว</th><th>จัดการ</th></tr></thead>
 <tbody>{rows_html}</tbody></table>
 
-<div class="section"><h2>จัดการชื่อผู้รับผิดชอบ</h2>
+<div class="section"><h2>ทะเบียนผู้รับผิดชอบ (People Registry)</h2>
+<div class="sub">LINE User ID เป็นตัวตนหลัก ระบบเรียนรู้ Display Name จากข้อความ/การ @Mention แล้วคุณกำหนดชื่อมาตรฐานและชื่อเรียกได้</div>
 <form onsubmit="saveAlias(event)">
 <input id="aliasName" placeholder="ชื่อที่พบ เช่น Tong Thanakrit" required>
-<input id="canonicalName" placeholder="ชื่อมาตรฐาน เช่น ต้น" required>
-<button type="submit">รวมชื่อ</button>
+<input id="canonicalName" placeholder="ชื่อมาตรฐาน เช่น พี่ต้อง" required>
+<button type="submit">เพิ่ม/รวม Alias</button>
 </form>
-<table><thead><tr><th>ชื่อมาตรฐาน</th><th>ชื่อที่ระบบรู้จัก</th></tr></thead><tbody>{people_html}</tbody></table>
+<table><thead><tr><th>ชื่อมาตรฐาน</th><th>ชื่อที่ใช้เรียก</th><th>LINE Display Name</th><th>Role</th><th>LINE ID</th><th>Aliases</th><th>จัดการ</th></tr></thead><tbody>{people_html}</tbody></table>
 </div>
 </main>
+<div id="personModal" class="modal" onclick="if(event.target===this)closePerson()"><div class="modalbox">
+<div style="display:flex;justify-content:space-between;gap:10px"><h2>แก้ไขบุคลากร</h2><button class="secondary" onclick="closePerson()">ปิด</button></div>
+<form id="personForm" onsubmit="savePerson(event)" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+<input type="hidden" id="personId">
+<label>ชื่อมาตรฐาน<input id="personCanonical" required style="width:100%"></label>
+<label>ชื่อที่ OA ใช้เรียก<input id="personCall" style="width:100%"></label>
+<label>LINE Display Name<input id="personDisplay" style="width:100%"></label>
+<label>Role<select id="personRole" style="width:100%"><option>EMPLOYEE</option><option>OWNER</option><option>MANAGER</option><option>ADMIN</option></select></label>
+<label style="grid-column:1/-1"><input type="checkbox" id="personActive"> ใช้งานบุคคลนี้</label>
+<div style="grid-column:1/-1"><button type="submit">บันทึก</button></div>
+</form></div></div>
 <div id="timelineModal" class="modal" onclick="if(event.target===this)closeTimeline()"><div class="modalbox">
 <div style="display:flex;justify-content:space-between;gap:10px"><h2 id="timelineTitle">ประวัติงาน</h2><button class="secondary" onclick="closeTimeline()">ปิด</button></div>
 <div id="timelineBody"></div></div></div>
 <script>
 const token={token_js};
+const people={people_json};
 async function setStatus(code,status){{
   if(!confirm('ยืนยัน '+code+' → '+status+' ?')) return;
   const u='/api/tasks/'+encodeURIComponent(code)+'/status?status='+encodeURIComponent(status)+'&token='+encodeURIComponent(token);
@@ -436,6 +486,30 @@ async function saveAlias(ev){{
   const u='/api/people/alias?alias='+encodeURIComponent(alias)+'&canonical='+encodeURIComponent(canonical)+'&token='+encodeURIComponent(token);
   const r=await fetch(u,{{method:'POST'}});
   if(r.ok){{const d=await r.json();alert('รวมชื่อแล้ว และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}} else alert(await r.text());
+}}
+function editPerson(id){{
+  const p=people.find(x=>x.id===id); if(!p) return;
+  document.getElementById('personId').value=p.id;
+  document.getElementById('personCanonical').value=p.canonical_name||'';
+  document.getElementById('personCall').value=p.call_name||'';
+  document.getElementById('personDisplay').value=p.display_name||'';
+  document.getElementById('personRole').value=p.role||'EMPLOYEE';
+  document.getElementById('personActive').checked=!!p.active;
+  document.getElementById('personModal').style.display='flex';
+}}
+function closePerson(){{document.getElementById('personModal').style.display='none';}}
+async function savePerson(ev){{
+  ev.preventDefault();
+  const id=document.getElementById('personId').value;
+  const params=new URLSearchParams({{
+    canonical_name:document.getElementById('personCanonical').value.trim(),
+    call_name:document.getElementById('personCall').value.trim(),
+    display_name:document.getElementById('personDisplay').value.trim(),
+    role:document.getElementById('personRole').value,
+    active:String(document.getElementById('personActive').checked), token:token
+  }});
+  const r=await fetch('/api/people/'+encodeURIComponent(id)+'/profile?'+params.toString(),{{method:'POST'}});
+  if(r.ok){{const d=await r.json();alert('บันทึกแล้ว และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}} else alert(await r.text());
 }}
 </script></body></html>"""
 
@@ -720,7 +794,7 @@ async def handle_quoted_task_reply(
             if target.assignee_name and target.assignee_user_id == user_id:
                 person = db.scalar(select(Person).where(Person.canonical_name == target.assignee_name))
                 if not person:
-                    person = Person(canonical_name=target.assignee_name, line_user_id=user_id)
+                    person = Person(canonical_name=target.assignee_name, display_name=sender_name, call_name=target.assignee_name, role="EMPLOYEE", line_user_id=user_id, active=True)
                     db.add(person)
                     db.flush()
                 elif not person.line_user_id:
@@ -988,6 +1062,13 @@ async def reminder_scan(force: bool = False):
                     t.status = "OVERDUE"
 
                 assignee = t.assignee_name.strip() if t.assignee_name else "ทีม"
+                person = None
+                if t.assignee_user_id:
+                    person = db.scalar(select(Person).where(Person.line_user_id == t.assignee_user_id))
+                if not person and t.assignee_name:
+                    person = db.scalar(select(Person).where(Person.canonical_name == t.assignee_name))
+                if person and person.call_name:
+                    assignee = person.call_name.strip()
                 use_mention = bool(t.assignee_user_id)
                 greeting = "{assignee}คะ" if use_mention else (f"{assignee}คะ" if assignee != "ทีม" else "ทีมคะ")
                 is_pre_due = bool(t.due_at and now < t.due_at)

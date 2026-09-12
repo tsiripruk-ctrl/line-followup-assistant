@@ -67,10 +67,13 @@ class TaskEvent(Base):
 
 
 class Person(Base):
-    """Canonical assignee identity."""
+    """Canonical LINE-aware assignee identity used by the People Registry."""
     __tablename__ = "people"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     canonical_name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    call_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    role: Mapped[str] = mapped_column(String(32), default="EMPLOYEE")
     line_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True, index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
