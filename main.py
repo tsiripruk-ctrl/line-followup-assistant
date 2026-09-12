@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Query
 from sqlalchemy import select
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
@@ -24,7 +24,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people
 )
 
-VERSION = "0.6.7"
+VERSION = "0.6.8"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -79,7 +79,7 @@ def health():
         "timeline": True, "assignee_normalization": True,
         "mention_assignment": True, "mention_followup": True,
         "people_registry": True, "people_registry_profile": True,
-        "safe_task_matching": True, "people_merge": True,
+        "safe_task_matching": True, "people_merge": True, "people_merge_nojs": True,
     }
 
 
@@ -340,6 +340,41 @@ def api_people_merge(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.get("/dashboard/people/merge-confirm", response_class=HTMLResponse)
+def dashboard_people_merge_confirm(
+    person_a_id: int = Query(...), person_b_id: int = Query(...), token: str | None = Query(default=None),
+):
+    _require_dashboard_token(token)
+    with SessionLocal() as db:
+        people = {p["id"]: p for p in list_people(db)}
+    pa, pb = people.get(person_a_id), people.get(person_b_id)
+    if not pa or not pb:
+        raise HTTPException(status_code=404, detail="person not found")
+    # Safety preview only; actual merge rules stay in service.merge_people.
+    final_name = pb["canonical_name"] if pa["line_bound"] and not pb["line_bound"] else (pa["canonical_name"] if pb["line_bound"] and not pa["line_bound"] else pa["canonical_name"])
+    t = escape(token or "", quote=True)
+    confirm_url = f"/dashboard/people/merge-do?person_a_id={person_a_id}&person_b_id={person_b_id}&token={t}"
+    back_url = f"/dashboard?token={t}"
+    return HTMLResponse(f"""<!doctype html><html lang='th'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>ยืนยันรวมบุคคล</title><style>body{{font-family:Arial,sans-serif;background:#f6f7f8;color:#202124}}.box{{max-width:620px;margin:60px auto;background:#fff;padding:24px;border:1px solid #ddd;border-radius:14px}}a{{display:inline-block;padding:10px 14px;border-radius:8px;text-decoration:none;margin-right:8px}}.ok{{background:#0f9d58;color:white}}.cancel{{background:#6b7280;color:white}}code{{background:#f2f2f2;padding:2px 5px;border-radius:4px}}</style></head><body><div class='box'>
+    <h2>ยืนยันการรวมบุคคล</h2><p>ต้องการรวม <b>{escape(pa['canonical_name'])}</b> กับ <b>{escape(pb['canonical_name'])}</b> เป็นบุคคลเดียวกันหรือไม่?</p>
+    <p>ชื่อมาตรฐานหลังรวม: <b>{escape(final_name)}</b></p><p>LINE ID ที่ผูกไว้จะถูกเก็บตามกฎความปลอดภัย และ Task เดิมจะถูกปรับอัตโนมัติ</p>
+    <a class='ok' href='{confirm_url}'>ยืนยันการรวม</a><a class='cancel' href='{back_url}'>ยกเลิก</a></div></body></html>""")
+
+
+@app.get("/dashboard/people/merge-do")
+def dashboard_people_merge_do(
+    person_a_id: int = Query(...), person_b_id: int = Query(...), token: str | None = Query(default=None),
+):
+    _require_dashboard_token(token)
+    try:
+        with SessionLocal() as db:
+            merge_people(db, person_a_id, person_b_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return RedirectResponse(url=f"/dashboard?token={token}", status_code=303)
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(
     token: str | None = Query(default=None),
@@ -405,9 +440,13 @@ def dashboard(
         suggestions = p.get("duplicate_suggestions") or []
         merge_buttons = ""
         for suggestion in suggestions[:3]:
+            merge_url = (
+                f'/dashboard/people/merge-confirm?person_a_id={p["id"]}'
+                f'&person_b_id={suggestion["id"]}&token={safe_token}'
+            )
             merge_buttons += (
-                f' <button type="button" class="mergebtn" onclick="mergePerson({p["id"]},{suggestion["id"]})">'
-                f'รวมกับ {escape(suggestion["canonical_name"])}</button>'
+                f' <a class="mergebtn" href="{merge_url}">'
+                f'รวมกับ {escape(suggestion["canonical_name"])}</a>'
             )
         people_rows.append(
             "<tr>"
@@ -433,7 +472,7 @@ main{{max-width:1280px;margin:auto;padding:24px}} h1{{margin:0 0 4px}} .sub{{col
 .card{{background:white;border:1px solid #ddd;border-radius:12px;padding:14px}} .card span{{display:block;font-size:28px;margin-top:7px}}
 form{{background:white;padding:14px;border-radius:12px;border:1px solid #ddd;margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap}}
 input,select{{padding:9px;border:1px solid #bbb;border-radius:8px}} button{{padding:8px 10px;border:0;border-radius:8px;background:#1677ff;color:white;cursor:pointer}}
-button.secondary{{background:#6b7280}} button.mergebtn{{background:#0f9d58;margin-top:6px;white-space:nowrap}} table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden}}
+button.secondary{{background:#6b7280}} .mergebtn{{display:inline-block;padding:8px 10px;border-radius:8px;background:#0f9d58;color:white;text-decoration:none;margin-top:6px;white-space:nowrap}} table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden}}
 th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}} th{{background:#f0f2f5}} small{{color:#666}}
 .section{{margin-top:22px}} .section h2{{margin:0 0 10px}}
 .modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);align-items:center;justify-content:center;padding:20px}}

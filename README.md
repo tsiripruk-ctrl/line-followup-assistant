@@ -60,3 +60,9 @@ Recommended naming example:
 - Fixed People Registry merge buttons so names containing symbols/emoji cannot break inline JavaScript.
 - Merge buttons now pass numeric IDs only and resolve names from the registry data.
 - Added explicit button type and visible error handling for merge requests.
+
+
+## v0.6.8
+- Replaced People Merge inline JavaScript button with a server-rendered confirmation flow.
+- Merge now works even when browser inline JavaScript/onclick is blocked or stale.
+- Added health flag `people_merge_nojs: true`.
