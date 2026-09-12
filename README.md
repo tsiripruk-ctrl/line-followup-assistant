@@ -71,3 +71,8 @@ Recommended naming example:
 - People Registry: add/remove multiple aliases directly from Edit Person.
 - Alias matching preserves call forms such as `มาช` and `พี่มาช` as separate saved aliases while remaining backward compatible.
 - Prevents the same alias from being assigned to two different people.
+
+
+## v0.6.10 — Dashboard JavaScript Hotfix
+- Fixed a JavaScript parse error caused by unescaped line breaks in the People Merge confirmation message.
+- Restores all Dashboard JavaScript actions, including Edit Person, Alias management, task status actions, and timeline buttons.

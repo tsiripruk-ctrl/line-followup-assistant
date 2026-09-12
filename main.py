@@ -24,7 +24,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias
 )
 
-VERSION = "0.6.9"
+VERSION = "0.6.10"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -582,7 +582,7 @@ async function mergePerson(a,b){{
   const pa=people.find(x=>Number(x.id)===Number(a)), pb=people.find(x=>Number(x.id)===Number(b));
   if(!pa||!pb){{alert('ไม่พบข้อมูลบุคคล กรุณารีเฟรชหน้า Dashboard แล้วลองใหม่');return;}}
   const finalName=(pa.line_bound&&!pb.line_bound)?pb.canonical_name:((pb.line_bound&&!pa.line_bound)?pa.canonical_name:pa.canonical_name);
-  const msg='ยืนยันรวม “'+pa.canonical_name+'” กับ “'+pb.canonical_name+'” เป็นบุคคลเดียวกัน?\n\nชื่อมาตรฐานหลังรวม: '+finalName+'\nLINE ID ที่ผูกไว้จะถูกเก็บไว้ และงานเดิมจะถูกปรับอัตโนมัติ';
+  const msg='ยืนยันรวม “'+pa.canonical_name+'” กับ “'+pb.canonical_name+'” เป็นบุคคลเดียวกัน?\\n\\nชื่อมาตรฐานหลังรวม: '+finalName+'\\nLINE ID ที่ผูกไว้จะถูกเก็บไว้ และงานเดิมจะถูกปรับอัตโนมัติ';
   if(!window.confirm(msg)) return;
   try{{
     const params=new URLSearchParams({{person_a_id:String(a),person_b_id:String(b),token:String(token||'')}});
