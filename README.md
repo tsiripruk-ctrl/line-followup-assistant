@@ -1,4 +1,4 @@
-# LINE Follow-up Assistant v0.6.6
+# LINE Follow-up Assistant v0.6.7
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
@@ -48,9 +48,15 @@ Recommended naming example:
 - Role: `OWNER`
 
 
-## v0.6.6 — Safe People Merge
+## v0.6.7 — People Merge Button Hotfix
 - Detects likely duplicate People Registry rows from canonical/display/alias overlap.
 - Dashboard shows a green “รวมกับ …” button for suggested duplicates.
 - Merge preserves the stable LINE userId, aliases, role, and active state.
 - Existing tasks are normalized to the merged canonical person.
 - Safety guard: two different bound LINE userIds cannot be merged.
+
+
+## v0.6.7 hotfix
+- Fixed People Registry merge buttons so names containing symbols/emoji cannot break inline JavaScript.
+- Merge buttons now pass numeric IDs only and resolve names from the registry data.
+- Added explicit button type and visible error handling for merge requests.

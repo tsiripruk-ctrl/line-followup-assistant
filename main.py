@@ -24,7 +24,7 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people
 )
 
-VERSION = "0.6.6"
+VERSION = "0.6.7"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -406,8 +406,7 @@ def dashboard(
         merge_buttons = ""
         for suggestion in suggestions[:3]:
             merge_buttons += (
-                f' <button class="mergebtn" onclick="mergePerson({p["id"]},{suggestion["id"]},'
-                f'\'{escape(p["canonical_name"], quote=True)}\',\'{escape(suggestion["canonical_name"], quote=True)}\')">'
+                f' <button type="button" class="mergebtn" onclick="mergePerson({p["id"]},{suggestion["id"]})">'
                 f'รวมกับ {escape(suggestion["canonical_name"])}</button>'
             )
         people_rows.append(
@@ -512,16 +511,24 @@ async function saveAlias(ev){{
   const r=await fetch(u,{{method:'POST'}});
   if(r.ok){{const d=await r.json();alert('รวมชื่อแล้ว และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}} else alert(await r.text());
 }}
-async function mergePerson(a,b,nameA,nameB){{
-  const pa=people.find(x=>x.id===a), pb=people.find(x=>x.id===b);
-  if(!pa||!pb) return;
-  let finalName=(pa.line_bound&&!pb.line_bound)?pb.canonical_name:((pb.line_bound&&!pa.line_bound)?pa.canonical_name:pa.canonical_name);
-  const msg='ยืนยันรวม “'+nameA+'” กับ “'+nameB+'” เป็นบุคคลเดียวกัน?\n\nชื่อมาตรฐานหลังรวม: '+finalName+'\nLINE ID ที่ผูกไว้จะถูกเก็บไว้ และงานเดิมจะถูกปรับอัตโนมัติ';
-  if(!confirm(msg)) return;
-  const params=new URLSearchParams({{person_a_id:String(a),person_b_id:String(b),token:token}});
-  const r=await fetch('/api/people/merge?'+params.toString(),{{method:'POST'}});
-  if(r.ok){{const d=await r.json();alert('รวมบุคคลเรียบร้อยเป็น “'+d.canonical_name+'” และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}}
-  else alert(await r.text());
+async function mergePerson(a,b){{
+  const pa=people.find(x=>Number(x.id)===Number(a)), pb=people.find(x=>Number(x.id)===Number(b));
+  if(!pa||!pb){{alert('ไม่พบข้อมูลบุคคล กรุณารีเฟรชหน้า Dashboard แล้วลองใหม่');return;}}
+  const finalName=(pa.line_bound&&!pb.line_bound)?pb.canonical_name:((pb.line_bound&&!pa.line_bound)?pa.canonical_name:pa.canonical_name);
+  const msg='ยืนยันรวม “'+pa.canonical_name+'” กับ “'+pb.canonical_name+'” เป็นบุคคลเดียวกัน?\n\nชื่อมาตรฐานหลังรวม: '+finalName+'\nLINE ID ที่ผูกไว้จะถูกเก็บไว้ และงานเดิมจะถูกปรับอัตโนมัติ';
+  if(!window.confirm(msg)) return;
+  try{{
+    const params=new URLSearchParams({{person_a_id:String(a),person_b_id:String(b),token:String(token||'')}});
+    const r=await fetch('/api/people/merge?'+params.toString(),{{method:'POST'}});
+    const body=await r.text();
+    if(!r.ok){{alert('รวมบุคคลไม่สำเร็จ: '+body);return;}}
+    const d=JSON.parse(body);
+    alert('รวมบุคคลเรียบร้อยเป็น “'+d.canonical_name+'” และปรับงานเดิม '+d.updated_tasks+' รายการ');
+    window.location.reload();
+  }}catch(err){{
+    console.error(err);
+    alert('เกิดข้อผิดพลาดขณะรวมบุคคล กรุณารีเฟรชหน้าแล้วลองอีกครั้ง');
+  }}
 }}
 function editPerson(id){{
   const p=people.find(x=>x.id===id); if(!p) return;
