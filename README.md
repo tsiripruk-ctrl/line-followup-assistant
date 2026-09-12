@@ -66,3 +66,8 @@ Recommended naming example:
 - Replaced People Merge inline JavaScript button with a server-rendered confirmation flow.
 - Merge now works even when browser inline JavaScript/onclick is blocked or stale.
 - Added health flag `people_merge_nojs: true`.
+
+## v0.6.9
+- People Registry: add/remove multiple aliases directly from Edit Person.
+- Alias matching preserves call forms such as `มาช` and `พี่มาช` as separate saved aliases while remaining backward compatible.
+- Prevents the same alias from being assigned to two different people.

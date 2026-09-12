@@ -205,6 +205,16 @@ def normalize_name(value: str | None) -> str:
     return "".join(x.split())
 
 
+def normalize_alias_key(value: str | None) -> str:
+    """Alias storage key. Preserve honorifics so มาช / พี่มาช can both be saved.
+
+    Matching remains backward compatible with legacy normalize_name keys.
+    """
+    if not value:
+        return ""
+    return "".join(value.strip().lower().split())
+
+
 def _match_text(value: str | None) -> str:
     """Normalize Thai/English task text for conservative task matching."""
     if not value:
@@ -349,10 +359,13 @@ def clean_display_name(value: str | None) -> str:
 
 
 def get_person_by_alias(db: Session, name: str | None) -> Person | None:
-    key = normalize_name(name)
-    if not key:
+    exact_key = normalize_alias_key(name)
+    legacy_key = normalize_name(name)
+    if not exact_key:
         return None
-    alias = db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key))
+    alias = db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == exact_key))
+    if not alias and legacy_key and legacy_key != exact_key:
+        alias = db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == legacy_key))
     if not alias:
         return None
     return db.get(Person, alias.person_id)
@@ -467,6 +480,44 @@ def set_person_alias(db: Session, alias_name: str, canonical_name: str) -> tuple
                 old_person.active = False
     db.commit()
     return person, updated
+
+
+def add_alias_to_person(db: Session, person_id: int, alias_name: str) -> PersonAlias:
+    person = db.get(Person, person_id)
+    if not person:
+        raise ValueError("person not found")
+    alias_name = " ".join((alias_name or "").strip().split())
+    if not alias_name:
+        raise ValueError("alias is required")
+    key = normalize_alias_key(alias_name)
+    existing = db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key))
+    if existing:
+        if existing.person_id == person.id:
+            existing.alias = alias_name
+            db.commit(); db.refresh(existing); return existing
+        other = db.get(Person, existing.person_id)
+        raise ValueError(f"ชื่อนี้ถูกใช้กับบุคคลอื่นแล้ว: {other.canonical_name if other else 'unknown'}")
+    row = PersonAlias(person_id=person.id, alias=alias_name, normalized_alias=key)
+    db.add(row); db.commit(); db.refresh(row)
+    return row
+
+
+def delete_person_alias(db: Session, person_id: int, alias_name: str) -> None:
+    person = db.get(Person, person_id)
+    if not person:
+        raise ValueError("person not found")
+    key = normalize_alias_key(alias_name)
+    row = db.scalar(select(PersonAlias).where(PersonAlias.person_id == person.id, PersonAlias.normalized_alias == key))
+    if not row:
+        # Backward compatibility for aliases stored by v0.6.8 and earlier.
+        legacy = normalize_name(alias_name)
+        row = db.scalar(select(PersonAlias).where(PersonAlias.person_id == person.id, PersonAlias.normalized_alias == legacy))
+    if not row:
+        raise ValueError("alias not found")
+    # Keep at least the canonical identity resolvable.
+    if normalize_name(row.alias) == normalize_name(person.canonical_name):
+        raise ValueError("ไม่สามารถลบชื่อมาตรฐานออกจาก Aliases ได้")
+    db.delete(row); db.commit()
 
 
 def update_person_profile(

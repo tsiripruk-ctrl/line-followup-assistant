@@ -21,10 +21,10 @@ from service import (
     format_task, choose_status_target, STATUS_THAI, brief_counts,
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
-    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people
+    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias
 )
 
-VERSION = "0.6.8"
+VERSION = "0.6.9"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -80,6 +80,7 @@ def health():
         "mention_assignment": True, "mention_followup": True,
         "people_registry": True, "people_registry_profile": True,
         "safe_task_matching": True, "people_merge": True, "people_merge_nojs": True,
+        "people_multi_alias": True, "people_alias_crud": True,
     }
 
 
@@ -302,6 +303,28 @@ def api_people_alias(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.post("/api/people/{person_id}/aliases")
+def api_people_add_alias(person_id: int, alias: str = Query(...), token: str | None = Query(default=None)):
+    _require_dashboard_token(token)
+    try:
+        with SessionLocal() as db:
+            row = add_alias_to_person(db, person_id, alias)
+            return {"ok": True, "alias": row.alias}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/people/{person_id}/aliases")
+def api_people_delete_alias(person_id: int, alias: str = Query(...), token: str | None = Query(default=None)):
+    _require_dashboard_token(token)
+    try:
+        with SessionLocal() as db:
+            delete_person_alias(db, person_id, alias)
+            return {"ok": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/people/{person_id}/profile")
 def api_people_profile(
     person_id: int, canonical_name: str = Query(...), call_name: str = Query(default=""),
@@ -512,7 +535,12 @@ th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:
 <label>LINE Display Name<input id="personDisplay" style="width:100%"></label>
 <label>Role<select id="personRole" style="width:100%"><option>EMPLOYEE</option><option>OWNER</option><option>MANAGER</option><option>ADMIN</option></select></label>
 <label style="grid-column:1/-1"><input type="checkbox" id="personActive"> ใช้งานบุคคลนี้</label>
-<div style="grid-column:1/-1"><button type="submit">บันทึก</button></div>
+<div style="grid-column:1/-1;border-top:1px solid #e5e7eb;padding-top:12px">
+  <b>ชื่ออื่น / Aliases</b><div class="sub">เพิ่มได้หลายชื่อ เช่น MARCH, มาช, พี่มาช, พี่มาร์ท — ทั้งหมดจะชี้ไปยัง LINE ID คนเดียวกัน</div>
+  <div id="personAliases" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0"></div>
+  <div style="display:flex;gap:6px"><input id="newPersonAlias" placeholder="เพิ่มชื่อเรียก เช่น พี่มาช" style="flex:1"><button type="button" onclick="addPersonAlias()">+ เพิ่มชื่อ</button></div>
+</div>
+<div style="grid-column:1/-1"><button type="submit">บันทึกข้อมูลบุคลากร</button></div>
 </form></div></div>
 <div id="timelineModal" class="modal" onclick="if(event.target===this)closeTimeline()"><div class="modalbox">
 <div style="display:flex;justify-content:space-between;gap:10px"><h2 id="timelineTitle">ประวัติงาน</h2><button class="secondary" onclick="closeTimeline()">ปิด</button></div>
@@ -577,7 +605,40 @@ function editPerson(id){{
   document.getElementById('personDisplay').value=p.display_name||'';
   document.getElementById('personRole').value=p.role||'EMPLOYEE';
   document.getElementById('personActive').checked=!!p.active;
+  renderPersonAliases(p);
+  document.getElementById('newPersonAlias').value='';
   document.getElementById('personModal').style.display='flex';
+}}
+function renderPersonAliases(p){{
+  const box=document.getElementById('personAliases'); box.innerHTML='';
+  (p.aliases||[]).forEach(a=>{{
+    const chip=document.createElement('span');
+    chip.style.cssText='display:inline-flex;align-items:center;gap:5px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:5px 9px';
+    const text=document.createElement('span'); text.textContent=a; chip.appendChild(text);
+    if(String(a).trim().toLowerCase()!==String(p.canonical_name||'').trim().toLowerCase()){{
+      const x=document.createElement('button'); x.type='button'; x.textContent='×'; x.title='ลบ Alias';
+      x.style.cssText='background:transparent;color:#6b7280;padding:0;border:0;font-size:18px';
+      x.onclick=()=>removePersonAlias(a); chip.appendChild(x);
+    }}
+    box.appendChild(chip);
+  }});
+}}
+async function addPersonAlias(){{
+  const id=document.getElementById('personId').value; const input=document.getElementById('newPersonAlias'); const alias=input.value.trim();
+  if(!alias) return;
+  const u='/api/people/'+encodeURIComponent(id)+'/aliases?alias='+encodeURIComponent(alias)+'&token='+encodeURIComponent(token);
+  const r=await fetch(u,{{method:'POST'}});
+  if(!r.ok){{alert(await r.text());return;}}
+  const p=people.find(x=>Number(x.id)===Number(id)); if(p&&!p.aliases.includes(alias)) p.aliases.push(alias);
+  input.value=''; if(p) renderPersonAliases(p);
+}}
+async function removePersonAlias(alias){{
+  if(!confirm('ลบชื่อเรียก “'+alias+'” ?')) return;
+  const id=document.getElementById('personId').value;
+  const u='/api/people/'+encodeURIComponent(id)+'/aliases?alias='+encodeURIComponent(alias)+'&token='+encodeURIComponent(token);
+  const r=await fetch(u,{{method:'DELETE'}});
+  if(!r.ok){{alert(await r.text());return;}}
+  const p=people.find(x=>Number(x.id)===Number(id)); if(p){{p.aliases=p.aliases.filter(x=>x!==alias);renderPersonAliases(p);}}
 }}
 function closePerson(){{document.getElementById('personModal').style.display='none';}}
 async function savePerson(ev){{
