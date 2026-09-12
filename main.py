@@ -21,10 +21,10 @@ from service import (
     format_task, choose_status_target, STATUS_THAI, brief_counts,
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
-    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile
+    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people
 )
 
-VERSION = "0.6.5"
+VERSION = "0.6.6"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -79,7 +79,7 @@ def health():
         "timeline": True, "assignee_normalization": True,
         "mention_assignment": True, "mention_followup": True,
         "people_registry": True, "people_registry_profile": True,
-        "safe_task_matching": True,
+        "safe_task_matching": True, "people_merge": True,
     }
 
 
@@ -323,6 +323,23 @@ def api_people_profile(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.post("/api/people/merge")
+def api_people_merge(
+    person_a_id: int = Query(...), person_b_id: int = Query(...),
+    token: str | None = Query(default=None),
+):
+    _require_dashboard_token(token)
+    try:
+        with SessionLocal() as db:
+            person, updated = merge_people(db, person_a_id, person_b_id)
+            return {
+                "ok": True, "person_id": person.id, "canonical_name": person.canonical_name,
+                "line_bound": bool(person.line_user_id), "updated_tasks": updated,
+            }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(
     token: str | None = Query(default=None),
@@ -385,6 +402,14 @@ def dashboard(
         bound = "ผูกแล้ว" if p["line_bound"] else "ยังไม่ผูก"
         active_label = "ใช้งาน" if p["active"] else "ปิดใช้งาน"
         uid_short = (p["line_user_id"][:10] + "…") if p["line_user_id"] else "-"
+        suggestions = p.get("duplicate_suggestions") or []
+        merge_buttons = ""
+        for suggestion in suggestions[:3]:
+            merge_buttons += (
+                f' <button class="mergebtn" onclick="mergePerson({p["id"]},{suggestion["id"]},'
+                f'\'{escape(p["canonical_name"], quote=True)}\',\'{escape(suggestion["canonical_name"], quote=True)}\')">'
+                f'รวมกับ {escape(suggestion["canonical_name"])}</button>'
+            )
         people_rows.append(
             "<tr>"
             f"<td><b>{escape(p['canonical_name'])}</b><br><small>{escape(active_label)}</small></td>"
@@ -393,7 +418,7 @@ def dashboard(
             f"<td>{escape(p['role'])}</td>"
             f"<td>{escape(bound)}<br><small>{escape(uid_short)}</small></td>"
             f"<td>{escape(aliases)}</td>"
-            f"<td><button onclick=\"editPerson({p['id']})\">แก้ไข</button></td>"
+            f"<td><button onclick=\"editPerson({p['id']})\">แก้ไข</button>{merge_buttons}</td>"
             "</tr>"
         )
     people_html = "".join(people_rows) or '<tr><td colspan="7">ยังไม่มีข้อมูลบุคลากร</td></tr>'
@@ -409,7 +434,7 @@ main{{max-width:1280px;margin:auto;padding:24px}} h1{{margin:0 0 4px}} .sub{{col
 .card{{background:white;border:1px solid #ddd;border-radius:12px;padding:14px}} .card span{{display:block;font-size:28px;margin-top:7px}}
 form{{background:white;padding:14px;border-radius:12px;border:1px solid #ddd;margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap}}
 input,select{{padding:9px;border:1px solid #bbb;border-radius:8px}} button{{padding:8px 10px;border:0;border-radius:8px;background:#1677ff;color:white;cursor:pointer}}
-button.secondary{{background:#6b7280}} table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden}}
+button.secondary{{background:#6b7280}} button.mergebtn{{background:#0f9d58;margin-top:6px;white-space:nowrap}} table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden}}
 th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}} th{{background:#f0f2f5}} small{{color:#666}}
 .section{{margin-top:22px}} .section h2{{margin:0 0 10px}}
 .modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);align-items:center;justify-content:center;padding:20px}}
@@ -431,7 +456,7 @@ th,td{{padding:11px;border-bottom:1px solid #eee;text-align:left;vertical-align:
 <tbody>{rows_html}</tbody></table>
 
 <div class="section"><h2>ทะเบียนผู้รับผิดชอบ (People Registry)</h2>
-<div class="sub">LINE User ID เป็นตัวตนหลัก ระบบเรียนรู้ Display Name จากข้อความ/การ @Mention แล้วคุณกำหนดชื่อมาตรฐานและชื่อเรียกได้</div>
+<div class="sub">LINE User ID เป็นตัวตนหลัก หากพบรายชื่อซ้ำ ระบบจะแสดงปุ่มสีเขียว “รวมกับ …” ให้กดยืนยันรวมเป็นคนเดียวกันได้</div>
 <form onsubmit="saveAlias(event)">
 <input id="aliasName" placeholder="ชื่อที่พบ เช่น Tong Thanakrit" required>
 <input id="canonicalName" placeholder="ชื่อมาตรฐาน เช่น พี่ต้อง" required>
@@ -486,6 +511,17 @@ async function saveAlias(ev){{
   const u='/api/people/alias?alias='+encodeURIComponent(alias)+'&canonical='+encodeURIComponent(canonical)+'&token='+encodeURIComponent(token);
   const r=await fetch(u,{{method:'POST'}});
   if(r.ok){{const d=await r.json();alert('รวมชื่อแล้ว และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}} else alert(await r.text());
+}}
+async function mergePerson(a,b,nameA,nameB){{
+  const pa=people.find(x=>x.id===a), pb=people.find(x=>x.id===b);
+  if(!pa||!pb) return;
+  let finalName=(pa.line_bound&&!pb.line_bound)?pb.canonical_name:((pb.line_bound&&!pa.line_bound)?pa.canonical_name:pa.canonical_name);
+  const msg='ยืนยันรวม “'+nameA+'” กับ “'+nameB+'” เป็นบุคคลเดียวกัน?\n\nชื่อมาตรฐานหลังรวม: '+finalName+'\nLINE ID ที่ผูกไว้จะถูกเก็บไว้ และงานเดิมจะถูกปรับอัตโนมัติ';
+  if(!confirm(msg)) return;
+  const params=new URLSearchParams({{person_a_id:String(a),person_b_id:String(b),token:token}});
+  const r=await fetch('/api/people/merge?'+params.toString(),{{method:'POST'}});
+  if(r.ok){{const d=await r.json();alert('รวมบุคคลเรียบร้อยเป็น “'+d.canonical_name+'” และปรับงานเดิม '+d.updated_tasks+' รายการ');location.reload();}}
+  else alert(await r.text());
 }}
 function editPerson(id){{
   const p=people.find(x=>x.id===id); if(!p) return;

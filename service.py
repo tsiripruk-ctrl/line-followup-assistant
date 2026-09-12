@@ -521,11 +521,171 @@ def update_person_profile(
     return person, updated
 
 
+
+def merge_people(db: Session, person_a_id: int, person_b_id: int) -> tuple[Person, int]:
+    """Safely merge two People Registry rows into one identity.
+
+    Rules:
+    - Never auto-merge two different bound LINE user IDs.
+    - If only one row has LINE userId, that bound row survives so the stable identity is preserved.
+    - For a bound + unbound duplicate, the unbound row's canonical name becomes the final
+      canonical name. This matches the common flow: LINE display-name row + manually-created Thai name.
+    - Aliases and existing task assignments are moved to the survivor.
+    """
+    if person_a_id == person_b_id:
+        raise ValueError("cannot merge the same person")
+    a = db.get(Person, person_a_id)
+    b = db.get(Person, person_b_id)
+    if not a or not b:
+        raise ValueError("person not found")
+
+    if a.line_user_id and b.line_user_id and a.line_user_id != b.line_user_id:
+        raise ValueError("ไม่สามารถรวมได้ เพราะทั้งสองรายชื่อผูกกับ LINE ID คนละบัญชี")
+
+    # Stable LINE-bound identity always survives. If neither is bound, keep person_a.
+    if a.line_user_id and not b.line_user_id:
+        survivor, duplicate = a, b
+        final_canonical = b.canonical_name
+    elif b.line_user_id and not a.line_user_id:
+        survivor, duplicate = b, a
+        final_canonical = a.canonical_name
+    else:
+        survivor, duplicate = a, b
+        final_canonical = a.canonical_name
+
+    final_canonical = clean_display_name(final_canonical) or survivor.canonical_name
+    old_survivor_canonical = survivor.canonical_name
+    duplicate_canonical = duplicate.canonical_name
+
+    # Collect all names before deleting/moving aliases.
+    name_values = {
+        old_survivor_canonical, duplicate_canonical,
+        survivor.display_name, duplicate.display_name,
+        survivor.call_name, duplicate.call_name,
+    }
+    survivor_aliases = list(db.scalars(select(PersonAlias).where(PersonAlias.person_id == survivor.id)).all())
+    duplicate_aliases = list(db.scalars(select(PersonAlias).where(PersonAlias.person_id == duplicate.id)).all())
+    for alias in survivor_aliases + duplicate_aliases:
+        name_values.add(alias.alias)
+
+    # Free unique canonical name first if the desired canonical currently belongs to duplicate.
+    duplicate.canonical_name = f"__merged__{duplicate.id}__"
+    db.flush()
+    survivor.canonical_name = final_canonical
+
+    # Prefer the actual LINE display name from the bound survivor.
+    if not survivor.display_name:
+        survivor.display_name = duplicate.display_name
+    if not survivor.call_name or normalize_name(survivor.call_name) == normalize_name(old_survivor_canonical):
+        survivor.call_name = final_canonical
+
+    # Keep the strongest role and active state.
+    role_rank = {"EMPLOYEE": 1, "MANAGER": 2, "ADMIN": 3, "OWNER": 4}
+    survivor_role = (survivor.role or "EMPLOYEE").upper()
+    duplicate_role = (duplicate.role or "EMPLOYEE").upper()
+    survivor.role = survivor_role if role_rank.get(survivor_role, 1) >= role_rank.get(duplicate_role, 1) else duplicate_role
+    survivor.active = bool(survivor.active or duplicate.active)
+    if not survivor.line_user_id and duplicate.line_user_id:
+        survivor.line_user_id = duplicate.line_user_id
+
+    # Re-point or de-duplicate aliases.
+    existing_by_key = {
+        x.normalized_alias: x
+        for x in db.scalars(select(PersonAlias).where(PersonAlias.person_id == survivor.id)).all()
+    }
+    for alias in duplicate_aliases:
+        current = existing_by_key.get(alias.normalized_alias)
+        if current:
+            db.delete(alias)
+        else:
+            alias.person_id = survivor.id
+            existing_by_key[alias.normalized_alias] = alias
+
+    # Ensure all useful identity strings are aliases of the survivor.
+    for value in name_values | {final_canonical}:
+        value = clean_display_name(value)
+        key = normalize_name(value)
+        if not key:
+            continue
+        existing = db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == key))
+        if not existing:
+            db.add(PersonAlias(person_id=survivor.id, alias=value, normalized_alias=key))
+        elif existing.person_id in {survivor.id, duplicate.id}:
+            existing.person_id = survivor.id
+            existing.alias = value
+
+    # Normalize task assignments that referred to either identity or either LINE ID.
+    old_keys = {normalize_name(v) for v in name_values if normalize_name(v)}
+    line_ids = {x for x in {a.line_user_id, b.line_user_id} if x}
+    updated = 0
+    for task in db.scalars(select(Task)).all():
+        name_match = normalize_name(task.assignee_name) in old_keys
+        id_match = bool(task.assignee_user_id and task.assignee_user_id in line_ids)
+        if name_match or id_match:
+            old_name = task.assignee_name
+            changed = False
+            if task.assignee_name != final_canonical:
+                task.assignee_name = final_canonical
+                changed = True
+            if survivor.line_user_id and task.assignee_user_id != survivor.line_user_id:
+                task.assignee_user_id = survivor.line_user_id
+                changed = True
+            if changed:
+                record_task_event(
+                    db, task, "ASSIGNEE_PERSON_MERGED", actor_name="Owner",
+                    text=f"รวมผู้รับผิดชอบ {old_name or '-'} → {final_canonical}", commit=False,
+                )
+                updated += 1
+
+    # Remove duplicate row after its aliases have been moved.
+    db.delete(duplicate)
+    db.commit()
+    db.refresh(survivor)
+    return survivor, updated
+
+
+def duplicate_person_suggestions(db: Session, people: list[Person] | None = None) -> dict[int, list[int]]:
+    """Suggest likely duplicate rows based on alias/display/canonical overlap.
+
+    Suggestions are advisory only; no automatic merge is performed.
+    Two rows with different bound LINE IDs are never suggested as duplicates.
+    """
+    people = people or list(db.scalars(select(Person)).all())
+    aliases_by_person: dict[int, set[str]] = {}
+    def identity_keys(value: str | None) -> set[str]:
+        if not value:
+            return set()
+        # Keep the normal registry key and a punctuation/emoji-insensitive key.
+        # Example: "Proud🤍" and "Proud" should be recognized as a likely duplicate.
+        normal = normalize_name(value)
+        compact = _match_text(value).replace(" ", "")
+        return {k for k in {normal, compact} if k}
+
+    for p in people:
+        keys = set()
+        for value in (p.canonical_name, p.display_name, p.call_name):
+            keys |= identity_keys(value)
+        for alias in db.scalars(select(PersonAlias).where(PersonAlias.person_id == p.id)).all():
+            keys |= identity_keys(alias.alias)
+        aliases_by_person[p.id] = keys
+
+    result: dict[int, list[int]] = {p.id: [] for p in people}
+    for i, a in enumerate(people):
+        for b in people[i + 1:]:
+            if a.line_user_id and b.line_user_id and a.line_user_id != b.line_user_id:
+                continue
+            if aliases_by_person[a.id] & aliases_by_person[b.id]:
+                result[a.id].append(b.id)
+                result[b.id].append(a.id)
+    return result
+
 def list_people(db: Session, include_inactive: bool = True) -> list[dict]:
     q = select(Person).order_by(Person.active.desc(), Person.canonical_name.asc())
     if not include_inactive:
         q = q.where(Person.active == True)
     people = list(db.scalars(q).all())
+    suggestions = duplicate_person_suggestions(db, people)
+    by_id = {p.id: p for p in people}
     result = []
     for p in people:
         aliases = list(db.scalars(select(PersonAlias).where(PersonAlias.person_id == p.id).order_by(PersonAlias.alias.asc())).all())
@@ -539,6 +699,10 @@ def list_people(db: Session, include_inactive: bool = True) -> list[dict]:
             "line_bound": bool(p.line_user_id),
             "active": bool(p.active),
             "aliases": [a.alias for a in aliases],
+            "duplicate_suggestions": [
+                {"id": sid, "canonical_name": by_id[sid].canonical_name, "line_bound": bool(by_id[sid].line_user_id)}
+                for sid in suggestions.get(p.id, []) if sid in by_id
+            ],
         })
     return result
 

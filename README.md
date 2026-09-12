@@ -1,8 +1,8 @@
-# LINE Follow-up Assistant v0.6.5
+# LINE Follow-up Assistant v0.6.6
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
-## New in v0.6.5 — People Registry Profile
+## New in v0.6.6 — People Registry Profile
 
 - Full People Registry in the Dashboard.
 - Stable LINE `userId` remains the strongest identity key.
@@ -22,7 +22,7 @@ Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee 
 
 ## Database migration
 
-v0.6.5 performs a non-destructive additive migration on startup. Existing `people` tables receive only these missing columns:
+v0.6.6 performs a non-destructive additive migration on startup. Existing `people` tables receive only these missing columns:
 
 - `display_name`
 - `call_name`
@@ -46,3 +46,11 @@ Recommended naming example:
 - LINE display name: `Tong Thanakrit`
 - Aliases: `Tong Thanakrit`, `Tong`, `ต้อง`, `พี่ต้อง`
 - Role: `OWNER`
+
+
+## v0.6.6 — Safe People Merge
+- Detects likely duplicate People Registry rows from canonical/display/alias overlap.
+- Dashboard shows a green “รวมกับ …” button for suggested duplicates.
+- Merge preserves the stable LINE userId, aliases, role, and active state.
+- Existing tasks are normalized to the merged canonical person.
+- Safety guard: two different bound LINE userIds cannot be merged.
