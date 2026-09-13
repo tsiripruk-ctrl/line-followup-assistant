@@ -85,3 +85,9 @@ Recommended naming example:
 - Keeps @mention and LINE userId as highest-confidence identity signals.
 - Ambiguous status updates show plausible candidate tasks to the owner but never auto-close one.
 - Existing LINE message-id deduplication remains enabled.
+
+
+## v0.6.12 hotfix
+- Adds deterministic Thai status fallback so concise updates such as `จ่ายค่าประกันเรียบร้อย` are treated as `completed` even when the LLM returns `status_signal=none`.
+- Adds a concise group acknowledgement when a status update is recognized but cannot be matched safely to an open Task.
+- Keeps safe matching: ambiguous updates never auto-close a random Task.

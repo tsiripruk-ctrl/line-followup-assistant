@@ -25,7 +25,7 @@ from service import (
     resolve_assignee_from_text, rank_status_targets
 )
 
-VERSION = "0.6.11"
+VERSION = "0.6.12"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -84,7 +84,54 @@ def health():
         "people_multi_alias": True, "people_alias_crud": True,
         "task_resolution_engine": True, "assignee_context_resolution": True,
         "status_semantic_core_matching": True, "message_deduplication": True,
+        "local_status_fallback": True, "unmatched_status_ack": True,
     }
+
+
+def infer_local_status_signal(text: str | None) -> str:
+    """Deterministic Thai fallback for obvious task-status updates.
+
+    The LLM remains the primary intent parser, but short operational messages such
+    as "จ่ายค่าประกันเรียบร้อย" must not become silent simply because the model
+    returns status_signal=none. Negative phrases are checked first.
+    """
+    compact = "".join((text or "").lower().split())
+    if not compact:
+        return "none"
+
+    negative_completion = (
+        "ยังไม่เรียบร้อย", "ยังไม่เสร็จ", "ยังไม่ได้เสร็จ",
+        "ยังไม่ได้จ่าย", "ไม่ได้จ่าย", "ยังไม่ชำระ", "ยังไม่ได้ชำระ",
+        "ยังไม่ได้โอน", "ไม่ได้โอน", "ยังไม่ได้ส่ง", "ไม่ได้ส่ง",
+    )
+    if any(term in compact for term in negative_completion):
+        if any(term in compact for term in ("รอ", "ยังไม่ได้", "ไม่ได้")):
+            return "waiting"
+        return "none"
+
+    completed_terms = (
+        "เรียบร้อย", "เสร็จแล้ว", "เสร็จเรียบร้อย", "ดำเนินการแล้ว",
+        "จ่ายแล้ว", "ชำระแล้ว", "โอนแล้ว", "ส่งแล้ว", "ตรวจแล้ว",
+        "แก้แล้ว", "ติดตั้งแล้ว", "อนุมัติแล้ว", "ได้รับแล้ว",
+    )
+    if any(term in compact for term in completed_terms):
+        return "completed"
+
+    waiting_terms = (
+        "รอข้อมูล", "รออนุมัติ", "รอของ", "รอสินค้า", "รอsupplier",
+        "รอซัพพลายเออร์", "รอตอบกลับ", "ยังรอ",
+    )
+    if any(term in compact for term in waiting_terms):
+        return "waiting"
+
+    progress_terms = (
+        "กำลังทำ", "กำลังดำเนินการ", "กำลังตรวจ", "กำลังเช็ก",
+        "กำลังเช็ค", "กำลังประสาน", "กำลังส่ง",
+    )
+    if any(term in compact for term in progress_terms):
+        return "in_progress"
+
+    return "none"
 
 
 def _require_cron_secret(secret: str | None):
@@ -814,6 +861,16 @@ async def _process_message(event: dict):
 
     extraction = await asyncio.to_thread(extract_task, text, display_name)
 
+    # v0.6.12: deterministic fallback for short Thai status updates.
+    # The LLM occasionally returns status_signal=none for concise messages such as
+    # "จ่ายค่าประกันเรียบร้อย". In that case the old flow became completely silent.
+    local_status = infer_local_status_signal(text)
+    if extraction.status_signal == "none" and local_status != "none":
+        extraction.status_signal = local_status
+        extraction.is_task_reply = True
+        if not extraction.related_task_hint:
+            extraction.related_task_hint = text
+
     # v0.5.4: if the user used LINE's quote/reply feature on one of the
     # assistant's reminder messages, resolve the exact task by quotedMessageId.
     # This is much more reliable than guessing from display names such as
@@ -837,6 +894,17 @@ async def _process_message(event: dict):
             return
         # A status-like reply that cannot be matched confidently must never close a
         # random task. Surface it privately for manual review instead.
+        # Never leave an explicit status update completely silent. Keep the group
+        # response short; detailed candidate information stays private with the owner.
+        try:
+            await reply_text(
+                reply_token,
+                "รับทราบค่ะ พบว่าเป็นการอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจน "
+                "จึงยังไม่เปลี่ยนสถานะงานนะคะ"
+            )
+        except Exception as exc:
+            print("unmatched status acknowledgement failed:", repr(exc))
+
         if settings.owner_status_updates and settings.owner_line_user_id:
             with SessionLocal() as db:
                 candidates = rank_status_targets(
