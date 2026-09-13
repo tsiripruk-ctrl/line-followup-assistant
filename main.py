@@ -25,7 +25,7 @@ from service import (
     resolve_assignee_from_text, rank_status_targets
 )
 
-VERSION = "0.6.13"
+VERSION = "0.6.14"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -86,6 +86,7 @@ def health():
         "status_semantic_core_matching": True, "message_deduplication": True,
         "local_status_fallback": True, "unmatched_status_ack": True,
         "fast_local_status_path": True, "ai_failure_status_fallback": True,
+        "preprocessing_failure_ack": True, "best_effort_group_preprocessing": True,
     }
 
 
@@ -810,10 +811,40 @@ def select_primary_mention(mentions: list[dict], extracted_assignee: str | None)
 
 
 async def process_message(event: dict):
+    """Process one LINE message without allowing an obvious status update to fail silently.
+
+    v0.6.14: group preprocessing (profile / People Registry / message logging) is
+    useful context, but it must not be a single point of failure. If anything raises
+    before the normal status handler can respond, an explicit Thai status update
+    receives a last-resort acknowledgement in the group.
+    """
+    msg = event.get("message") or {}
+    source = event.get("source") or {}
+    source_type = source.get("type", "unknown")
+    source_id = source.get("groupId") or source.get("userId") or source.get("roomId")
+    reply_token = event.get("replyToken")
+    text = (msg.get("text") or "").strip()
+    local_status = infer_local_status_signal(text) if source_type == "group" else "none"
     try:
         await _process_message(event)
     except Exception as exc:
-        print("process_message failed:", repr(exc))
+        print("process_message failed:", repr(exc), "source_type=", source_type, "text=", repr(text))
+        if source_type == "group" and source_id and local_status != "none":
+            fallback = (
+                "รับทราบค่ะ ระบบได้รับข้อความอัปเดตงานแล้ว แต่ยังอัปเดต Task ไม่สำเร็จ "
+                "จึงยังไม่เปลี่ยนสถานะงานนะคะ"
+            )
+            try:
+                if reply_token:
+                    await reply_text(reply_token, fallback)
+                else:
+                    await push_text(source_id, fallback)
+            except Exception as reply_exc:
+                print("preprocessing failure reply failed:", repr(reply_exc))
+                try:
+                    await push_text(source_id, fallback)
+                except Exception as push_exc:
+                    print("preprocessing failure push failed:", repr(push_exc))
 
 
 async def _process_message(event: dict):
@@ -826,28 +857,52 @@ async def _process_message(event: dict):
     if not source_id:
         return
 
+    # Parse the text/status before non-essential network/registry work.
+    # In v0.6.13 these calls happened first, so a profile/People Registry error could
+    # stop an obvious message such as "จ่ายค่าประกันเรียบร้อย" before the fast
+    # local-status path was ever reached.
+    text = msg.get("text", "").strip()
+    local_status = infer_local_status_signal(text) if source_type == "group" else "none"
+    quoted_message_id = msg.get("quotedMessageId")
+
     display_name = None
     if source_type == "group" and user_id:
-        display_name = await get_member_profile(source_id, user_id)
+        try:
+            display_name = await get_member_profile(source_id, user_id)
+        except Exception as exc:
+            print("get_member_profile failed:", repr(exc))
 
-    text = msg.get("text", "").strip()
-    quoted_message_id = msg.get("quotedMessageId")
-    mentions = await resolve_message_mentions(msg, source_id) if source_type == "group" else []
+    mentions = []
+    if source_type == "group":
+        try:
+            mentions = await resolve_message_mentions(msg, source_id)
+        except Exception as exc:
+            print("resolve_message_mentions failed:", repr(exc))
 
-    # Learn every group participant from the stable LINE userId. This lets later
-    # plain-name assignments resolve to the same person even if their display name changes.
+    # People Registry enrichment is best-effort. A registry/schema problem must not
+    # prevent task status processing or user acknowledgement.
     if source_type == "group" and user_id and display_name:
+        try:
+            with SessionLocal() as db:
+                bind_person_identity(db, display_name, user_id, display_name)
+                db.commit()
+        except Exception as exc:
+            print("bind_person_identity failed:", repr(exc))
+
+    # Message logging/dedup is also best-effort for availability. If the database is
+    # temporarily unavailable, the later task update may still fail, but process_message
+    # will now return an explicit acknowledgement rather than silence.
+    try:
         with SessionLocal() as db:
-            bind_person_identity(db, display_name, user_id, display_name)
+            if db.scalar(select(Message).where(Message.line_message_id == msg["id"])):
+                return
+            db.add(Message(
+                line_message_id=msg["id"], source_type=source_type, source_id=source_id,
+                user_id=user_id, display_name=display_name, text=text
+            ))
             db.commit()
-    with SessionLocal() as db:
-        if db.scalar(select(Message).where(Message.line_message_id == msg["id"])):
-            return
-        db.add(Message(
-            line_message_id=msg["id"], source_type=source_type, source_id=source_id,
-            user_id=user_id, display_name=display_name, text=text
-        ))
-        db.commit()
+    except Exception as exc:
+        print("message logging failed:", repr(exc))
 
     if source_type == "user" and settings.owner_line_user_id.strip().upper() == "TEMP":
         await push_text(user_id, f"เชื่อมต่อสำเร็จค่ะ\nLINE User ID ของคุณคือ:\n{user_id}\n\nให้นำค่านี้ไปใส่ใน Render ที่ OWNER_LINE_USER_ID แล้ว Deploy ใหม่ค่ะ")
@@ -860,11 +915,10 @@ async def _process_message(event: dict):
     if source_type != "group":
         return
 
-    # v0.6.13 FAST LOCAL STATUS PATH
+    # v0.6.14 FAST LOCAL STATUS PATH
     # Detect obvious Thai status updates *before* calling the LLM. This is important
     # because a slow/failed OpenAI request previously caused messages such as
     # "จ่ายค่าประกันเรียบร้อย" to disappear silently before the local fallback ran.
-    local_status = infer_local_status_signal(text)
     if local_status != "none":
         extraction = TaskExtraction(
             is_task=False,
