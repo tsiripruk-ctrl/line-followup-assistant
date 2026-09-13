@@ -87,7 +87,14 @@ Recommended naming example:
 - Existing LINE message-id deduplication remains enabled.
 
 
-## v0.6.12 hotfix
+## v0.6.13 hotfix
 - Adds deterministic Thai status fallback so concise updates such as `จ่ายค่าประกันเรียบร้อย` are treated as `completed` even when the LLM returns `status_signal=none`.
 - Adds a concise group acknowledgement when a status update is recognized but cannot be matched safely to an open Task.
 - Keeps safe matching: ambiguous updates never auto-close a random Task.
+
+
+## v0.6.13 hotfix
+- Fast local status path runs before OpenAI for obvious Thai updates such as `จ่ายค่าประกันเรียบร้อย`.
+- Obvious status updates no longer depend on OpenAI availability/latency.
+- Unmatched status acknowledgement falls back from LINE reply to group push, preventing silent failures when replyToken expires.
+- `/health` exposes `fast_local_status_path` and `ai_failure_status_fallback`.

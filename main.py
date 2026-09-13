@@ -14,7 +14,7 @@ from db import Base, engine, SessionLocal, ensure_people_registry_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
-from ai import extract_task
+from ai import extract_task, TaskExtraction
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -25,7 +25,7 @@ from service import (
     resolve_assignee_from_text, rank_status_targets
 )
 
-VERSION = "0.6.12"
+VERSION = "0.6.13"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -85,6 +85,7 @@ def health():
         "task_resolution_engine": True, "assignee_context_resolution": True,
         "status_semantic_core_matching": True, "message_deduplication": True,
         "local_status_fallback": True, "unmatched_status_ack": True,
+        "fast_local_status_path": True, "ai_failure_status_fallback": True,
     }
 
 
@@ -859,17 +860,30 @@ async def _process_message(event: dict):
     if source_type != "group":
         return
 
-    extraction = await asyncio.to_thread(extract_task, text, display_name)
-
-    # v0.6.12: deterministic fallback for short Thai status updates.
-    # The LLM occasionally returns status_signal=none for concise messages such as
-    # "จ่ายค่าประกันเรียบร้อย". In that case the old flow became completely silent.
+    # v0.6.13 FAST LOCAL STATUS PATH
+    # Detect obvious Thai status updates *before* calling the LLM. This is important
+    # because a slow/failed OpenAI request previously caused messages such as
+    # "จ่ายค่าประกันเรียบร้อย" to disappear silently before the local fallback ran.
     local_status = infer_local_status_signal(text)
-    if extraction.status_signal == "none" and local_status != "none":
-        extraction.status_signal = local_status
-        extraction.is_task_reply = True
-        if not extraction.related_task_hint:
-            extraction.related_task_hint = text
+    if local_status != "none":
+        extraction = TaskExtraction(
+            is_task=False,
+            confidence=1.0,
+            status_signal=local_status,
+            is_task_reply=True,
+            related_task_hint=text,
+            reason="deterministic local status path",
+        )
+        print("fast local status:", local_status, repr(text))
+    else:
+        try:
+            extraction = await asyncio.to_thread(extract_task, text, display_name)
+        except Exception as exc:
+            # Do not kill the webhook worker silently if the LLM is temporarily
+            # unavailable. Non-obvious messages can wait for the next human message,
+            # while obvious status messages never reach this branch.
+            print("extract_task failed:", repr(exc), "text=", repr(text))
+            return
 
     # v0.5.4: if the user used LINE's quote/reply feature on one of the
     # assistant's reminder messages, resolve the exact task by quotedMessageId.
@@ -896,14 +910,23 @@ async def _process_message(event: dict):
         # random task. Surface it privately for manual review instead.
         # Never leave an explicit status update completely silent. Keep the group
         # response short; detailed candidate information stays private with the owner.
+        unmatched_text = (
+            "รับทราบค่ะ พบว่าเป็นการอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจน "
+            "จึงยังไม่เปลี่ยนสถานะงานนะคะ"
+        )
         try:
-            await reply_text(
-                reply_token,
-                "รับทราบค่ะ พบว่าเป็นการอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจน "
-                "จึงยังไม่เปลี่ยนสถานะงานนะคะ"
-            )
+            if reply_token:
+                await reply_text(reply_token, unmatched_text)
+            else:
+                await push_text(source_id, unmatched_text)
         except Exception as exc:
+            # replyToken is short-lived. If AI/DB processing took too long, LINE can
+            # reject the reply. Fall back to a group push so the user never sees silence.
             print("unmatched status acknowledgement failed:", repr(exc))
+            try:
+                await push_text(source_id, unmatched_text)
+            except Exception as fallback_exc:
+                print("unmatched status push fallback failed:", repr(fallback_exc))
 
         if settings.owner_status_updates and settings.owner_line_user_id:
             with SessionLocal() as db:
