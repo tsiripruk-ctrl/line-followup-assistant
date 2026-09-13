@@ -21,10 +21,11 @@ from service import (
     format_task, choose_status_target, STATUS_THAI, brief_counts,
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
-    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias
+    task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
+    resolve_assignee_from_text, rank_status_targets
 )
 
-VERSION = "0.6.10"
+VERSION = "0.6.11"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -81,6 +82,8 @@ def health():
         "people_registry": True, "people_registry_profile": True,
         "safe_task_matching": True, "people_merge": True, "people_merge_nojs": True,
         "people_multi_alias": True, "people_alias_crud": True,
+        "task_resolution_engine": True, "assignee_context_resolution": True,
+        "status_semantic_core_matching": True, "message_deduplication": True,
     }
 
 
@@ -835,11 +838,29 @@ async def _process_message(event: dict):
         # A status-like reply that cannot be matched confidently must never close a
         # random task. Surface it privately for manual review instead.
         if settings.owner_status_updates and settings.owner_line_user_id:
+            with SessionLocal() as db:
+                candidates = rank_status_targets(
+                    open_tasks(db, source_id),
+                    resolve_canonical_name(db, display_name) or display_name,
+                    resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name,
+                    extraction.related_task_hint or text,
+                    user_id,
+                )[:3]
+            candidate_lines = []
+            for row in candidates:
+                # Only show plausible alternatives; never imply that one was updated.
+                if row["content"] >= 0.20 or row["identity"] > 0:
+                    t = row["task"]
+                    candidate_lines.append(f"• {t.task_code} {t.title}")
+            candidate_text = ""
+            if candidate_lines:
+                candidate_text = "\n\nงานที่อาจเกี่ยวข้อง:\n" + "\n".join(candidate_lines)
             await push_text(
                 settings.owner_line_user_id,
                 f"พบข้อความอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจนค่ะ\n\n"
                 f"ผู้ส่ง: {display_name or '-'}\n"
-                f"ข้อความ: {text}\n\n"
+                f"ข้อความ: {text}"
+                f"{candidate_text}\n\n"
                 f"ระบบจึงยังไม่เปลี่ยนสถานะงานใดนะคะ"
             )
         return
@@ -875,10 +896,19 @@ async def _process_message(event: dict):
         mention_name = primary_mention.get("display_name") if primary_mention else None
         mention_user_id = primary_mention.get("user_id") if primary_mention else None
         with SessionLocal() as db:
+            # If there is no @mention, resolve explicit assignment wording against the
+            # People Registry. This safely handles ambiguous names such as "ต้อง" in
+            # "ให้ต้องเป็นผู้รับผิดชอบ" without treating "ต้องส่งวันนี้" as a person.
+            contextual_person = None if primary_mention else resolve_assignee_from_text(db, text)
+            assignee_override = mention_name
+            assignee_uid = mention_user_id
+            if contextual_person:
+                assignee_override = contextual_person.canonical_name
+                assignee_uid = contextual_person.line_user_id
             task = create_task(
                 db, source_id, msg["id"], extraction, source_text=text,
                 actor_name=display_name, actor_user_id=user_id,
-                assignee_name_override=mention_name, assignee_user_id=mention_user_id,
+                assignee_name_override=assignee_override, assignee_user_id=assignee_uid,
             )
             # If AI found a plain-text assignee and that person is already known in
             # People Registry, attach their stable LINE userId too.

@@ -76,3 +76,12 @@ Recommended naming example:
 ## v0.6.10 — Dashboard JavaScript Hotfix
 - Fixed a JavaScript parse error caused by unescaped line breaks in the People Merge confirmation message.
 - Restores all Dashboard JavaScript actions, including Edit Person, Alias management, task status actions, and timeline buttons.
+
+
+## v0.6.11
+- Added Task Resolution Engine scoring visibility and safer ambiguity handling.
+- Added Thai semantic-core matching for short status replies (e.g. จ่าย/ชำระค่าประกัน).
+- Added People Registry context assignment for explicit wording such as “ให้ต้องเป็นผู้รับผิดชอบ”.
+- Keeps @mention and LINE userId as highest-confidence identity signals.
+- Ambiguous status updates show plausible candidate tasks to the owner but never auto-close one.
+- Existing LINE message-id deduplication remains enabled.

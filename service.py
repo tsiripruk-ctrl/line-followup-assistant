@@ -224,6 +224,86 @@ def _match_text(value: str | None) -> str:
     return " ".join(x.split())
 
 
+STATUS_NOISE_TERMS = (
+    "เรียบร้อยแล้ว", "เรียบร้อย", "เสร็จแล้ว", "เสร็จ", "แล้ว", "สำเร็จแล้ว", "สำเร็จ",
+    "ดำเนินการแล้ว", "ดำเนินการ", "ตรวจสอบแล้ว", "ตรวจแล้ว", "อัปเดต", "update",
+    "กำลังดำเนินการ", "กำลังทำ", "กำลังเช็ก", "กำลังตรวจสอบ", "รอข้อมูล", "รออนุมัติ",
+    "รับทราบ", "ค่ะ", "ครับ", "คะ", "นะคะ", "นะครับ",
+)
+
+ACTION_SYNONYMS = (
+    ("ชำระ", "จ่าย"),
+    ("โอนเงิน", "จ่าย"),
+    ("ชำระเงิน", "จ่าย"),
+    ("เช็ค", "ตรวจ"),
+    ("เช็ก", "ตรวจ"),
+    ("ตรวจสอบ", "ตรวจ"),
+)
+
+
+def _semantic_core(value: str | None) -> str:
+    """Compact task text after removing generic status wording and normalizing common actions.
+
+    Thai usually has no spaces between words, so token-only matching is not enough for
+    short replies such as "จ่ายค่าประกันเรียบร้อย" vs "ชำระค่าประกันสัญญา".
+    """
+    x = _match_text(value).replace(" ", "")
+    if not x:
+        return ""
+    for term in sorted(STATUS_NOISE_TERMS, key=len, reverse=True):
+        x = x.replace(_match_text(term).replace(" ", ""), "")
+    for src, dst in ACTION_SYNONYMS:
+        x = x.replace(_match_text(src).replace(" ", ""), _match_text(dst).replace(" ", ""))
+    return x
+
+
+def _compact_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        # A meaningful Thai core contained in the task title is strong evidence.
+        shorter = min(len(a), len(b))
+        return 0.92 if shorter >= 5 else 0.72
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def resolve_assignee_from_text(db: Session, text: str | None) -> Person | None:
+    """Resolve an assignee from explicit assignment language using People Registry aliases.
+
+    This deliberately does NOT treat every occurrence of an alias as an assignment.
+    It is designed for ambiguous Thai names such as "ต้อง":
+      - "ให้ต้องเป็นผู้รับผิดชอบ" -> person ต้อง
+      - "งานนี้ต้องส่งวันนี้"      -> no person match
+    """
+    raw = " ".join((text or "").strip().split())
+    if not raw:
+        return None
+    compact = normalize_alias_key(raw)
+    aliases = list(db.scalars(select(PersonAlias)).all())
+    # Prefer longer aliases first so "พี่ต้อง" wins over "ต้อง".
+    aliases.sort(key=lambda a: len(normalize_alias_key(a.alias)), reverse=True)
+    for row in aliases:
+        alias = normalize_alias_key(row.alias)
+        if not alias or len(alias) < 2:
+            continue
+        patterns = (
+            f"ให้{alias}เป็นผู้รับผิดชอบ",
+            f"มอบหมายให้{alias}",
+            f"มอบให้{alias}",
+            f"ผู้รับผิดชอบ{alias}",
+            f"{alias}เป็นผู้รับผิดชอบ",
+            f"ฝาก{alias}ช่วย",
+            f"ฝาก{alias}",
+            f"{alias}ช่วย",
+            f"{alias}รับผิดชอบ",
+            f"{alias}รับเรื่อง",
+        )
+        if any(pat in compact for pat in patterns):
+            person = db.get(Person, row.person_id)
+            if person and person.active:
+                return person
+    return None
+
 def _task_text_score(task: Task, hint: str | None) -> float:
     """Return 0..1 lexical similarity between a reply and a task.
 
@@ -240,6 +320,15 @@ def _task_text_score(task: Task, hint: str | None) -> float:
         return 0.0
     if h in target or target in h:
         return 0.95
+
+    # Thai semantic-core comparison strips generic status words and normalizes
+    # common action synonyms (e.g. ชำระ -> จ่าย). This makes concise updates
+    # such as "จ่ายค่าประกันเรียบร้อย" match "ชำระค่าประกันสัญญา" reliably.
+    h_core = _semantic_core(hint)
+    t_core = _semantic_core(" ".join(x for x in [task.title, task.project or ""] if x))
+    core_score = _compact_similarity(h_core, t_core)
+    if core_score >= 0.90:
+        return 0.91
 
     ht = {w for w in h.split() if len(w) >= 2}
     tt = {w for w in target.split() if len(w) >= 2}
@@ -263,7 +352,38 @@ def _task_text_score(task: Task, hint: str | None) -> float:
     score = 0.65 * overlap + 0.35 * seq
     if long_shared:
         score = max(score, min(0.82, 0.58 + 0.08 * len(long_shared)))
+    # Sequence similarity over the compact semantic core is a conservative
+    # fallback for Thai phrases that differ only by action wording/status suffixes.
+    if core_score >= 0.62 and min(len(h_core), len(t_core)) >= 4:
+        score = max(score, min(0.84, 0.55 + 0.30 * core_score))
     return min(1.0, score)
+
+
+def rank_status_targets(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> list[dict]:
+    """Return candidate tasks with transparent content/identity scores for review."""
+    sender = normalize_name(sender_name)
+    extracted_assignee = normalize_name(assignee_name)
+    rows = []
+    for t in tasks:
+        content_score = _task_text_score(t, hint)
+        identity_score = 0.0
+        identity_match = False
+        if sender_user_id and t.assignee_user_id == sender_user_id:
+            identity_score = 0.45
+            identity_match = True
+        elif sender and normalize_name(t.assignee_name) == sender:
+            identity_score = 0.30
+            identity_match = True
+        elif extracted_assignee and normalize_name(t.assignee_name) == extracted_assignee:
+            identity_score = 0.20
+        rows.append({
+            "task": t,
+            "content": content_score,
+            "identity": identity_score,
+            "identity_match": identity_match,
+            "combined": content_score + identity_score,
+        })
+    return sorted(rows, key=lambda r: (r["content"], r["combined"], r["identity"]), reverse=True)
 
 
 def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> Task | None:
@@ -278,30 +398,7 @@ def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_na
     if not tasks:
         return None
 
-    sender = normalize_name(sender_name)
-    extracted_assignee = normalize_name(assignee_name)
-
-    rows = []
-    for t in tasks:
-        content_score = _task_text_score(t, hint)
-        identity_score = 0.0
-        identity_match = False
-        if sender_user_id and t.assignee_user_id == sender_user_id:
-            identity_score = 0.45
-            identity_match = True
-        elif sender and normalize_name(t.assignee_name) == sender:
-            identity_score = 0.30
-            identity_match = True
-        elif extracted_assignee and normalize_name(t.assignee_name) == extracted_assignee:
-            identity_score = 0.20
-
-        rows.append({
-            "task": t,
-            "content": content_score,
-            "identity": identity_score,
-            "identity_match": identity_match,
-            "combined": content_score + identity_score,
-        })
+    rows = rank_status_targets(tasks, sender_name, assignee_name, hint, sender_user_id)
 
     # CONTENT-FIRST RULE: if the reply clearly names a topic/technology/project,
     # select by content before considering ownership. This prevents a sender's
