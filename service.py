@@ -480,6 +480,92 @@ def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_na
 
 
 
+def rank_status_targets_with_history(db: Session, tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> list[dict]:
+    """Rank tasks using title/project plus recent task-event text.
+
+    This recovers cases where AI shortened a task title and the useful wording only
+    exists in the original CREATED event, e.g. task title "ต่อประกันรถ" while the
+    original assignment mentioned "ชำระ/จ่ายค่าประกันรถ".
+    """
+    sender = normalize_name(sender_name)
+    extracted_assignee = normalize_name(assignee_name)
+    rows = []
+    for t in tasks:
+        title_text = " ".join(x for x in [t.title, t.project or ""] if x)
+        title_score = _task_text_score(t, hint)
+        event_texts = list(db.scalars(
+            select(TaskEvent.text)
+            .where(TaskEvent.task_id == t.id, TaskEvent.text.is_not(None))
+            .order_by(TaskEvent.id.desc())
+            .limit(8)
+        ).all())
+        history_text = " ".join(x for x in event_texts if x)
+        history_score = 0.0
+        if history_text:
+            proxy = type("TaskProxy", (), {"title": history_text, "project": None})()
+            history_score = _task_text_score(proxy, hint)
+        content_score = max(title_score, min(0.94, history_score))
+
+        identity_score = 0.0
+        identity_match = False
+        if sender_user_id and t.assignee_user_id == sender_user_id:
+            identity_score = 0.45
+            identity_match = True
+        elif sender and normalize_name(t.assignee_name) == sender:
+            identity_score = 0.30
+            identity_match = True
+        elif extracted_assignee and normalize_name(t.assignee_name) == extracted_assignee:
+            identity_score = 0.20
+
+        rows.append({
+            "task": t,
+            "content": content_score,
+            "title_content": title_score,
+            "history_content": history_score,
+            "identity": identity_score,
+            "identity_match": identity_match,
+            "combined": content_score + identity_score,
+        })
+    return sorted(rows, key=lambda r: (r["content"], r["combined"], r["identity"], r["task"].id), reverse=True)
+
+
+def choose_status_target_with_history(db: Session, tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> Task | None:
+    """Safer resolver that also considers the task's original conversation history."""
+    if not tasks:
+        return None
+    rows = rank_status_targets_with_history(db, tasks, sender_name, assignee_name, hint, sender_user_id)
+
+    strong = [r for r in rows if r["content"] >= 0.75]
+    if strong:
+        best = strong[0]
+        second = strong[1] if len(strong) > 1 else None
+        if second is None:
+            return best["task"]
+        if best["content"] - second["content"] >= 0.10:
+            return best["task"]
+        if best["identity"] > second["identity"]:
+            return best["task"]
+        return None
+
+    medium = [r for r in rows if r["content"] >= 0.35]
+    if medium:
+        best = medium[0]
+        second_score = medium[1]["combined"] if len(medium) > 1 else -1.0
+        if best["combined"] >= 0.58 and (best["combined"] - second_score) >= 0.12:
+            return best["task"]
+        return None
+
+    sender = normalize_name(sender_name)
+    sender_owned = [
+        r for r in rows
+        if (sender_user_id and r["task"].assignee_user_id == sender_user_id)
+        or (sender and normalize_name(r["task"].assignee_name) == sender)
+    ]
+    if len(sender_owned) == 1:
+        return sender_owned[0]["task"]
+    return None
+
+
 
 def clean_display_name(value: str | None) -> str:
     if not value:

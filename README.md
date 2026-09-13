@@ -106,3 +106,9 @@ Recommended naming example:
 - Owner notification failures can no longer make a successfully committed task look like an update failure.
 - Ambiguous matches remain safe: the system refuses to auto-close when multiple plausible tasks exist.
 - Fixed a real `NameError` in `choose_status_target()` (`sender` was referenced before assignment on weak/unmatched content). This was one direct cause of the generic "received update but could not update Task" message.
+
+## v0.6.16
+- เพิ่ม task-history matching เพื่อใช้ข้อความต้นฉบับของ Task ช่วยจับสถานะ
+- เพิ่ม strict cross-group recovery สำหรับ owner/ผู้รับผิดชอบ เมื่อ Task ถูกสร้างคนละกลุ่ม
+- เพิ่ม candidate score logging เพื่อวิเคราะห์เหตุผลที่จับ/ไม่จับ Task
+- คง safety rule: ถ้ามีหลาย Task ที่เกี่ยวข้องเท่า ๆ กัน จะไม่ปิดงานโดยเดา

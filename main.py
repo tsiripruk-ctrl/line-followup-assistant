@@ -22,10 +22,10 @@ from service import (
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
-    resolve_assignee_from_text, rank_status_targets
+    resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history
 )
 
-VERSION = "0.6.15"
+VERSION = "0.6.16"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -89,6 +89,7 @@ def health():
         "preprocessing_failure_ack": True, "best_effort_group_preprocessing": True,
         "business_concept_matching": True, "safe_status_notifications": True,
         "status_update_transaction_guard": True,
+        "task_history_matching": True, "cross_group_unique_fallback": True, "candidate_score_logging": True,
     }
 
 
@@ -998,8 +999,8 @@ async def _process_message(event: dict):
 
         if settings.owner_status_updates and settings.owner_line_user_id:
             with SessionLocal() as db:
-                candidates = rank_status_targets(
-                    open_tasks(db, source_id),
+                candidates = rank_status_targets_with_history(
+                    db, open_tasks(db, source_id),
                     resolve_canonical_name(db, display_name) or display_name,
                     resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name,
                     extraction.related_task_hint or text,
@@ -1188,9 +1189,56 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             extracted_name = getattr(extraction, "assignee_name", None)
             canonical_extracted = resolve_canonical_name(db, extracted_name) or extracted_name
             match_hint = getattr(extraction, "related_task_hint", None) or text
-            target = choose_status_target(tasks, canonical_sender, canonical_extracted, match_hint, user_id)
+            target = choose_status_target_with_history(db, tasks, canonical_sender, canonical_extracted, match_hint, user_id)
+            rows = rank_status_targets_with_history(db, tasks, canonical_sender, canonical_extracted, match_hint, user_id)
+            print("status candidates same-group:", [
+                {
+                    "task": r["task"].task_code,
+                    "title": r["task"].title,
+                    "content": round(r["content"], 3),
+                    "title_score": round(r.get("title_content", 0.0), 3),
+                    "history_score": round(r.get("history_content", 0.0), 3),
+                    "identity": round(r["identity"], 3),
+                } for r in rows[:5]
+            ])
+
+            # Recovery path for a task that was created in another LINE group/room.
+            # This is intentionally strict: only the owner may update any unique global
+            # task; other users may recover only tasks already bound to their LINE userId.
             if not target:
-                print("status match: no confident target", repr(text), "open_tasks=", len(tasks))
+                global_tasks = open_tasks(db, None)
+                if user_id == settings.owner_line_user_id:
+                    eligible_global = global_tasks
+                elif user_id:
+                    eligible_global = [t for t in global_tasks if t.assignee_user_id == user_id]
+                else:
+                    eligible_global = []
+
+                # Remove current-group tasks because they were already evaluated above.
+                eligible_global = [t for t in eligible_global if t.group_id != group_id]
+                if eligible_global:
+                    global_rows = rank_status_targets_with_history(
+                        db, eligible_global, canonical_sender, canonical_extracted, match_hint, user_id
+                    )
+                    print("status candidates cross-group:", [
+                        {
+                            "task": r["task"].task_code,
+                            "title": r["task"].title,
+                            "content": round(r["content"], 3),
+                            "history_score": round(r.get("history_content", 0.0), 3),
+                            "identity": round(r["identity"], 3),
+                        } for r in global_rows[:5]
+                    ])
+                    strong_global = [r for r in global_rows if r["content"] >= 0.75]
+                    if len(strong_global) == 1:
+                        target = strong_global[0]["task"]
+                    elif len(strong_global) > 1:
+                        best, second = strong_global[0], strong_global[1]
+                        if best["content"] - second["content"] >= 0.15:
+                            target = best["task"]
+
+            if not target:
+                print("status match: no confident target", repr(text), "same_group_open_tasks=", len(tasks))
                 return None
 
             mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
