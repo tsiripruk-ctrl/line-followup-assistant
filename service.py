@@ -231,6 +231,32 @@ STATUS_NOISE_TERMS = (
     "รับทราบ", "ค่ะ", "ครับ", "คะ", "นะคะ", "นะครับ",
 )
 
+
+
+BUSINESS_CONCEPT_TERMS = {
+    # Operational phrases that describe the same business job with different verbs.
+    # Keep these narrow: concept matching is only one signal and never overrides ambiguity.
+    "insurance": (
+        "ประกันรถ", "ประกันภัยรถ", "ประกันภัย", "ต่อประกัน", "ต่ออายุประกัน",
+        "เบี้ยประกัน", "ค่าประกัน", "ชำระค่าประกัน", "จ่ายค่าประกัน",
+    ),
+    "vehicle_tax": ("ภาษีรถ", "ต่อภาษีรถ", "ภาษีประจำปี", "ต่อทะเบียนรถ"),
+    "compulsory_insurance": ("พรบ", "พ.ร.บ", "พ.ร.บ.", "ต่อพรบ", "ต่อ พ.ร.บ."),
+}
+
+
+def _business_concepts(value: str | None) -> set[str]:
+    compact = _match_text(value).replace(" ", "")
+    if not compact:
+        return set()
+    out: set[str] = set()
+    for concept, terms in BUSINESS_CONCEPT_TERMS.items():
+        for term in terms:
+            needle = _match_text(term).replace(" ", "")
+            if needle and needle in compact:
+                out.add(concept)
+                break
+    return out
 ACTION_SYNONYMS = (
     ("ชำระ", "จ่าย"),
     ("โอนเงิน", "จ่าย"),
@@ -330,6 +356,16 @@ def _task_text_score(task: Task, hint: str | None) -> float:
     if core_score >= 0.90:
         return 0.91
 
+    # Business-concept bridge: operational replies often use a different verb from
+    # the task title. Example: "จ่ายค่าประกันเรียบร้อย" and "ต่อประกันรถ" are
+    # the same insurance job even though their literal strings are not close.
+    # A shared concept is strong enough only to produce a candidate; if multiple
+    # open tasks share the concept, choose_status_target() will refuse to guess.
+    h_concepts = _business_concepts(hint)
+    t_concepts = _business_concepts(" ".join(x for x in [task.title, task.project or ""] if x))
+    if h_concepts & t_concepts:
+        return max(0.80, core_score)
+
     ht = {w for w in h.split() if len(w) >= 2}
     tt = {w for w in target.split() if len(w) >= 2}
     shared = ht & tt
@@ -398,6 +434,7 @@ def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_na
     if not tasks:
         return None
 
+    sender = normalize_name(sender_name)
     rows = rank_status_targets(tasks, sender_name, assignee_name, hint, sender_user_id)
 
     # CONTENT-FIRST RULE: if the reply clearly names a topic/technology/project,

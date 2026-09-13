@@ -98,3 +98,11 @@ Recommended naming example:
 - Obvious status updates no longer depend on OpenAI availability/latency.
 - Unmatched status acknowledgement falls back from LINE reply to group push, preventing silent failures when replyToken expires.
 - `/health` exposes `fast_local_status_path` and `ai_failure_status_fallback`.
+
+
+## v0.6.15 hotfix
+- Business concept matching for operational status replies (e.g. `จ่ายค่าประกันเรียบร้อย` ↔ `ต่อประกันรถ`).
+- Status DB update is transaction-guarded and logs exact commit/failure stage.
+- Owner notification failures can no longer make a successfully committed task look like an update failure.
+- Ambiguous matches remain safe: the system refuses to auto-close when multiple plausible tasks exist.
+- Fixed a real `NameError` in `choose_status_target()` (`sender` was referenced before assignment on weak/unmatched content). This was one direct cause of the generic "received update but could not update Task" message.

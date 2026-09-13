@@ -25,7 +25,7 @@ from service import (
     resolve_assignee_from_text, rank_status_targets
 )
 
-VERSION = "0.6.14"
+VERSION = "0.6.15"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -87,6 +87,8 @@ def health():
         "local_status_fallback": True, "unmatched_status_ack": True,
         "fast_local_status_path": True, "ai_failure_status_fallback": True,
         "preprocessing_failure_ack": True, "best_effort_group_preprocessing": True,
+        "business_concept_matching": True, "safe_status_notifications": True,
+        "status_update_transaction_guard": True,
     }
 
 
@@ -766,6 +768,18 @@ async def acknowledge_task_reply(reply_token: str | None, group_id: str, status_
             print("task reply acknowledgement fallback failed:", repr(fallback_exc))
 
 
+async def safe_push_text(to: str | None, text: str, *, label: str = "notification") -> bool:
+    """Best-effort LINE push that must never invalidate an already-committed task update."""
+    if not to:
+        return False
+    try:
+        await push_text(to, text)
+        return True
+    except Exception as exc:
+        print(f"{label} push failed:", repr(exc))
+        return False
+
+
 def _mention_text(text: str, mentionee: dict) -> str | None:
     """Best-effort visible @name extraction for mention entries without userId."""
     try:
@@ -831,8 +845,8 @@ async def process_message(event: dict):
         print("process_message failed:", repr(exc), "source_type=", source_type, "text=", repr(text))
         if source_type == "group" and source_id and local_status != "none":
             fallback = (
-                "รับทราบค่ะ ระบบได้รับข้อความอัปเดตงานแล้ว แต่ยังอัปเดต Task ไม่สำเร็จ "
-                "จึงยังไม่เปลี่ยนสถานะงานนะคะ"
+                "รับทราบค่ะ ระบบได้รับข้อความอัปเดตงานแล้ว แต่เกิดข้อผิดพลาดระหว่างประมวลผล "
+                "ระบบจะไม่เดาหรือเปลี่ยน Task ผิดงานค่ะ"
             )
             try:
                 if reply_token:
@@ -950,7 +964,7 @@ async def _process_message(event: dict):
         if changed is not None:
             await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
-                await push_text(settings.owner_line_user_id, changed)
+                await safe_push_text(settings.owner_line_user_id, changed, label="quoted status owner")
             return
 
     if extraction.status_signal != "none":
@@ -958,7 +972,7 @@ async def _process_message(event: dict):
         if changed is not None:
             await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
-                await push_text(settings.owner_line_user_id, changed)
+                await safe_push_text(settings.owner_line_user_id, changed, label="status owner")
             return
         # A status-like reply that cannot be matched confidently must never close a
         # random task. Surface it privately for manual review instead.
@@ -1000,13 +1014,14 @@ async def _process_message(event: dict):
             candidate_text = ""
             if candidate_lines:
                 candidate_text = "\n\nงานที่อาจเกี่ยวข้อง:\n" + "\n".join(candidate_lines)
-            await push_text(
+            await safe_push_text(
                 settings.owner_line_user_id,
                 f"พบข้อความอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจนค่ะ\n\n"
                 f"ผู้ส่ง: {display_name or '-'}\n"
                 f"ข้อความ: {text}"
                 f"{candidate_text}\n\n"
-                f"ระบบจึงยังไม่เปลี่ยนสถานะงานใดนะคะ"
+                f"ระบบจึงยังไม่เปลี่ยนสถานะงานใดนะคะ",
+                label="unmatched status owner",
             )
         return
 
@@ -1160,44 +1175,60 @@ async def handle_quoted_task_reply(
 
 
 async def try_update_task_from_status(group_id: str, user_id: str | None, sender_name: str | None, extraction, text: str) -> str | None:
+    """Resolve and update one task atomically.
+
+    Matching failure returns None. Database/update failure is logged with a precise stage
+    and re-raised so the webhook can acknowledge a processing error without pretending
+    that a different task was changed. Notification failures happen outside this function.
+    """
     with SessionLocal() as db:
-        tasks = open_tasks(db, group_id)
-        canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
-        canonical_extracted = resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name
-        match_hint = extraction.related_task_hint or text
-        target = choose_status_target(tasks, canonical_sender, canonical_extracted, match_hint, user_id)
-        if not target:
-            return None
+        try:
+            tasks = open_tasks(db, group_id)
+            canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
+            extracted_name = getattr(extraction, "assignee_name", None)
+            canonical_extracted = resolve_canonical_name(db, extracted_name) or extracted_name
+            match_hint = getattr(extraction, "related_task_hint", None) or text
+            target = choose_status_target(tasks, canonical_sender, canonical_extracted, match_hint, user_id)
+            if not target:
+                print("status match: no confident target", repr(text), "open_tasks=", len(tasks))
+                return None
 
-        mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
-        new_status = mapping.get(extraction.status_signal)
-        if not new_status:
-            return None
+            mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
+            signal = getattr(extraction, "status_signal", "none")
+            new_status = mapping.get(signal)
+            if not new_status:
+                return None
 
-        old_status = target.status
-        target.status = new_status
-        target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
-        if new_status == "COMPLETED":
-            target.next_reminder_at = None
-        elif target.due_at and datetime.utcnow() > target.due_at:
-            target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
-        else:
-            target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
-        record_task_event(
-            db, target, "STATUS_REPLY", actor_name=canonical_sender, actor_user_id=user_id, text=text,
-            old_status=old_status, new_status=new_status, commit=False,
-        )
-        db.commit()
-        db.refresh(target)
+            old_status = target.status
+            target.status = new_status
+            target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
+            if new_status == "COMPLETED":
+                target.next_reminder_at = None
+            elif target.due_at and datetime.utcnow() > target.due_at:
+                target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
+            else:
+                target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
 
-        if old_status == new_status and new_status != "COMPLETED":
-            return ""
-        status_th = STATUS_THAI.get(new_status, new_status)
-        return (
-            f"อัปเดตงานจากบทสนทนาในกลุ่มแล้วค่ะ\n\n"
-            f"{target.task_code} {target.title}\n"
-            f"ผู้ตอบ: {canonical_sender or '-'}\nสถานะใหม่: {status_th}"
-        )
+            record_task_event(
+                db, target, "STATUS_REPLY", actor_name=canonical_sender, actor_user_id=user_id, text=text,
+                old_status=old_status, new_status=new_status, commit=False,
+            )
+            db.commit()
+            db.refresh(target)
+            print("status update committed:", target.task_code, old_status, "->", new_status, repr(text))
+
+            if old_status == new_status and new_status != "COMPLETED":
+                return ""
+            status_th = STATUS_THAI.get(new_status, new_status)
+            return (
+                f"อัปเดตงานจากบทสนทนาในกลุ่มแล้วค่ะ\n\n"
+                f"{target.task_code} {target.title}\n"
+                f"ผู้ตอบ: {canonical_sender or '-'}\nสถานะใหม่: {status_th}"
+            )
+        except Exception as exc:
+            db.rollback()
+            print("status update transaction failed:", type(exc).__name__, repr(exc), "text=", repr(text))
+            raise
 
 
 async def handle_owner_command(user_id: str, text: str):
