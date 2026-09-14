@@ -1,5 +1,6 @@
 import random
 import json
+import re
 from datetime import datetime, timedelta
 import asyncio
 from zoneinfo import ZoneInfo
@@ -26,7 +27,7 @@ from service import (
     contextual_followup_text, summarize_progress_update, task_reference_label
 )
 
-VERSION = "0.6.22"
+VERSION = "0.6.23"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -100,6 +101,8 @@ def health():
         "daily_followup_limits": True, "staggered_group_followups": True,
         "task_context_integrity_guard": True, "cross_topic_memory_guard": True,
         "source_truth_reminders": True, "identity_only_substantive_match_disabled": True,
+        "trust_recovery_mode": True, "public_technical_fallback_disabled": True,
+        "multi_topic_update_guard": True, "human_group_ack": True,
     }
 
 
@@ -153,6 +156,130 @@ def infer_local_status_signal(text: str | None) -> str:
         return "in_progress"
 
     return "none"
+
+
+
+TOPIC_HINT_TERMS = (
+    "ชุมแสง", "ตาสิทธิ์", "ประแส", "ระยอง", "gps", "มิเตอร์", "กล้อง", "cctv",
+    "flow account", "tsp", "futong", "fiber", "ไฟเบอร์", "po", "ประกัน", "datasheet",
+    "เทศบาล", "อบต.", "อบต", "สายไฟ", "ตู้", "ครุภัณฑ์",
+)
+
+
+def split_operational_update_segments(text: str | None) -> list[str]:
+    """Split a long human update into topic-sized chunks without inventing meaning.
+
+    A single LINE reply may update several projects at once. Treating the whole message
+    as one status hint is a major source of cross-task contamination. We split only on
+    strong human boundaries (blank lines / explicit 'ส่วน...' transitions) and keep the
+    original wording intact.
+    """
+    raw = (text or "").strip()
+    if len(raw) < 120:
+        return []
+    parts = [x.strip() for x in re.split(r"\n\s*\n+", raw) if x.strip()]
+    expanded: list[str] = []
+    transition = re.compile(r"(?=(?:ส่วน(?:งาน|ของ)?|แล้วก็จะมีในส่วนของ|อีกส่วน(?:หนึ่ง)?|ส่วนประแส|ส่วนชุมแสง)\s*)", re.I)
+    for part in parts:
+        subs = [x.strip(" -:;,\n") for x in transition.split(part) if x.strip(" -:;,\n")]
+        if len(subs) > 1:
+            expanded.extend(subs)
+        else:
+            expanded.append(part)
+    # Avoid fragments too short to carry topic meaning.
+    expanded = [x for x in expanded if len(x) >= 18]
+    if len(expanded) < 2:
+        return []
+    anchors = []
+    for seg in expanded:
+        low = seg.lower()
+        anchors.append({term for term in TOPIC_HINT_TERMS if term in low})
+    nonempty = [a for a in anchors if a]
+    distinct = set().union(*nonempty) if nonempty else set()
+    # Require at least two distinct topic hints before declaring a multi-topic update.
+    return expanded if len(distinct) >= 2 else []
+
+
+async def handle_multi_topic_update(
+    group_id: str,
+    user_id: str | None,
+    sender_name: str | None,
+    reply_token: str | None,
+    text: str,
+) -> bool:
+    """Safely ingest a multi-topic reply without mixing projects together.
+
+    Only strong title/project matches are stored. Unmatched segments remain unattached
+    and are reported privately to the owner. The group receives one natural thank-you,
+    never internal Task/matcher language.
+    """
+    segments = split_operational_update_segments(text)
+    if not segments:
+        return False
+
+    matched: list[tuple[str, str]] = []
+    unmatched: list[str] = []
+    with SessionLocal() as db:
+        tasks = open_tasks(db, group_id)
+        canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
+        used_task_ids: set[int] = set()
+        for seg in segments:
+            rows = rank_status_targets(tasks, canonical_sender, None, seg, user_id)
+            best = rows[0] if rows else None
+            second = rows[1] if len(rows) > 1 else None
+            # Strong content only. Identity must not rescue a weak topic match here.
+            if not best or best["content"] < 0.75:
+                unmatched.append(seg)
+                continue
+            if second and second["content"] >= 0.65 and (best["content"] - second["content"]) < 0.15:
+                unmatched.append(seg)
+                continue
+            target = best["task"]
+            if target.id in used_task_ids:
+                # Two different sections mapping to the same task is suspicious; keep
+                # the later section unattached instead of merging contexts silently.
+                unmatched.append(seg)
+                continue
+            used_task_ids.add(target.id)
+            record_task_event(
+                db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
+                text=seg, new_status=target.status, commit=False,
+            )
+            memory = summarize_progress_update(seg)
+            if memory:
+                record_task_event(
+                    db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
+                    text=memory, old_status=target.status, new_status=target.status, commit=False,
+                )
+            target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {seg}").strip()
+            matched.append((target.task_code, target.title))
+        db.commit()
+
+    public_text = (
+        "ขอบคุณค่ะ รับข้อมูลอัปเดตไว้แล้วนะคะ เดี๋ยวติดตามต่อจากแต่ละเรื่องให้ค่ะ"
+        if matched else
+        "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ"
+    )
+    try:
+        if reply_token:
+            await reply_text(reply_token, public_text)
+        else:
+            await push_text(group_id, public_text)
+    except Exception as exc:
+        print("multi-topic acknowledgement failed:", repr(exc))
+
+    if settings.owner_status_updates and settings.owner_line_user_id:
+        lines = ["สรุปข้อความอัปเดตหลายเรื่องค่ะ"]
+        if matched:
+            lines.append("\nผูกข้อมูลได้:")
+            lines.extend(f"• {code} {title}" for code, title in matched)
+        if unmatched:
+            lines.append("\nส่วนที่ยังไม่ผูกอัตโนมัติ:")
+            lines.extend(f"• {seg[:180]}" for seg in unmatched)
+        lines.append("\nส่วนที่ยังไม่แน่ใจจะไม่ถูกนำไปปนกับงานอื่นค่ะ")
+        await safe_push_text(settings.owner_line_user_id, "\n".join(lines), label="multi-topic owner summary")
+    print("multi-topic update:", {"matched": matched, "unmatched": len(unmatched)})
+    return True
 
 
 def _require_cron_secret(secret: str | None):
@@ -749,24 +876,22 @@ async def acknowledge_task_reply(reply_token: str | None, group_id: str, status_
     """
     reply_pool = {
         "completed": [
-            "ขอบคุณมากค่ะ เรียบร้อยแล้วนะคะ ขอบคุณที่ช่วยจัดการให้ค่ะ",
-            "ขอบคุณนะคะ งานนี้เรียบร้อยแล้วค่ะ จัดการให้เรียบร้อยดีมากเลยค่ะ",
-            "ขอบคุณมากค่ะ รับทราบว่าเรียบร้อยแล้วนะคะ งานนี้ปิดได้เลยค่ะ",
-            "ขอบคุณค่ะ เรียบร้อยแล้วนะคะ ขอบคุณที่อัปเดตให้ค่ะ",
+            "ขอบคุณค่ะ รับทราบว่าเรียบร้อยแล้วนะคะ",
+            "รับทราบค่ะ งานนี้เรียบร้อยแล้ว ขอบคุณที่อัปเดตนะคะ",
+            "ขอบคุณค่ะ เรื่องนี้เรียบร้อยแล้วนะคะ",
         ],
         "waiting": [
-            "ขอบคุณที่อัปเดตนะคะ รับทราบเรื่องที่ยังรออยู่ค่ะ เดี๋ยวขออนุญาตติดตามต่ออีกครั้งนะคะ",
-            "ขอบคุณค่ะ รับทราบว่ายังรอข้อมูลอยู่นะคะ เดี๋ยวช่วยติดตามต่อค่ะ",
-            "รับทราบค่ะ ขอบคุณที่แจ้งนะคะ เรื่องนี้เดี๋ยวขออนุญาตติดตามต่อจนเรียบร้อยค่ะ",
+            "ขอบคุณค่ะ รับทราบว่ายังรออยู่ เดี๋ยวติดตามต่อให้นะคะ",
+            "รับทราบค่ะ ตอนนี้ยังรออยู่ เดี๋ยวค่อยตามต่อจากจุดนี้นะคะ",
+            "ขอบคุณที่อัปเดตค่ะ เดี๋ยวติดตามต่อจากข้อมูลนี้นะคะ",
         ],
         "in_progress": [
-            "ขอบคุณที่อัปเดตนะคะ รับทราบค่ะ เดี๋ยวขออนุญาตติดตามต่อจนเรียบร้อยนะคะ",
-            "ขอบคุณค่ะ รับทราบว่ากำลังดำเนินการอยู่นะคะ ไว้เดี๋ยวขอติดตามต่ออีกครั้งค่ะ",
-            "รับทราบค่ะ ขอบคุณที่อัปเดตนะคะ เดี๋ยวช่วยติดตามความคืบหน้าต่อค่ะ",
+            "ขอบคุณค่ะ รับทราบความคืบหน้าแล้วนะคะ",
+            "รับทราบค่ะ เดี๋ยวติดตามต่อจากจุดนี้นะคะ",
+            "ขอบคุณที่อัปเดตค่ะ รับข้อมูลไว้แล้วนะคะ",
         ],
         "none": [
-            "ขอบคุณนะคะ รับทราบค่ะ",
-            "ขอบคุณที่แจ้งนะคะ รับทราบค่ะ",
+            "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ",
             "รับทราบค่ะ ขอบคุณที่อัปเดตนะคะ",
             "ขอบคุณค่ะ รับทราบแล้วนะคะ",
         ],
@@ -861,10 +986,7 @@ async def process_message(event: dict):
     except Exception as exc:
         print("process_message failed:", repr(exc), "source_type=", source_type, "text=", repr(text))
         if source_type == "group" and source_id and local_status != "none":
-            fallback = (
-                "รับทราบค่ะ ระบบได้รับข้อความอัปเดตงานแล้ว แต่เกิดข้อผิดพลาดระหว่างประมวลผล "
-                "ระบบจะไม่เดาหรือเปลี่ยน Task ผิดงานค่ะ"
-            )
+            fallback = "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ"
             try:
                 if reply_token:
                     await reply_text(reply_token, fallback)
@@ -876,6 +998,14 @@ async def process_message(event: dict):
                     await push_text(source_id, fallback)
                 except Exception as push_exc:
                     print("preprocessing failure push failed:", repr(push_exc))
+            if settings.owner_status_updates and settings.owner_line_user_id:
+                await safe_push_text(
+                    settings.owner_line_user_id,
+                    f"มีข้อความอัปเดตที่ประมวลผลไม่สำเร็จและยังไม่ได้ผูกกับงานใดค่ะ\n\n"
+                    f"ผู้ส่ง: {source.get('userId') or '-'}\nข้อความ: {text}\n"
+                    f"รายละเอียดสำหรับตรวจสอบ: {type(exc).__name__}: {exc}",
+                    label="processing diagnostic owner",
+                )
 
 
 async def _process_message(event: dict):
@@ -984,6 +1114,12 @@ async def _process_message(event: dict):
                 await safe_push_text(settings.owner_line_user_id, changed, label="quoted status owner")
             return
 
+    # Long replies can contain updates for several projects. Never feed the full
+    # mixed message into a single-task matcher; split and attach only strong segments.
+    if not quoted_message_id and extraction.is_task_reply:
+        if await handle_multi_topic_update(source_id, user_id, display_name, reply_token, text):
+            return
+
     if extraction.status_signal != "none":
         changed = await try_update_task_from_status(source_id, user_id, display_name, extraction, text)
         if changed is not None:
@@ -995,10 +1131,10 @@ async def _process_message(event: dict):
         # random task. Surface it privately for manual review instead.
         # Never leave an explicit status update completely silent. Keep the group
         # response short; detailed candidate information stays private with the owner.
-        unmatched_text = (
-            "รับทราบค่ะ พบว่าเป็นการอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจน "
-            "จึงยังไม่เปลี่ยนสถานะงานนะคะ"
-        )
+        # Never expose internal matching/Task terminology in the LINE group.
+        # If confidence is insufficient, acknowledge the human update naturally and
+        # send diagnostic/candidate detail only to the owner.
+        unmatched_text = "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ"
         try:
             if reply_token:
                 await reply_text(reply_token, unmatched_text)
@@ -1033,11 +1169,11 @@ async def _process_message(event: dict):
                 candidate_text = "\n\nงานที่อาจเกี่ยวข้อง:\n" + "\n".join(candidate_lines)
             await safe_push_text(
                 settings.owner_line_user_id,
-                f"พบข้อความอัปเดตงาน แต่ยังจับคู่กับ Task ไม่ชัดเจนค่ะ\n\n"
+                f"มีข้อความอัปเดตที่ยังผูกกับงานเดิมได้ไม่มั่นใจค่ะ\n\n"
                 f"ผู้ส่ง: {display_name or '-'}\n"
                 f"ข้อความ: {text}"
                 f"{candidate_text}\n\n"
-                f"ระบบจึงยังไม่เปลี่ยนสถานะงานใดนะคะ",
+                f"ยังไม่มีการเปลี่ยนสถานะงานอัตโนมัติค่ะ",
                 label="unmatched status owner",
             )
         return
@@ -1047,7 +1183,7 @@ async def _process_message(event: dict):
             tasks = open_tasks(db, source_id)
             canonical_sender = resolve_canonical_name(db, display_name) or display_name
             match_hint = extraction.related_task_hint or text
-            target = choose_status_target(tasks, canonical_sender, extraction.assignee_name, match_hint, user_id)
+            target = choose_status_target_with_history(db, tasks, canonical_sender, extraction.assignee_name, match_hint, user_id)
             if target:
                 record_task_event(
                     db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
@@ -1067,6 +1203,24 @@ async def _process_message(event: dict):
                         f"สถานะยังเป็น: {STATUS_THAI.get(target.status, target.status)}"
                     )
                 return
+            # A human gave an operational update, but the link to a specific task is
+            # not strong enough. Thank them naturally; keep diagnostics private.
+            try:
+                if reply_token:
+                    await reply_text(reply_token, "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ")
+                else:
+                    await push_text(source_id, "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ")
+            except Exception as exc:
+                print("unmatched comment acknowledgement failed:", repr(exc))
+            if settings.owner_status_updates and settings.owner_line_user_id:
+                await safe_push_text(
+                    settings.owner_line_user_id,
+                    f"มีข้อมูลอัปเดตที่ยังผูกกับงานเดิมได้ไม่มั่นใจค่ะ\n\n"
+                    f"ผู้ส่ง: {canonical_sender or '-'}\nข้อความ: {text}\n\n"
+                    f"จึงยังไม่ได้นำข้อมูลนี้ไปต่อกับงานใดอัตโนมัติค่ะ",
+                    label="unmatched comment owner",
+                )
+            return
 
     if extraction.is_task and extraction.confidence >= settings.auto_create_confidence:
         primary_mention = select_primary_mention(mentions, extraction.assignee_name)
