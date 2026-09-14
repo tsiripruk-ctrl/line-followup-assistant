@@ -26,7 +26,7 @@ from service import (
     contextual_followup_text, summarize_progress_update
 )
 
-VERSION = "0.6.19"
+VERSION = "0.6.20"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -94,6 +94,7 @@ def health():
         "business_first_status_resolution": True, "vehicle_insurance_resolution": True, "duplicate_business_task_resolution": True,
         "task_state_continuity": True, "context_aware_reminders": True, "waiting_followup_memory": True,
         "quoted_reply_identity_guard": True, "quoted_reply_task_memory": True,
+        "quoted_reply_atomic_status": True, "quoted_reply_identity_best_effort": True,
         "mixed_progress_waiting_resolution": True,
     }
 
@@ -1100,19 +1101,24 @@ async def _process_message(event: dict):
 async def handle_quoted_task_reply(
     group_id: str, user_id: str | None, sender_name: str | None, quoted_message_id: str, extraction, text: str
 ) -> str | None:
-    """Apply a LINE quote-reply to the exact task whose assistant message was quoted.
+    """Apply a LINE quote-reply to the exact task message safely.
 
-    v0.6.19 hardens identity handling: a LINE userId is globally unique, so we always
-    resolve the existing Person by userId before learning aliases. This prevents a
-    duplicate Person insert (and unique-constraint failure) when a task still stores an
-    old display name such as ``Tong Thanakrit`` while People Registry already knows the
-    same LINE account as ``ต้อง``/``พี่ต้อง``.
+    v0.6.20: the quoted LINE message is the strongest task identifier. Status changes
+    are committed in a small transaction *before* optional People Registry enrichment.
+    Identity/alias problems must never prevent a correctly quoted task from closing.
 
     Returns:
-      None  -> quote wasn't one of our tracked task messages; continue normal matching.
-      ""    -> handled but owner notification disabled/not needed.
+      None  -> quote wasn't linked to a tracked task; continue normal matching.
+      ""    -> handled but no owner message is needed.
       str   -> owner notification text.
     """
+    mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
+    signal = getattr(extraction, "status_signal", "none")
+    new_status = mapping.get(signal)
+
+    # Phase 1: resolve exact quoted task and commit the operational update only.
+    task_id = None
+    canonical_sender = sender_name or "-"
     with SessionLocal() as db:
         try:
             link = db.scalar(select(OutboundTaskMessage).where(
@@ -1121,7 +1127,6 @@ async def handle_quoted_task_reply(
             ))
             target = db.get(Task, link.task_id) if link else None
             if not target:
-                # A staff member may quote/reply to the original assignment message.
                 target = db.scalar(select(Task).where(
                     Task.source_message_id == str(quoted_message_id),
                     Task.group_id == group_id,
@@ -1131,42 +1136,12 @@ async def handle_quoted_task_reply(
             if target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
                 return ""
 
-            # Resolve the sender by stable LINE userId first. Do not create a second
-            # Person row just because the task contains an older display-name alias.
-            sender_person = None
-            if user_id:
-                sender_person = db.scalar(select(Person).where(Person.line_user_id == user_id))
-                if not sender_person and sender_name:
-                    sender_person = bind_person_identity(db, sender_name, user_id, sender_name)
-                elif sender_person and sender_name:
-                    # Learn the latest LINE display name/alias on the existing person.
-                    sender_person = bind_person_identity(db, sender_person.canonical_name, user_id, sender_name)
-
-            canonical_sender = (
-                sender_person.canonical_name if sender_person
-                else (resolve_canonical_name(db, sender_name) or sender_name or "-")
-            )
-
-            # Bind an unbound task only when identity is compatible with its current
-            # assignee name. An exact quoted reply identifies the task, but it must not
-            # silently reassign a task already owned by somebody else.
-            if user_id and not target.assignee_user_id:
-                task_canonical = resolve_canonical_name(db, target.assignee_name) or target.assignee_name
-                same_identity = (
-                    not target.assignee_name
-                    or normalize_name(task_canonical) == normalize_name(canonical_sender)
-                    or normalize_name(target.assignee_name) == normalize_name(sender_name)
-                )
-                if same_identity:
-                    target.assignee_user_id = user_id
-                    if sender_person and target.assignee_name:
-                        target.assignee_name = sender_person.canonical_name
-
-            mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
-            signal = getattr(extraction, "status_signal", "none")
-            new_status = mapping.get(signal)
+            task_id = target.id
             old_status = target.status
+            canonical_sender = resolve_canonical_name(db, sender_name) or sender_name or "-"
 
+            # Exact quote identifies the task. Do not make status correctness depend
+            # on People Registry writes or alias uniqueness.
             if new_status:
                 target.status = new_status
                 if new_status == "COMPLETED":
@@ -1186,34 +1161,73 @@ async def handle_quoted_task_reply(
                 old_status=old_status, new_status=target.status, commit=False,
             )
 
-            # Quote replies are first-class task memory too. Without this event, the
-            # next reminder forgets what the assignee just said and repeats the original
-            # question.
-            memory = summarize_progress_update(text)
-            if memory:
-                record_task_event(
-                    db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
-                    text=memory, old_status=target.status, new_status=target.status, commit=False,
-                )
+            # Memory is useful but cannot be allowed to abort the status update.
+            try:
+                memory = summarize_progress_update(text)
+                if memory:
+                    record_task_event(
+                        db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender,
+                        actor_user_id=user_id, text=memory, old_status=target.status,
+                        new_status=target.status, commit=False,
+                    )
+            except Exception as memory_exc:
+                print("quoted reply memory skipped:", type(memory_exc).__name__, repr(memory_exc))
 
             db.commit()
             db.refresh(target)
-            print("quoted status update committed:", target.task_code, old_status, "->", target.status,
+            task_code, task_title, final_status = target.task_code, target.title, target.status
+            print("quoted status update committed:", task_code, old_status, "->", final_status,
                   "sender=", canonical_sender, "text=", repr(text))
-
-            status_th = STATUS_THAI.get(target.status, target.status)
-            return (
-                f"มีการตอบกลับงานแล้วค่ะ\n\n"
-                f"{target.task_code} {target.title}\n"
-                f"ผู้ตอบ: {canonical_sender}\n"
-                f"ข้อความ: {text}\n"
-                f"สถานะ: {status_th}"
-            )
         except Exception as exc:
             db.rollback()
-            print("quoted task reply failed:", type(exc).__name__, repr(exc),
+            print("quoted task CORE update failed:", type(exc).__name__, repr(exc),
                   "quoted_message_id=", quoted_message_id, "sender=", repr(sender_name), "text=", repr(text))
             raise
+
+    # Phase 2: enrich People Registry / bind assignee only after the task update is safe.
+    # Any failure here is logged and ignored; it must not turn a successful task update
+    # into a user-visible processing error.
+    if task_id and user_id:
+        with SessionLocal() as db:
+            try:
+                target = db.get(Task, task_id)
+                sender_person = db.scalar(select(Person).where(Person.line_user_id == user_id))
+                if not sender_person and sender_name:
+                    sender_person = bind_person_identity(db, sender_name, user_id, sender_name)
+                elif sender_person and sender_name:
+                    # Learn latest display name only on the existing LINE identity.
+                    sender_person = bind_person_identity(db, sender_person.canonical_name, user_id, sender_name)
+
+                if sender_person:
+                    canonical_sender = sender_person.canonical_name
+
+                # Only attach an unbound task. Never silently reassign a task already
+                # bound to another LINE account.
+                if target and not target.assignee_user_id:
+                    task_canonical = resolve_canonical_name(db, target.assignee_name) or target.assignee_name
+                    same_identity = (
+                        not target.assignee_name
+                        or normalize_name(task_canonical) == normalize_name(canonical_sender)
+                        or normalize_name(target.assignee_name) == normalize_name(sender_name)
+                    )
+                    if same_identity:
+                        target.assignee_user_id = user_id
+                        if sender_person:
+                            target.assignee_name = sender_person.canonical_name
+                db.commit()
+            except Exception as identity_exc:
+                db.rollback()
+                print("quoted reply identity enrichment skipped:", type(identity_exc).__name__, repr(identity_exc),
+                      "task_id=", task_id, "user_id=", user_id)
+
+    status_th = STATUS_THAI.get(final_status, final_status)
+    return (
+        f"มีการตอบกลับงานแล้วค่ะ\n\n"
+        f"{task_code} {task_title}\n"
+        f"ผู้ตอบ: {canonical_sender}\n"
+        f"ข้อความ: {text}\n"
+        f"สถานะ: {status_th}"
+    )
 
 
 async def try_update_task_from_status(group_id: str, user_id: str | None, sender_name: str | None, extraction, text: str) -> str | None:

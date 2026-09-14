@@ -133,7 +133,7 @@ Recommended naming example:
 - `/health` exposes `task_state_continuity`, `context_aware_reminders`, and `waiting_followup_memory`.
 
 
-## v0.6.19 — Quote Reply Identity + Continuity Hotfix
+## v0.6.20 — Quote Reply Identity + Continuity Hotfix
 
 - Fixes duplicate-People unique constraint failures when a quoted task stores an old LINE display name but People Registry already owns that LINE userId under a canonical name.
 - Quote replies now resolve Person by stable LINE userId first and never create a duplicate person for the same account.
@@ -141,3 +141,9 @@ Recommended naming example:
 - `WAITING` quote replies snooze for 24 hours.
 - Mixed updates such as “เปิด PO เรียบร้อยแล้ว แต่เซลล์ยังไม่ตอบรับ” stay `WAITING` instead of being incorrectly closed as `COMPLETED`.
 - Adds explicit completion phrases such as “ส่งเรียบร้อย” and “ดำเนินการเสร็จแล้ว”.
+
+
+## v0.6.20
+- Exact LINE quote-replies update the linked Task before optional People Registry enrichment.
+- Identity/Alias conflicts can no longer roll back a correctly quoted status update.
+- Added logs: `quoted task CORE update failed` and `quoted reply identity enrichment skipped`.
