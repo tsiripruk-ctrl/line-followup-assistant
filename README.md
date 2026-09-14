@@ -231,3 +231,15 @@ Post-deploy smoke test:
 3. Send an in-progress update matched to one task => group must stay silent; task memory/status may update internally.
 4. Quote-reply `เรียบร้อยแล้ว` to a reminder => exact task becomes COMPLETED and a short acknowledgement is allowed.
 5. Force/observe any ambiguous or processing-error path => no technical/canned message in group; owner receives diagnostics privately.
+
+## v0.6.26 - Non-Task Leave Guard + Owner Delete
+
+- Added deterministic Task Creation Guard before the LLM.
+- Leave/attendance notices such as `ขอลากิจ 2 วัน`, `ลาป่วย`, `ไม่เข้าทำงาน`, `ขอกลับก่อน` are ignored and do not create FU tasks.
+- Real action requests about leave paperwork remain task-eligible, e.g. `ช่วยทำใบลาให้บอส`, `ส่งใบลาให้ HR`, `อนุมัติการลาให้...`.
+- Added owner private command `ลบ FU-xxxxxx-xxxx` to permanently remove a mistaken task and its timeline/outbound mappings.
+- `/health` exposes `task_creation_guard`, `leave_notice_filter`, and `owner_hard_delete_command`.
+
+### Regression test
+
+Run `python -m unittest discover -s tests -v`. Expected: all task-creation guard tests pass.

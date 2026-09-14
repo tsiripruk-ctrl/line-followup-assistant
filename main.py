@@ -16,6 +16,7 @@ from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, Task
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
+from intent_guard import classify_precreation_guard
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -24,10 +25,10 @@ from service import (
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
-    contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target
+    contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target, delete_task_by_code
 )
 
-VERSION = "0.6.25"
+VERSION = "0.6.26"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -106,6 +107,8 @@ def health():
         "silent_ambiguity_mode": True, "recent_reminder_context": True,
         "passive_task_learning": True, "quiet_ack_policy": True,
         "public_exception_fallback_disabled": True,
+        "task_creation_guard": True, "leave_notice_filter": True,
+        "owner_hard_delete_command": True,
     }
 
 
@@ -1050,6 +1053,15 @@ async def _process_message(event: dict):
     if source_type != "group":
         return
 
+    # v0.6.26 TASK CREATION GUARD
+    # Ordinary leave/attendance notices are informational and must not become FU
+    # tasks. Run this before status parsing and before the LLM so a sentence such
+    # as "ขอลากิจ 2 วัน" cannot be promoted to a task by model uncertainty.
+    precreation_guard = classify_precreation_guard(text)
+    if precreation_guard.block_task_creation:
+        print("non-task notice ignored:", precreation_guard.reason, repr(text))
+        return
+
     # v0.6.14 FAST LOCAL STATUS PATH
     # Detect obvious Thai status updates *before* calling the LLM. This is important
     # because a slow/failed OpenAI request previously caused messages such as
@@ -1474,6 +1486,23 @@ async def handle_owner_command(user_id: str, text: str):
     raw = text.strip()
     low = raw.lower()
 
+    if low.startswith("ลบ "):
+        parts = raw.split(maxsplit=1)
+        code = parts[1].strip() if len(parts) > 1 else ""
+        if not re.fullmatch(r"FU-\d{6}-\d{4,}", code, flags=re.IGNORECASE):
+            await push_text(user_id, "รูปแบบ: ลบ FU-xxxxxx-xxxx ค่ะ")
+            return
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            title = task.title
+            deleted = delete_task_by_code(db, code)
+        if deleted:
+            await push_text(user_id, f"ลบงาน {code} ออกจากระบบเรียบร้อยค่ะ\n{title}")
+        return
+
     if low.startswith("ปิด ") or low.startswith("เสร็จ "):
         parts = raw.split(maxsplit=1)
         code = parts[1].strip() if len(parts) > 1 else ""
@@ -1591,7 +1620,8 @@ async def handle_owner_command(user_id: str, text: str):
         "• ประวัติ FU-xxxxxx-xxxx\n"
         "• รวมชื่อ Tong Thanakrit = ต้น\n"
         "• สรุปเช้า / สรุปเย็น\n"
-        "• ปิด FU-xxxxxx-xxxx"
+        "• ปิด FU-xxxxxx-xxxx\n"
+        "• ลบ FU-xxxxxx-xxxx"
     )
 
 

@@ -3,9 +3,9 @@ import re
 from difflib import SequenceMatcher
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
-from models import Task, TaskEvent, Person, PersonAlias, SystemEvent
+from models import Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage
 from config import settings
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
@@ -139,6 +139,24 @@ def completed_tasks(db: Session, limit: int = 10):
 def get_task_by_code(db: Session, code: str) -> Task | None:
     return db.scalar(select(Task).where(Task.task_code == code.upper().strip()))
 
+
+
+def delete_task_by_code(db: Session, code: str) -> Task | None:
+    """Hard-delete one tracked task and its bot-owned child records.
+
+    Used only by an explicit owner command. Child rows are deleted explicitly so
+    behavior is consistent on both PostgreSQL and SQLite test environments.
+    """
+    task = get_task_by_code(db, code)
+    if not task:
+        return None
+    # Keep a detached snapshot of the identifying fields for the confirmation.
+    task_id = task.id
+    db.execute(delete(OutboundTaskMessage).where(OutboundTaskMessage.task_id == task_id))
+    db.execute(delete(TaskEvent).where(TaskEvent.task_id == task_id))
+    db.delete(task)
+    db.commit()
+    return task
 
 def _local_day_range(days_from_today: int = 0):
     tz = ZoneInfo(settings.timezone)
