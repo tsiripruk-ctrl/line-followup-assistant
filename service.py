@@ -88,11 +88,21 @@ def create_task(
         person = get_person_by_alias(db, canonical_assignee or raw_assignee)
         if person and person.line_user_id:
             assignee_user_id = person.line_user_id
+    resolved_title = extraction.title or "งานติดตามจาก LINE"
+    # Guard against cross-message AI extraction. If the generated title points to a
+    # different operational topic than the actual source message, preserve the source
+    # wording instead of creating a confidently wrong task title.
+    if source_text:
+        src_anchors = _topic_anchors(source_text)
+        title_anchors = _topic_anchors(resolved_title)
+        if src_anchors and title_anchors and not (src_anchors & title_anchors):
+            resolved_title = _safe_source_excerpt(source_text, 160) or resolved_title
+
     t = Task(
         task_code="TEMP",
         group_id=group_id,
         source_message_id=source_message_id,
-        title=extraction.title or "งานติดตามจาก LINE",
+        title=resolved_title,
         project=extraction.project,
         assignee_name=canonical_assignee or raw_assignee,
         assignee_user_id=assignee_user_id,
@@ -282,6 +292,128 @@ def _semantic_core(value: str | None) -> str:
         x = x.replace(_match_text(src).replace(" ", ""), _match_text(dst).replace(" ", ""))
     return x
 
+
+
+
+# Topic anchors are deliberately operational and conservative. They are used to
+# prevent a status update from one job contaminating another job owned by the same
+# person. This is not a classifier; it is a conflict guard.
+TOPIC_ANCHOR_TERMS = {
+    "gps": ("gps", "ปักหมุด", "พิกัด", "coordinate", "coordinates"),
+    "meter": ("มิเตอร์", "meter"),
+    "camera": ("กล้อง", "cctv", "camera"),
+    "flow_account": ("flow account", "flowaccount", "tsp"),
+    "purchase_order": ("เปิด po", "po", "พีโอ", "futong", "ฟู่ตง"),
+    "fiber": ("สายไฟเบอร์", "ไฟเบอร์", "fiber", "fibre"),
+    "insurance": ("ประกัน", "เบี้ยประกัน", "พรบ", "พ.ร.บ"),
+    "postgresql": ("postgresql", "postgres", "ฐานข้อมูล"),
+    "email": ("อีเมล", "email", "เมล"),
+    "drawing": ("drawing", "แบบติดตั้ง", "แบบการติดตั้ง", "วาดแบบ"),
+}
+
+
+def _topic_anchors(value: str | None) -> set[str]:
+    compact = _match_text(value).replace(" ", "")
+    if not compact:
+        return set()
+    anchors: set[str] = set()
+    for name, terms in TOPIC_ANCHOR_TERMS.items():
+        for term in terms:
+            needle = _match_text(term).replace(" ", "")
+            if needle and needle in compact:
+                anchors.add(name)
+                break
+    # Exact latin/numeric tokens are useful anchors for product/system/project names.
+    normalized = _match_text(value)
+    for tok in normalized.split():
+        if re.search(r"[a-zA-Z0-9]", tok) and len(tok) >= 3 and tok not in {"update", "status"}:
+            anchors.add(f"token:{tok}")
+    return anchors
+
+
+def _created_task_text(db: Session, task: Task) -> str:
+    try:
+        ev = db.scalar(
+            select(TaskEvent)
+            .where(TaskEvent.task_id == task.id, TaskEvent.event_type == "CREATED")
+            .order_by(TaskEvent.id.asc())
+            .limit(1)
+        )
+        return (ev.text or "").strip() if ev else ""
+    except Exception:
+        return ""
+
+
+def _base_task_text(db: Session, task: Task) -> str:
+    """Stable task context: title/project plus the original assignment only.
+
+    Do not include arbitrary later STATUS_REPLY/TASK_MEMORY events here; those may be
+    exactly the contaminated data we are trying to detect.
+    """
+    return " ".join(x for x in [task.title or "", task.project or "", _created_task_text(db, task)] if x)
+
+
+def _is_generic_status_only(value: str | None) -> bool:
+    """True only for short replies with no independent topic information.
+
+    Generic replies may safely use identity/quoted context. Substantive updates such
+    as 'ยังไม่ได้ปักหมุด GPS...' must never be attached by assignee identity alone.
+    """
+    x = _match_text(value)
+    if not x:
+        return True
+    if _topic_anchors(value):
+        return False
+    core = _semantic_core(value)
+    generic_cores = {
+        "", "ส่ง", "จ่าย", "ตรวจ", "ทำ", "ปิด", "เปิด", "โอเค", "ok", "done",
+        "ยังไม่", "ยังไม่ได้", "รอ", "กำลังทำ", "กำลังตรวจ",
+    }
+    if core in generic_cores:
+        return True
+    return len(core) <= 8
+
+
+def _memory_relevant_to_task(db: Session, task: Task, memory_text: str | None) -> bool:
+    """Reject task-memory that contains a clearly different operational topic."""
+    if not memory_text:
+        return False
+    base = _base_task_text(db, task)
+    base_anchors = _topic_anchors(base)
+    mem_anchors = _topic_anchors(memory_text)
+    if base_anchors and mem_anchors and not (base_anchors & mem_anchors):
+        return False
+    # When both sides have no known anchors, require at least modest lexical relation
+    # unless the reply is generic status wording.
+    if not base_anchors and not mem_anchors and not _is_generic_status_only(memory_text):
+        proxy = type("TaskProxy", (), {"title": base, "project": None})()
+        if _task_text_score(proxy, memory_text) < 0.25:
+            return False
+    return True
+
+
+def _safe_source_excerpt(text: str | None, max_len: int = 110) -> str:
+    if not text:
+        return ""
+    x = " ".join(str(text).replace("\n", " ").split()).strip()
+    # Trim common follow-up filler while keeping the actual assignment wording.
+    for phrase in ("มาตอนนี้เค้าอัพเดทอะไรยังไงบ้าง", "ตอนนี้เค้าอัพเดทอะไรยังไงบ้าง", "เห็นเค้าตามเรื่องกันอยู่"):
+        x = x.replace(phrase, "").strip(" ,-:|.")
+    if len(x) > max_len:
+        x = x[: max_len - 1].rstrip() + "…"
+    return x
+
+
+def task_reference_label(db: Session, task: Task) -> str:
+    """Prefer the original assignment when the AI-generated title conflicts with it."""
+    source = _created_task_text(db, task)
+    if not source:
+        return task.title
+    title_anchors = _topic_anchors(task.title)
+    source_anchors = _topic_anchors(source)
+    if title_anchors and source_anchors and not (title_anchors & source_anchors):
+        return _safe_source_excerpt(source) or task.title
+    return task.title
 
 def _compact_similarity(a: str, b: str) -> float:
     if not a or not b:
@@ -579,7 +711,11 @@ def rank_status_targets_with_history(db: Session, tasks: list[Task], sender_name
         title_score = _task_text_score(t, hint)
         event_texts = list(db.scalars(
             select(TaskEvent.text)
-            .where(TaskEvent.task_id == t.id, TaskEvent.text.is_not(None))
+            .where(
+                TaskEvent.task_id == t.id,
+                TaskEvent.text.is_not(None),
+                TaskEvent.event_type.in_(["CREATED", "QUOTED_STATUS_REPLY", "QUOTED_COMMENT_REPLY"]),
+            )
             .order_by(TaskEvent.id.desc())
             .limit(8)
         ).all())
@@ -650,14 +786,18 @@ def choose_status_target_with_history(db: Session, tasks: list[Task], sender_nam
             return best["task"]
         return None
 
-    sender = normalize_name(sender_name)
-    sender_owned = [
-        r for r in rows
-        if (sender_user_id and r["task"].assignee_user_id == sender_user_id)
-        or (sender and normalize_name(r["task"].assignee_name) == sender)
-    ]
-    if len(sender_owned) == 1:
-        return sender_owned[0]["task"]
+    # Identity-only fallback is intentionally limited to generic status replies.
+    # A substantive update (e.g. GPS/meter/camera details) must have content evidence
+    # or an exact quote-reply link; otherwise it is safer to leave the task unchanged.
+    if _is_generic_status_only(hint):
+        sender = normalize_name(sender_name)
+        sender_owned = [
+            r for r in rows
+            if (sender_user_id and r["task"].assignee_user_id == sender_user_id)
+            or (sender and normalize_name(r["task"].assignee_name) == sender)
+        ]
+        if len(sender_owned) == 1:
+            return sender_owned[0]["task"]
     return None
 
 
@@ -726,22 +866,26 @@ def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner
     """
     ev = latest_status_reply(db, task)
     memory = summarize_progress_update(ev.text if ev else None)
+    topic = task_reference_label(db, task)
+    if memory and not _memory_relevant_to_task(db, task, memory):
+        print("task memory rejected as cross-topic contamination:", task.task_code, repr(memory), "base=", repr(_base_task_text(db, task)))
+        memory = ""
     if memory:
         if task.status == "WAITING":
             return (
-                f"{assignee_token}คะ จากอัปเดตล่าสุดเรื่อง{task.title} ที่แจ้งว่า {memory}\n"
+                f"{assignee_token}คะ จากอัปเดตล่าสุดของงาน {topic} ที่แจ้งว่า {memory}\n"
                 f"ตอนนี้สิ่งที่กำลังรออยู่มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ",
                 True,
             )
         if task.status == "IN_PROGRESS":
             return (
-                f"{assignee_token}คะ จากอัปเดตล่าสุดเรื่อง{task.title} ที่แจ้งว่า {memory}\n"
+                f"{assignee_token}คะ จากอัปเดตล่าสุดของงาน {topic} ที่แจ้งว่า {memory}\n"
                 f"ตอนนี้ดำเนินการต่อถึงขั้นตอนไหนแล้วคะ หากเรียบร้อยแล้วแจ้ง{owner_name}ได้เลยค่ะ",
                 True,
             )
         if task.status == "OVERDUE":
             return (
-                f"{assignee_token}คะ ขออัปเดตต่อจากข้อมูลล่าสุดของเรื่อง{task.title} ที่แจ้งว่า {memory}\n"
+                f"{assignee_token}คะ ขออัปเดตต่อจากข้อมูลล่าสุดของงาน {topic} ที่แจ้งว่า {memory}\n"
                 f"ตอนนี้มีความคืบหน้าเพิ่มเติมหรือมีจุดติดขัดอะไรไหมคะ",
                 True,
             )

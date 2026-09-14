@@ -161,3 +161,21 @@ Recommended naming example:
 New optional environment variables:
 `FOLLOWUP_START_HOUR=8`, `FOLLOWUP_START_MINUTE=30`, `FOLLOWUP_END_HOUR=17`, `FOLLOWUP_END_MINUTE=30`,
 `MAX_FOLLOWUPS_PER_TASK_PER_DAY=2`, `WAITING_MAX_FOLLOWUPS_PER_DAY=1`, `MAX_FOLLOWUPS_PER_SCAN=2`, `MAX_GROUP_FOLLOWUPS_PER_SCAN=1`.
+
+## v0.6.22 – Task Context Integrity Guard
+
+This release addresses cross-task context contamination observed in group follow-ups.
+
+- Treats the original LINE assignment (`CREATED` event) as source truth when an AI-generated task title points to a different topic.
+- Prevents substantive updates (GPS, meter, camera, Flow Account, PO, fiber, insurance, etc.) from being attached to a task by assignee identity alone.
+- Uses identity-only fallback only for genuinely generic short status replies such as `เรียบร้อยแล้ว` when there is exactly one eligible task.
+- Excludes arbitrary `STATUS_REPLY` / `TASK_MEMORY_UPDATED` events from future task matching; only the original assignment and exact quoted replies may enrich matching context.
+- Rejects cross-topic task memory before generating reminders.
+- Reminder text falls back to the original assignment wording when the stored task title conflicts with the source message.
+- New tasks receive a source-vs-title integrity check at creation time to reduce mixed-context titles from entering the database.
+
+`/health` exposes:
+- `task_context_integrity_guard`
+- `cross_topic_memory_guard`
+- `source_truth_reminders`
+- `identity_only_substantive_match_disabled`

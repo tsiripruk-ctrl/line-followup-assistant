@@ -23,10 +23,10 @@ from service import (
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
-    contextual_followup_text, summarize_progress_update
+    contextual_followup_text, summarize_progress_update, task_reference_label
 )
 
-VERSION = "0.6.21"
+VERSION = "0.6.22"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -98,6 +98,8 @@ def health():
         "mixed_progress_waiting_resolution": True,
         "working_hours_followup": True, "followup_window": "08:30-17:30",
         "daily_followup_limits": True, "staggered_group_followups": True,
+        "task_context_integrity_guard": True, "cross_topic_memory_guard": True,
+        "source_truth_reminders": True, "identity_only_substantive_match_disabled": True,
     }
 
 
@@ -1633,12 +1635,13 @@ async def reminder_scan(force: bool = False):
                     assignee = person.call_name.strip()
                 use_mention = bool(t.assignee_user_id)
                 greeting = "{assignee}คะ" if use_mention else (f"{assignee}คะ" if assignee != "ทีม" else "ทีมคะ")
+                topic = task_reference_label(db, t)
                 is_pre_due = bool(t.due_at and now < t.due_at)
 
                 if is_pre_due:
                     due_text = format_due_local(t)
                     body = (
-                        f"{greeting} ขอแจ้งเตือนเรื่อง{t.title}ค่ะ\n"
+                        f"{greeting} ขอแจ้งเตือนเรื่อง{topic}ค่ะ\n"
                         f"งานนี้กำหนด {due_text} ถ้าเรียบร้อยแล้วแจ้ง{settings.owner_display_name}ได้เลยนะคะ"
                     )
                     # After the advance reminder, the next check is the due time itself.
@@ -1652,22 +1655,22 @@ async def reminder_scan(force: bool = False):
                     elif t.status == "OVERDUE":
                         if t.reminder_count >= settings.escalation_after_reminders:
                             body = (
-                                f"{greeting} ขออัปเดตเรื่อง{t.title}อีกครั้งค่ะ\n"
+                                f"{greeting} ขออัปเดตเรื่อง{topic}อีกครั้งค่ะ\n"
                                 f"ตอนนี้เลยกำหนดแล้ว หากยังติดปัญหาตรงไหน รบกวนแจ้งสาเหตุและวันที่คาดว่าจะเรียบร้อยให้{settings.owner_display_name}ทราบด้วยนะคะ"
                             )
                         else:
                             body = (
-                                f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                                f"{greeting} ขออัปเดตเรื่อง{topic}หน่อยค่ะ\n"
                                 f"ตอนนี้เลยกำหนดแล้ว หากยังติดอะไรอยู่แจ้ง{settings.owner_display_name}ไว้ได้เลยนะคะ"
                             )
                     elif t.status == "WAITING":
                         body = (
-                            f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                            f"{greeting} ขออัปเดตเรื่อง{topic}หน่อยค่ะ\n"
                             f"เรื่องที่รออยู่มีความคืบหน้าเพิ่มเติมไหมคะ"
                         )
                     else:
                         body = (
-                            f"{greeting} ขออัปเดตความคืบหน้าเรื่อง{t.title}หน่อยค่ะ\n"
+                            f"{greeting} ขออัปเดตความคืบหน้าเรื่อง{topic}หน่อยค่ะ\n"
                             f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
                         )
 
@@ -1679,7 +1682,7 @@ async def reminder_scan(force: bool = False):
                         t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
                 else:
                     body = (
-                        f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                        f"{greeting} ขออัปเดตเรื่อง{topic}หน่อยค่ะ\n"
                         f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
                     )
                     t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
