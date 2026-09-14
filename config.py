@@ -23,7 +23,18 @@ class Settings(BaseSettings):
     reminder_repeat_hours: int = 4
     escalation_after_reminders: int = 2
 
-    # Quiet hours (no group follow-up during this window)
+    # Follow-up working window (Thailand/local timezone). Group reminders are
+    # allowed only from 08:30 until 17:30. Daily follow-up still runs every day.
+    followup_start_hour: int = 8
+    followup_start_minute: int = 30
+    followup_end_hour: int = 17
+    followup_end_minute: int = 30
+    max_followups_per_task_per_day: int = 2
+    waiting_max_followups_per_day: int = 1
+    max_followups_per_scan: int = 2
+    max_group_followups_per_scan: int = 1
+
+    # Legacy quiet-hour settings are retained for backward compatibility only.
     quiet_hour_start: int = 20
     quiet_hour_end: int = 7
 
@@ -34,9 +45,9 @@ class Settings(BaseSettings):
 
     # Daily brief (Thailand/local timezone)
     daily_brief_enabled: bool = True
-    morning_brief_hour: int = 7
+    morning_brief_hour: int = 8
     morning_brief_minute: int = 30
-    evening_brief_hour: int = 18
+    evening_brief_hour: int = 17
     evening_brief_minute: int = 30
     # v0.3.2 default: /jobs/tick handles reminders only. Daily briefs use dedicated jobs.
     brief_catchup_on_tick: bool = False

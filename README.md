@@ -147,3 +147,17 @@ Recommended naming example:
 - Exact LINE quote-replies update the linked Task before optional People Registry enrichment.
 - Identity/Alias conflicts can no longer roll back a correctly quoted status update.
 - Added logs: `quoted task CORE update failed` and `quoted reply identity enrichment skipped`.
+
+## v0.6.21 — Working-hours & Humanized Follow-up Policy
+
+- Group follow-up runs every day but only during **08:30–17:30 Asia/Bangkok**.
+- No group reminder is sent before 08:30 or from 17:30 onward; overdue reminders wait for the next working window.
+- Default daily cap: **2 follow-ups per task/day**, and **1/day** for `WAITING` tasks.
+- Reminder bursts are spread across scheduler ticks instead of sending many messages to the same group at once.
+- Next reminders are automatically clamped to working hours; tasks that hit the daily cap resume the next day from 08:30 with deterministic staggering.
+- Context-aware reminders and Task Memory from v0.6.18+ remain enabled.
+- Default owner briefs are aligned to **08:30** and **17:30**.
+
+New optional environment variables:
+`FOLLOWUP_START_HOUR=8`, `FOLLOWUP_START_MINUTE=30`, `FOLLOWUP_END_HOUR=17`, `FOLLOWUP_END_MINUTE=30`,
+`MAX_FOLLOWUPS_PER_TASK_PER_DAY=2`, `WAITING_MAX_FOLLOWUPS_PER_DAY=1`, `MAX_FOLLOWUPS_PER_SCAN=2`, `MAX_GROUP_FOLLOWUPS_PER_SCAN=1`.

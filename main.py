@@ -4,14 +4,14 @@ from datetime import datetime, timedelta
 import asyncio
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Query
-from sqlalchemy import select
+from sqlalchemy import select, func
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi.responses import HTMLResponse, RedirectResponse
 from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
 from db import Base, engine, SessionLocal, ensure_people_registry_schema
-from models import Message, Task, OutboundTaskMessage, Person, PersonAlias
+from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, TaskEvent
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
@@ -26,7 +26,7 @@ from service import (
     contextual_followup_text, summarize_progress_update
 )
 
-VERSION = "0.6.20"
+VERSION = "0.6.21"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -96,6 +96,8 @@ def health():
         "quoted_reply_identity_guard": True, "quoted_reply_task_memory": True,
         "quoted_reply_atomic_status": True, "quoted_reply_identity_best_effort": True,
         "mixed_progress_waiting_resolution": True,
+        "working_hours_followup": True, "followup_window": "08:30-17:30",
+        "daily_followup_limits": True, "staggered_group_followups": True,
     }
 
 
@@ -1482,23 +1484,100 @@ async def send_task_list(user_id: str, title: str, tasks: list[Task]):
     await push_text(user_id, "\n".join(lines))
 
 
-def in_quiet_hours() -> bool:
-    hour = datetime.now(ZoneInfo(settings.timezone)).hour
-    start, end = settings.quiet_hour_start, settings.quiet_hour_end
+def _local_minutes(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
+def in_followup_window(local_dt: datetime | None = None) -> bool:
+    """True only during the configured daily working window.
+
+    The end time is exclusive: at 17:30 group follow-up stops. Owner daily brief
+    may still be sent by its dedicated 17:30 job.
+    """
+    local_dt = local_dt or datetime.now(ZoneInfo(settings.timezone))
+    start = settings.followup_start_hour * 60 + settings.followup_start_minute
+    end = settings.followup_end_hour * 60 + settings.followup_end_minute
+    current = _local_minutes(local_dt)
     if start == end:
-        return False
-    if start > end:
-        return hour >= start or hour < end
-    return start <= hour < end
+        return True
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def in_quiet_hours() -> bool:
+    # Backward-compatible name used by /health and dashboard. For reminder
+    # purposes, anything outside working hours is quiet.
+    return not in_followup_window()
+
+
+def _local_day_utc_bounds(now_utc: datetime) -> tuple[datetime, datetime]:
+    tz = ZoneInfo(settings.timezone)
+    aware_utc = now_utc.replace(tzinfo=ZoneInfo("UTC"))
+    local = aware_utc.astimezone(tz)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    end_utc = end_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return start_utc, end_utc
+
+
+def followups_sent_today(db, task: Task, now_utc: datetime) -> int:
+    start_utc, end_utc = _local_day_utc_bounds(now_utc)
+    return int(db.scalar(select(func.count(TaskEvent.id)).where(
+        TaskEvent.task_id == task.id,
+        TaskEvent.event_type == "REMINDER_SENT",
+        TaskEvent.created_at >= start_utc,
+        TaskEvent.created_at < end_utc,
+    )) or 0)
+
+
+def _task_stagger_minutes(task: Task, max_minutes: int = 45) -> int:
+    token = task.task_code or str(task.id or 0)
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(token)) % (max_minutes + 1)
+
+
+def next_work_window_utc(base_utc: datetime, task: Task | None = None, *, next_day: bool = False) -> datetime:
+    """Clamp a UTC-naive reminder time into 08:30-17:30 local working hours."""
+    tz = ZoneInfo(settings.timezone)
+    local = base_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+    start_min = settings.followup_start_hour * 60 + settings.followup_start_minute
+    end_min = settings.followup_end_hour * 60 + settings.followup_end_minute
+    current = _local_minutes(local)
+    stagger = _task_stagger_minutes(task) if task else 0
+
+    if next_day:
+        local = (local + timedelta(days=1)).replace(
+            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
+        ) + timedelta(minutes=stagger)
+    elif current < start_min:
+        local = local.replace(
+            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
+        ) + timedelta(minutes=stagger)
+    elif current >= end_min:
+        local = (local + timedelta(days=1)).replace(
+            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
+        ) + timedelta(minutes=stagger)
+
+    # A large stagger must never push a message past the work window.
+    if _local_minutes(local) >= end_min:
+        local = (local + timedelta(days=1)).replace(
+            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
+        )
+    return local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+
+def schedule_next_followup(task: Task, candidate_utc: datetime, *, force_next_day: bool = False) -> datetime:
+    return next_work_window_utc(candidate_utc, task, next_day=force_next_day)
 
 
 async def reminder_scan(force: bool = False):
-    stats = {"due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0}
+    stats = {"due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0, "skipped_daily_cap": 0, "deferred_spread": 0}
     now = datetime.utcnow()
 
-    # Do not lose a due reminder during quiet hours. It remains due and will be
-    # delivered by the first tick after quiet hours end.
-    if not force and in_quiet_hours():
+    # Group follow-up is strictly limited to the working window 08:30-17:30.
+    # Due reminders are preserved and delivered after the next window opens.
+    if not force and not in_followup_window():
         with SessionLocal() as db:
             stats["due"] = db.query(Task).filter(
                 Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
@@ -1506,7 +1585,7 @@ async def reminder_scan(force: bool = False):
                 Task.next_reminder_at <= now,
             ).count()
         stats["skipped_quiet"] = stats["due"]
-        print("reminder scan skipped: quiet hours, due=", stats["due"] )
+        print("reminder scan skipped: outside follow-up window, due=", stats["due"] )
         return stats
 
     with SessionLocal() as db:
@@ -1516,8 +1595,29 @@ async def reminder_scan(force: bool = False):
             Task.next_reminder_at <= now,
         ).order_by(Task.next_reminder_at.asc())).all())
         stats["due"] = len(tasks)
+        group_sent_counts: dict[str, int] = {}
 
         for t in tasks:
+            # Avoid a robotic burst of many reminders in the same cron tick.
+            if not force and stats["sent"] >= settings.max_followups_per_scan:
+                stats["deferred_spread"] += 1
+                continue
+            if not force and group_sent_counts.get(t.group_id, 0) >= settings.max_group_followups_per_scan:
+                t.next_reminder_at = max(t.next_reminder_at or now, now + timedelta(minutes=5))
+                db.commit()
+                stats["deferred_spread"] += 1
+                continue
+
+            # Daily cap: normal tasks max 2 follow-ups/day; WAITING max 1/day.
+            # This preserves daily follow-up while avoiding repetitive pressure.
+            sent_today = followups_sent_today(db, t, now)
+            daily_cap = settings.waiting_max_followups_per_day if t.status == "WAITING" else settings.max_followups_per_task_per_day
+            if not force and sent_today >= daily_cap:
+                t.next_reminder_at = schedule_next_followup(t, now, force_next_day=True)
+                db.commit()
+                stats["skipped_daily_cap"] += 1
+                continue
+
             try:
                 became_overdue = bool(t.due_at and now > t.due_at and t.status != "OVERDUE")
                 if t.due_at and now > t.due_at:
@@ -1542,7 +1642,7 @@ async def reminder_scan(force: bool = False):
                         f"งานนี้กำหนด {due_text} ถ้าเรียบร้อยแล้วแจ้ง{settings.owner_display_name}ได้เลยนะคะ"
                     )
                     # After the advance reminder, the next check is the due time itself.
-                    t.next_reminder_at = t.due_at
+                    t.next_reminder_at = schedule_next_followup(t, t.due_at)
                 elif t.status in ("OVERDUE", "WAITING", "IN_PROGRESS"):
                     memory_body, used_memory = contextual_followup_text(
                         db, t, greeting[:-2] if greeting.endswith("คะ") else greeting, settings.owner_display_name
@@ -1572,17 +1672,17 @@ async def reminder_scan(force: bool = False):
                         )
 
                     if t.status == "WAITING":
-                        t.next_reminder_at = now + timedelta(hours=24)
+                        t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=24))
                     elif t.status == "IN_PROGRESS":
-                        t.next_reminder_at = now + timedelta(hours=6)
+                        t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=6))
                     else:
-                        t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
+                        t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
                 else:
                     body = (
                         f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
                         f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
                     )
-                    t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
+                    t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
 
                 if use_mention:
                     try:
@@ -1611,6 +1711,7 @@ async def reminder_scan(force: bool = False):
                 )
                 db.commit()
                 stats["sent"] += 1
+                group_sent_counts[t.group_id] = group_sent_counts.get(t.group_id, 0) + 1
                 print("reminder sent:", t.task_code, t.status, "pre_due=", is_pre_due, "count=", t.reminder_count)
 
                 if settings.owner_escalation_alerts and settings.owner_line_user_id:
