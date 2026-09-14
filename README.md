@@ -199,3 +199,35 @@ This release addresses cross-task context contamination observed in group follow
 3. ส่งข้อความอัปเดตหลายเรื่องในข้อความเดียว โดยแยกย่อหน้า ชุมแสง / ประแส / Fiber. ในกลุ่มควรได้คำตอบรับเพียงครั้งเดียว และ owner DM ต้องแสดงว่าส่วนไหนผูกได้หรือยังไม่ผูก.
 4. ส่งอัปเดตเรื่อง GPS จากคนที่มีหลายงาน ระบบต้องไม่เอาไปต่อกับงานกล้อง/มิเตอร์อื่นเพียงเพราะเป็นคนเดียวกัน.
 5. Quote Reply ที่ Reminder เดิมแล้วพิมพ์ `เรียบร้อยแล้ว` ต้องยังปิดงานตรงข้อความที่ Quote ได้ตามเดิม.
+
+## v0.6.24 - Quiet Context Learning / Recent Reminder Continuity
+
+- Quiet-by-default in LINE groups: ambiguous updates no longer trigger canned acknowledgements.
+- Progress-only comments are learned silently; the bot speaks mainly on explicit status changes or exact quote replies.
+- Recent Reminder Context: a natural reply shortly after a reminder can resolve to that task even without LINE quote/reply, but only with sender/topic safety guards.
+- Multi-topic messages are split/learned privately without a repetitive public acknowledgement.
+- Unmatched details remain in Message history and are reported privately to the owner; they are not forced into a random task.
+- Cross-topic integrity guard remains active.
+
+### Mobile test checklist
+1. `/health` must show `version: 0.6.24`, `silent_ambiguity_mode: true`, `recent_reminder_context: true`.
+2. Send an unrelated operational sentence: the group should receive no canned bot reply.
+3. Reply naturally (without quote) within 3 hours after one reminder for your assigned task; a clear status such as `ส่งแล้ว` should update that recent task.
+4. If two recent reminders belong to the same person, a substantive reply must match by topic; otherwise it stays silent and does not change either task.
+5. Send a long multi-project update; no repetitive public acknowledgement should appear, and no segment may contaminate a different task.
+
+
+## v0.6.25 - Verified Quiet Group Policy
+
+- Removed the remaining public fallback message `ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ` from exception handling.
+- Routine `in_progress` / `none` updates no longer receive canned public acknowledgements.
+- Public acknowledgements are now limited to meaningful state changes: `COMPLETED` and `WAITING`.
+- Processing errors and ambiguous matches remain silent in the group and are sent only to the owner diagnostics.
+- Health flags now reflect implemented behavior: `quiet_ack_policy` and `public_exception_fallback_disabled`.
+
+Post-deploy smoke test:
+1. `/health` => `version: 0.6.25`, `quiet_ack_policy: true`, `public_exception_fallback_disabled: true`.
+2. Send a vague update such as `เดี๋ยวเช็กให้อีกทีครับ` => group must stay silent.
+3. Send an in-progress update matched to one task => group must stay silent; task memory/status may update internally.
+4. Quote-reply `เรียบร้อยแล้ว` to a reminder => exact task becomes COMPLETED and a short acknowledgement is allowed.
+5. Force/observe any ambiguous or processing-error path => no technical/canned message in group; owner receives diagnostics privately.

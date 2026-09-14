@@ -696,6 +696,88 @@ def _business_status_target(db: Session, tasks: list[Task], hint: str | None, se
     return None, "ambiguous_business_concept"
 
 
+
+def recent_reminder_context_target(
+    db: Session,
+    group_id: str,
+    sender_user_id: str | None,
+    sender_name: str | None,
+    text: str | None,
+    max_minutes: int = 180,
+) -> Task | None:
+    """Resolve a human update against a recently reminded task without guessing.
+
+    Humans often answer a reminder naturally without using LINE's quote feature.
+    We therefore look at recent assistant reminder messages in the same group, but
+    only use this continuity signal when it is safe:
+      * prefer tasks explicitly assigned to the sender's LINE user id;
+      * a generic status reply may bind only when exactly one recent task remains;
+      * a substantive update still needs topic/content evidence and a clear margin.
+
+    This gives the bot conversational continuity while preventing one employee's
+    unrelated update from contaminating another open task.
+    """
+    if not group_id:
+        return None
+    cutoff = datetime.utcnow() - timedelta(minutes=max_minutes)
+    try:
+        sent = list(db.scalars(
+            select(OutboundTaskMessage)
+            .where(
+                OutboundTaskMessage.group_id == group_id,
+                OutboundTaskMessage.created_at >= cutoff,
+            )
+            .order_by(OutboundTaskMessage.created_at.desc())
+            .limit(30)
+        ).all())
+    except Exception:
+        return None
+
+    seen: set[int] = set()
+    candidates: list[Task] = []
+    for row in sent:
+        if row.task_id in seen:
+            continue
+        t = db.get(Task, row.task_id)
+        if not t or t.status in {"COMPLETED", "CANCELLED"}:
+            continue
+        seen.add(t.id)
+        candidates.append(t)
+
+    if not candidates:
+        return None
+
+    # Sender identity is a narrowing signal, never a substitute for topic evidence.
+    if sender_user_id:
+        owned = [t for t in candidates if t.assignee_user_id == sender_user_id]
+        if owned:
+            candidates = owned
+    elif sender_name:
+        ns = normalize_name(sender_name)
+        owned = [t for t in candidates if normalize_name(t.assignee_name) == ns]
+        if owned:
+            candidates = owned
+
+    if _is_generic_status_only(text):
+        return candidates[0] if len(candidates) == 1 else None
+
+    scored: list[tuple[float, Task]] = []
+    for t in candidates:
+        base = _base_task_text(db, t)
+        proxy = type("TaskProxy", (), {"title": base, "project": None})()
+        score = _task_text_score(proxy, text)
+        # A cross-topic memory must never be rescued by recency alone.
+        if not _memory_relevant_to_task(db, t, text):
+            score = 0.0
+        scored.append((score, t))
+    scored.sort(key=lambda x: (x[0], x[1].id), reverse=True)
+    if not scored or scored[0][0] < 0.45:
+        return None
+    if len(scored) > 1 and scored[1][0] >= 0.35 and (scored[0][0] - scored[1][0]) < 0.15:
+        return None
+    return scored[0][1]
+
+
 def rank_status_targets_with_history(db: Session, tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> list[dict]:
     """Rank tasks using title/project plus recent task-event text.
 

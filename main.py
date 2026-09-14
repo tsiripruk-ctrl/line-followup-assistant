@@ -24,10 +24,10 @@ from service import (
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
-    contextual_followup_text, summarize_progress_update, task_reference_label
+    contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target
 )
 
-VERSION = "0.6.23"
+VERSION = "0.6.25"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -86,9 +86,9 @@ def health():
         "people_multi_alias": True, "people_alias_crud": True,
         "task_resolution_engine": True, "assignee_context_resolution": True,
         "status_semantic_core_matching": True, "message_deduplication": True,
-        "local_status_fallback": True, "unmatched_status_ack": True,
+        "local_status_fallback": True, "unmatched_status_ack": False,
         "fast_local_status_path": True, "ai_failure_status_fallback": True,
-        "preprocessing_failure_ack": True, "best_effort_group_preprocessing": True,
+        "preprocessing_failure_ack": False, "best_effort_group_preprocessing": True,
         "business_concept_matching": True, "safe_status_notifications": True,
         "status_update_transaction_guard": True,
         "task_history_matching": True, "cross_group_unique_fallback": True, "candidate_score_logging": True,
@@ -102,7 +102,10 @@ def health():
         "task_context_integrity_guard": True, "cross_topic_memory_guard": True,
         "source_truth_reminders": True, "identity_only_substantive_match_disabled": True,
         "trust_recovery_mode": True, "public_technical_fallback_disabled": True,
-        "multi_topic_update_guard": True, "human_group_ack": True,
+        "multi_topic_update_guard": True, "human_group_ack": "state_change_only",
+        "silent_ambiguity_mode": True, "recent_reminder_context": True,
+        "passive_task_learning": True, "quiet_ack_policy": True,
+        "public_exception_fallback_disabled": True,
     }
 
 
@@ -255,18 +258,10 @@ async def handle_multi_topic_update(
             matched.append((target.task_code, target.title))
         db.commit()
 
-    public_text = (
-        "ขอบคุณค่ะ รับข้อมูลอัปเดตไว้แล้วนะคะ เดี๋ยวติดตามต่อจากแต่ละเรื่องให้ค่ะ"
-        if matched else
-        "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ"
-    )
-    try:
-        if reply_token:
-            await reply_text(reply_token, public_text)
-        else:
-            await push_text(group_id, public_text)
-    except Exception as exc:
-        print("multi-topic acknowledgement failed:", repr(exc))
+    # Quiet-by-default: multi-topic operational chatter is learned silently.
+    # Repetitive acknowledgements after every human update made the assistant feel
+    # robotic and discouraged replies. Diagnostics stay private with the owner.
+    print("multi-topic public acknowledgement suppressed", {"matched": len(matched), "unmatched": len(unmatched)})
 
     if settings.owner_status_updates and settings.owner_line_user_id:
         lines = ["สรุปข้อความอัปเดตหลายเรื่องค่ะ"]
@@ -869,45 +864,34 @@ async def webhook(request: Request):
 
 
 async def acknowledge_task_reply(reply_token: str | None, group_id: str, status_signal: str):
-    """Reply like a natural Thai female secretary, with light variation.
+    """Quiet-by-default acknowledgement policy.
 
-    Only messages successfully matched to an existing task reach this function.
-    The wording intentionally avoids system-like phrases and repetitive templates.
+    Public group acknowledgement is reserved for state-changing moments that are useful
+    to humans (completed / waiting). Routine in-progress updates and ambiguous/none
+    updates stay silent to avoid bot fatigue and repetitive canned messages.
     """
     reply_pool = {
         "completed": [
-            "ขอบคุณค่ะ รับทราบว่าเรียบร้อยแล้วนะคะ",
-            "รับทราบค่ะ งานนี้เรียบร้อยแล้ว ขอบคุณที่อัปเดตนะคะ",
+            "รับทราบค่ะ งานนี้เรียบร้อยแล้วนะคะ",
             "ขอบคุณค่ะ เรื่องนี้เรียบร้อยแล้วนะคะ",
         ],
         "waiting": [
-            "ขอบคุณค่ะ รับทราบว่ายังรออยู่ เดี๋ยวติดตามต่อให้นะคะ",
-            "รับทราบค่ะ ตอนนี้ยังรออยู่ เดี๋ยวค่อยตามต่อจากจุดนี้นะคะ",
+            "รับทราบค่ะ ตอนนี้ยังรออยู่ เดี๋ยวติดตามต่อจากจุดนี้นะคะ",
             "ขอบคุณที่อัปเดตค่ะ เดี๋ยวติดตามต่อจากข้อมูลนี้นะคะ",
         ],
-        "in_progress": [
-            "ขอบคุณค่ะ รับทราบความคืบหน้าแล้วนะคะ",
-            "รับทราบค่ะ เดี๋ยวติดตามต่อจากจุดนี้นะคะ",
-            "ขอบคุณที่อัปเดตค่ะ รับข้อมูลไว้แล้วนะคะ",
-        ],
-        "none": [
-            "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ",
-            "รับทราบค่ะ ขอบคุณที่อัปเดตนะคะ",
-            "ขอบคุณค่ะ รับทราบแล้วนะคะ",
-        ],
     }
-    text = random.choice(reply_pool.get(status_signal, reply_pool["none"]))
+    if status_signal not in reply_pool:
+        print("public acknowledgement suppressed:", status_signal)
+        return
+    text = random.choice(reply_pool[status_signal])
     try:
         if reply_token:
             await reply_text(reply_token, text)
         else:
             await push_text(group_id, text)
     except Exception as exc:
+        # Acknowledgement failure must never create another public fallback message.
         print("task reply acknowledgement failed:", repr(exc))
-        try:
-            await push_text(group_id, text)
-        except Exception as fallback_exc:
-            print("task reply acknowledgement fallback failed:", repr(fallback_exc))
 
 
 async def safe_push_text(to: str | None, text: str, *, label: str = "notification") -> bool:
@@ -986,18 +970,8 @@ async def process_message(event: dict):
     except Exception as exc:
         print("process_message failed:", repr(exc), "source_type=", source_type, "text=", repr(text))
         if source_type == "group" and source_id and local_status != "none":
-            fallback = "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ"
-            try:
-                if reply_token:
-                    await reply_text(reply_token, fallback)
-                else:
-                    await push_text(source_id, fallback)
-            except Exception as reply_exc:
-                print("preprocessing failure reply failed:", repr(reply_exc))
-                try:
-                    await push_text(source_id, fallback)
-                except Exception as push_exc:
-                    print("preprocessing failure push failed:", repr(push_exc))
+            # Never expose technical processing failure or a canned fallback in the work group.
+            # Keep the group quiet; diagnostics go only to the owner.
             if settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(
                     settings.owner_line_user_id,
@@ -1134,20 +1108,10 @@ async def _process_message(event: dict):
         # Never expose internal matching/Task terminology in the LINE group.
         # If confidence is insufficient, acknowledge the human update naturally and
         # send diagnostic/candidate detail only to the owner.
-        unmatched_text = "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ"
-        try:
-            if reply_token:
-                await reply_text(reply_token, unmatched_text)
-            else:
-                await push_text(source_id, unmatched_text)
-        except Exception as exc:
-            # replyToken is short-lived. If AI/DB processing took too long, LINE can
-            # reject the reply. Fall back to a group push so the user never sees silence.
-            print("unmatched status acknowledgement failed:", repr(exc))
-            try:
-                await push_text(source_id, unmatched_text)
-            except Exception as fallback_exc:
-                print("unmatched status push fallback failed:", repr(fallback_exc))
+        # Quiet ambiguity: do not expose uncertainty or send a canned acknowledgement
+        # into the work group. The original human message is already visible; silently
+        # retain it in Message history and send diagnostics only to the owner.
+        print("unmatched status kept silent in group:", repr(text))
 
         if settings.owner_status_updates and settings.owner_line_user_id:
             with SessionLocal() as db:
@@ -1183,7 +1147,9 @@ async def _process_message(event: dict):
             tasks = open_tasks(db, source_id)
             canonical_sender = resolve_canonical_name(db, display_name) or display_name
             match_hint = extraction.related_task_hint or text
-            target = choose_status_target_with_history(db, tasks, canonical_sender, extraction.assignee_name, match_hint, user_id)
+            target = recent_reminder_context_target(db, source_id, user_id, canonical_sender, match_hint)
+            if not target:
+                target = choose_status_target_with_history(db, tasks, canonical_sender, extraction.assignee_name, match_hint, user_id)
             if target:
                 record_task_event(
                     db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
@@ -1191,8 +1157,9 @@ async def _process_message(event: dict):
                 )
                 target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
                 db.commit()
-                print("task comment recorded:", target.task_code)
-                await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
+                print("task comment recorded silently:", target.task_code)
+                # Progress-only comments are learned silently. Acknowledgements are
+                # reserved for explicit status changes or exact quoted replies.
                 if settings.owner_status_updates and settings.owner_line_user_id:
                     await push_text(
                         settings.owner_line_user_id,
@@ -1203,15 +1170,9 @@ async def _process_message(event: dict):
                         f"สถานะยังเป็น: {STATUS_THAI.get(target.status, target.status)}"
                     )
                 return
-            # A human gave an operational update, but the link to a specific task is
-            # not strong enough. Thank them naturally; keep diagnostics private.
-            try:
-                if reply_token:
-                    await reply_text(reply_token, "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ")
-                else:
-                    await push_text(source_id, "ขอบคุณค่ะ รับข้อมูลไว้แล้วนะคะ")
-            except Exception as exc:
-                print("unmatched comment acknowledgement failed:", repr(exc))
+            # Ambiguous operational chatter stays silent in the group. The message is
+            # already persisted and can inform future context; diagnostics are private.
+            print("unmatched comment kept silent in group:", repr(text))
             if settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(
                     settings.owner_line_user_id,
@@ -1402,7 +1363,14 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             extracted_name = getattr(extraction, "assignee_name", None)
             canonical_extracted = resolve_canonical_name(db, extracted_name) or extracted_name
             match_hint = getattr(extraction, "related_task_hint", None) or text
-            target = choose_status_target_with_history(db, tasks, canonical_sender, canonical_extracted, match_hint, user_id)
+            # Conversation continuity: people frequently answer the most recent reminder
+            # without using LINE quote/reply. Prefer that recent context only when the
+            # sender/topic evidence is safe; otherwise fall back to normal matching.
+            target = recent_reminder_context_target(db, group_id, user_id, canonical_sender, match_hint)
+            if target:
+                print("recent reminder context target:", target.task_code, target.title, repr(text))
+            else:
+                target = choose_status_target_with_history(db, tasks, canonical_sender, canonical_extracted, match_hint, user_id)
             rows = rank_status_targets_with_history(db, tasks, canonical_sender, canonical_extracted, match_hint, user_id)
             print("status candidates same-group:", [
                 {
