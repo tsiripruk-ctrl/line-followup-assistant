@@ -112,3 +112,22 @@ Recommended naming example:
 - เพิ่ม strict cross-group recovery สำหรับ owner/ผู้รับผิดชอบ เมื่อ Task ถูกสร้างคนละกลุ่ม
 - เพิ่ม candidate score logging เพื่อวิเคราะห์เหตุผลที่จับ/ไม่จับ Task
 - คง safety rule: ถ้ามีหลาย Task ที่เกี่ยวข้องเท่า ๆ กัน จะไม่ปิดงานโดยเดา
+
+
+## v0.6.17 hotfix
+- Adds business-first status resolution before generic similarity tie handling.
+- Resolves `จ่ายค่าประกันเรียบร้อย` to a single open `ต่อประกันรถ` task.
+- Uses recent TaskEvent history for business-concept matching.
+- If multiple vehicle-insurance tasks are open, it refuses to guess.
+- If duplicate tasks represent the same concept/project/assignee, it chooses the newest duplicate deterministically.
+- Adds health flags: `business_first_status_resolution`, `vehicle_insurance_resolution`, `duplicate_business_task_resolution`.
+
+## v0.6.18 — Task State Continuity / Context-aware Follow-up
+
+- Follow-up reminders now continue from the latest human progress update instead of repeating the original task wording.
+- Uses existing `TaskEvent` history, so old tasks benefit immediately without a destructive database migration.
+- Stores a compact `TASK_MEMORY_UPDATED` event for every new status reply.
+- `WAITING` updates are followed up after 24 hours instead of every 6 hours to reduce repetitive chasing of external dependencies.
+- Example: Flow Account follow-up remembers that documents were sent, the reply was off-topic, and staff are waiting for the officer to respond.
+- Example: Futong PO follow-up remembers that the PO was already opened and only sales acceptance is pending.
+- `/health` exposes `task_state_continuity`, `context_aware_reminders`, and `waiting_followup_memory`.

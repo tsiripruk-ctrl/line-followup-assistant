@@ -22,10 +22,11 @@ from service import (
     event_exists, record_event, search_open_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
-    resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history
+    resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
+    contextual_followup_text, summarize_progress_update
 )
 
-VERSION = "0.6.16"
+VERSION = "0.6.18"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -90,6 +91,8 @@ def health():
         "business_concept_matching": True, "safe_status_notifications": True,
         "status_update_transaction_guard": True,
         "task_history_matching": True, "cross_group_unique_fallback": True, "candidate_score_logging": True,
+        "business_first_status_resolution": True, "vehicle_insurance_resolution": True, "duplicate_business_task_resolution": True,
+        "task_state_continuity": True, "context_aware_reminders": True, "waiting_followup_memory": True,
     }
 
 
@@ -1252,6 +1255,9 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
             if new_status == "COMPLETED":
                 target.next_reminder_at = None
+            elif new_status == "WAITING":
+                # External dependencies need breathing room; do not chase the assignee every few hours.
+                target.next_reminder_at = datetime.utcnow() + timedelta(hours=24)
             elif target.due_at and datetime.utcnow() > target.due_at:
                 target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
             else:
@@ -1261,6 +1267,13 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
                 db, target, "STATUS_REPLY", actor_name=canonical_sender, actor_user_id=user_id, text=text,
                 old_status=old_status, new_status=new_status, commit=False,
             )
+            # Store a compact task-memory snapshot so future reminders continue from this update.
+            memory = summarize_progress_update(text)
+            if memory:
+                record_task_event(
+                    db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
+                    text=memory, old_status=new_status, new_status=new_status, commit=False,
+                )
             db.commit()
             db.refresh(target)
             print("status update committed:", target.task_code, old_status, "->", new_status, repr(text))
@@ -1478,30 +1491,40 @@ async def reminder_scan(force: bool = False):
                     )
                     # After the advance reminder, the next check is the due time itself.
                     t.next_reminder_at = t.due_at
-                elif t.status == "OVERDUE":
-                    if t.reminder_count >= settings.escalation_after_reminders:
+                elif t.status in ("OVERDUE", "WAITING", "IN_PROGRESS"):
+                    memory_body, used_memory = contextual_followup_text(
+                        db, t, greeting[:-2] if greeting.endswith("คะ") else greeting, settings.owner_display_name
+                    )
+                    if used_memory:
+                        body = memory_body
+                    elif t.status == "OVERDUE":
+                        if t.reminder_count >= settings.escalation_after_reminders:
+                            body = (
+                                f"{greeting} ขออัปเดตเรื่อง{t.title}อีกครั้งค่ะ\n"
+                                f"ตอนนี้เลยกำหนดแล้ว หากยังติดปัญหาตรงไหน รบกวนแจ้งสาเหตุและวันที่คาดว่าจะเรียบร้อยให้{settings.owner_display_name}ทราบด้วยนะคะ"
+                            )
+                        else:
+                            body = (
+                                f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                                f"ตอนนี้เลยกำหนดแล้ว หากยังติดอะไรอยู่แจ้ง{settings.owner_display_name}ไว้ได้เลยนะคะ"
+                            )
+                    elif t.status == "WAITING":
                         body = (
-                            f"{greeting} ขออัปเดตเรื่อง{t.title}อีกครั้งค่ะ\n"
-                            f"ตอนนี้เลยกำหนดแล้ว หากยังติดปัญหาตรงไหน รบกวนแจ้งสาเหตุและวันที่คาดว่าจะเรียบร้อยให้{settings.owner_display_name}ทราบด้วยนะคะ"
+                            f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
+                            f"เรื่องที่รออยู่มีความคืบหน้าเพิ่มเติมไหมคะ"
                         )
                     else:
                         body = (
-                            f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
-                            f"ตอนนี้เลยกำหนดแล้ว หากยังติดอะไรอยู่แจ้ง{settings.owner_display_name}ไว้ได้เลยนะคะ"
+                            f"{greeting} ขออัปเดตความคืบหน้าเรื่อง{t.title}หน่อยค่ะ\n"
+                            f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
                         )
-                    t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
-                elif t.status == "WAITING":
-                    body = (
-                        f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"
-                        f"เรื่องที่รออยู่มีความคืบหน้าเพิ่มเติมไหมคะ"
-                    )
-                    t.next_reminder_at = now + timedelta(hours=6)
-                elif t.status == "IN_PROGRESS":
-                    body = (
-                        f"{greeting} ขออัปเดตความคืบหน้าเรื่อง{t.title}หน่อยค่ะ\n"
-                        f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
-                    )
-                    t.next_reminder_at = now + timedelta(hours=6)
+
+                    if t.status == "WAITING":
+                        t.next_reminder_at = now + timedelta(hours=24)
+                    elif t.status == "IN_PROGRESS":
+                        t.next_reminder_at = now + timedelta(hours=6)
+                    else:
+                        t.next_reminder_at = now + timedelta(hours=settings.reminder_repeat_hours)
                 else:
                     body = (
                         f"{greeting} ขออัปเดตเรื่อง{t.title}หน่อยค่ะ\n"

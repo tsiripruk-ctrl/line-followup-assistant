@@ -480,6 +480,90 @@ def choose_status_target(tasks: list[Task], sender_name: str | None, assignee_na
 
 
 
+
+
+def _task_business_text(db: Session, task: Task) -> str:
+    """Return title/project plus recent event text for deterministic business matching."""
+    parts = [task.title or "", task.project or ""]
+    try:
+        event_texts = list(db.scalars(
+            select(TaskEvent.text)
+            .where(TaskEvent.task_id == task.id, TaskEvent.text.is_not(None))
+            .order_by(TaskEvent.id.desc())
+            .limit(8)
+        ).all())
+        parts.extend(x for x in event_texts if x)
+    except Exception:
+        # History enrichment must never break status matching.
+        pass
+    return " ".join(x for x in parts if x)
+
+
+def _is_vehicle_insurance_text(value: str | None) -> bool:
+    compact = _match_text(value).replace(" ", "")
+    if not compact:
+        return False
+    insurance = any(k in compact for k in ("ประกัน", "เบี้ยประกัน", "พรบ", "พ.ร.บ"))
+    vehicle = any(k in compact for k in ("รถ", "รถยนต์", "รถกระบะ", "vios", "fortuner", "revo", "dmax", "d-max"))
+    return insurance and vehicle
+
+
+def _business_status_target(db: Session, tasks: list[Task], hint: str | None, sender_user_id: str | None = None) -> tuple[Task | None, str | None]:
+    """Deterministically resolve short operational updates before generic similarity.
+
+    This is intentionally conservative but understands business concepts. For example,
+    "จ่ายค่าประกันเรียบร้อย" can close the single open task "ต่อประกันรถ" even
+    though the verbs differ. It never chooses between two distinct vehicle-insurance
+    tasks because that could close the wrong vehicle/project.
+    """
+    msg_concepts = _business_concepts(hint)
+    if not msg_concepts or not tasks:
+        return None, None
+
+    candidates: list[tuple[Task, set[str], str]] = []
+    for t in tasks:
+        business_text = _task_business_text(db, t)
+        concepts = _business_concepts(business_text)
+        if msg_concepts & concepts:
+            candidates.append((t, concepts, business_text))
+
+    if not candidates:
+        return None, None
+    if len(candidates) == 1:
+        return candidates[0][0], "single_business_concept"
+
+    # Prefer a task bound to the sender only when that narrows to exactly one.
+    if sender_user_id:
+        owned = [c for c in candidates if c[0].assignee_user_id == sender_user_id]
+        if len(owned) == 1:
+            return owned[0][0], "single_business_concept_owned"
+        if len(owned) > 1:
+            candidates = owned
+
+    # Insurance-specific bridge. A generic payment update such as
+    # "จ่ายค่าประกันเรียบร้อย" is often the completion signal for "ต่อประกันรถ".
+    # Select it only when there is exactly one open vehicle-insurance task.
+    if "insurance" in msg_concepts:
+        vehicle = [c for c in candidates if _is_vehicle_insurance_text(c[2])]
+        if len(vehicle) == 1:
+            return vehicle[0][0], "unique_vehicle_insurance"
+        if len(vehicle) > 1:
+            # Two different open vehicle-insurance jobs are genuinely ambiguous.
+            return None, "ambiguous_vehicle_insurance"
+
+    # If all candidates are operational duplicates for the same project/assignee and
+    # same concept family, choose the newest record. This handles accidental duplicate
+    # task creation without letting a different project steal the update.
+    projects = {normalize_name(c[0].project) for c in candidates if c[0].project}
+    assignees = {c[0].assignee_user_id or normalize_name(c[0].assignee_name) for c in candidates if (c[0].assignee_user_id or c[0].assignee_name)}
+    concept_sets = {tuple(sorted(c[1])) for c in candidates}
+    if len(projects) <= 1 and len(assignees) <= 1 and len(concept_sets) == 1:
+        newest = max((c[0] for c in candidates), key=lambda t: (t.created_at, t.id))
+        return newest, "duplicate_business_task_newest"
+
+    return None, "ambiguous_business_concept"
+
+
 def rank_status_targets_with_history(db: Session, tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> list[dict]:
     """Rank tasks using title/project plus recent task-event text.
 
@@ -535,6 +619,17 @@ def choose_status_target_with_history(db: Session, tasks: list[Task], sender_nam
         return None
     rows = rank_status_targets_with_history(db, tasks, sender_name, assignee_name, hint, sender_user_id)
 
+    # Business-first deterministic resolver for short operational updates. It runs
+    # before generic threshold/tie logic, so a single open "ต่อประกันรถ" can be
+    # resolved from "จ่ายค่าประกันเรียบร้อย" without being blocked by unrelated
+    # lexical ties. Ambiguous business cases still return to the safe generic logic.
+    business_target, business_reason = _business_status_target(db, tasks, hint, sender_user_id)
+    if business_target:
+        print("business status target:", business_target.task_code, business_target.title, business_reason)
+        return business_target
+    if business_reason:
+        print("business status unresolved:", business_reason, repr(hint))
+
     strong = [r for r in rows if r["content"] >= 0.75]
     if strong:
         best = strong[0]
@@ -565,6 +660,92 @@ def choose_status_target_with_history(db: Session, tasks: list[Task], sender_nam
         return sender_owned[0]["task"]
     return None
 
+
+
+def latest_status_reply(db: Session, task: Task) -> TaskEvent | None:
+    """Return the latest human progress/status reply for a task."""
+    return db.scalar(
+        select(TaskEvent)
+        .where(
+            TaskEvent.task_id == task.id,
+            TaskEvent.event_type.in_(["STATUS_REPLY", "TASK_MEMORY_UPDATED"]),
+            TaskEvent.text.is_not(None),
+        )
+        .order_by(TaskEvent.id.desc())
+        .limit(1)
+    )
+
+
+def summarize_progress_update(text: str | None, max_len: int = 180) -> str:
+    """Create a concise Thai follow-up memory from a human progress update.
+
+    This is intentionally deterministic so reminders retain context even when the AI
+    service is unavailable. It removes common filler while preserving completed steps
+    and what is still being waited on.
+    """
+    if not text:
+        return ""
+    x = " ".join(str(text).replace("\n", " ").split()).strip()
+    # Trim conversational filler without changing operational meaning.
+    for prefix in ("อัปเดตค่ะ", "อัปเดตครับ", "แจ้งค่ะ", "แจ้งครับ"):
+        if x.startswith(prefix):
+            x = x[len(prefix):].strip(" :-")
+    # High-value operational patterns: preserve the completed step and the current dependency.
+    low = x.lower()
+    if ("ส่งเอกสาร" in x and ("เมลตอบ" in x or "อีเมลตอบ" in x)
+            and ("ไม่ตรงประเด็น" in x or "ไม่ตรง" in x)
+            and ("รอเค้าตอบ" in x or "รอเขาตอบ" in x or "รอตอบ" in x)):
+        return "ส่งเอกสารแล้ว ได้รับอีเมลตอบกลับแต่ยังไม่ตรงประเด็น และกำลังรอเจ้าหน้าที่ตอบกลับ"
+    if (("เปิด po" in low or "เปิด พีโอ" in x)
+            and ("เรียบร้อย" in x or "แล้ว" in x)
+            and ("เซลล์" in x or "sales" in low)
+            and ("ไม่ตอบรับ" in x or "ยังไม่ตอบ" in x)):
+        return "เปิด PO เรียบร้อยแล้ว แต่ทางเซลล์ยังไม่ตอบรับและกำลังรอติดตามอีกครั้ง"
+
+    # Normalize a few phrases so the next reminder sounds like continuity rather than a quote dump.
+    replacements = [
+        ("เดี๋ยวจะติดตามอีกที", "กำลังรอติดตามอีกครั้ง"),
+        ("เดี๋ยวติดตามอีกที", "กำลังรอติดตามอีกครั้ง"),
+        ("รอเค้าตอบเมลกลับมา", "กำลังรอเจ้าหน้าที่ตอบกลับ"),
+        ("รอเขาตอบเมลกลับมา", "กำลังรอเจ้าหน้าที่ตอบกลับ"),
+        ("รอเค้าตอบกลับ", "กำลังรอการตอบกลับ"),
+        ("รอเขาตอบกลับ", "กำลังรอการตอบกลับ"),
+    ]
+    for a,b in replacements:
+        x=x.replace(a,b)
+    if len(x) > max_len:
+        x = x[:max_len-1].rstrip() + "…"
+    return x
+
+
+def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
+    """Build a reminder that continues from the latest known task state.
+
+    Returns (message_body, used_memory). assignee_token may be a textV2 substitution
+    token such as ``{assignee}`` or a plain display name.
+    """
+    ev = latest_status_reply(db, task)
+    memory = summarize_progress_update(ev.text if ev else None)
+    if memory:
+        if task.status == "WAITING":
+            return (
+                f"{assignee_token}คะ จากอัปเดตล่าสุดเรื่อง{task.title} ที่แจ้งว่า {memory}\n"
+                f"ตอนนี้สิ่งที่กำลังรออยู่มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ",
+                True,
+            )
+        if task.status == "IN_PROGRESS":
+            return (
+                f"{assignee_token}คะ จากอัปเดตล่าสุดเรื่อง{task.title} ที่แจ้งว่า {memory}\n"
+                f"ตอนนี้ดำเนินการต่อถึงขั้นตอนไหนแล้วคะ หากเรียบร้อยแล้วแจ้ง{owner_name}ได้เลยค่ะ",
+                True,
+            )
+        if task.status == "OVERDUE":
+            return (
+                f"{assignee_token}คะ ขออัปเดตต่อจากข้อมูลล่าสุดของเรื่อง{task.title} ที่แจ้งว่า {memory}\n"
+                f"ตอนนี้มีความคืบหน้าเพิ่มเติมหรือมีจุดติดขัดอะไรไหมคะ",
+                True,
+            )
+    return "", False
 
 
 def clean_display_name(value: str | None) -> str:
