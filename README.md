@@ -131,3 +131,13 @@ Recommended naming example:
 - Example: Flow Account follow-up remembers that documents were sent, the reply was off-topic, and staff are waiting for the officer to respond.
 - Example: Futong PO follow-up remembers that the PO was already opened and only sales acceptance is pending.
 - `/health` exposes `task_state_continuity`, `context_aware_reminders`, and `waiting_followup_memory`.
+
+
+## v0.6.19 — Quote Reply Identity + Continuity Hotfix
+
+- Fixes duplicate-People unique constraint failures when a quoted task stores an old LINE display name but People Registry already owns that LINE userId under a canonical name.
+- Quote replies now resolve Person by stable LINE userId first and never create a duplicate person for the same account.
+- Quote replies now write `TASK_MEMORY_UPDATED`, so future reminders continue from the latest human update.
+- `WAITING` quote replies snooze for 24 hours.
+- Mixed updates such as “เปิด PO เรียบร้อยแล้ว แต่เซลล์ยังไม่ตอบรับ” stay `WAITING` instead of being incorrectly closed as `COMPLETED`.
+- Adds explicit completion phrases such as “ส่งเรียบร้อย” and “ดำเนินการเสร็จแล้ว”.

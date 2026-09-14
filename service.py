@@ -668,7 +668,7 @@ def latest_status_reply(db: Session, task: Task) -> TaskEvent | None:
         select(TaskEvent)
         .where(
             TaskEvent.task_id == task.id,
-            TaskEvent.event_type.in_(["STATUS_REPLY", "TASK_MEMORY_UPDATED"]),
+            TaskEvent.event_type.in_(["STATUS_REPLY", "QUOTED_STATUS_REPLY", "QUOTED_COMMENT_REPLY", "TASK_MEMORY_UPDATED"]),
             TaskEvent.text.is_not(None),
         )
         .order_by(TaskEvent.id.desc())

@@ -26,7 +26,7 @@ from service import (
     contextual_followup_text, summarize_progress_update
 )
 
-VERSION = "0.6.18"
+VERSION = "0.6.19"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -93,6 +93,8 @@ def health():
         "task_history_matching": True, "cross_group_unique_fallback": True, "candidate_score_logging": True,
         "business_first_status_resolution": True, "vehicle_insurance_resolution": True, "duplicate_business_task_resolution": True,
         "task_state_continuity": True, "context_aware_reminders": True, "waiting_followup_memory": True,
+        "quoted_reply_identity_guard": True, "quoted_reply_task_memory": True,
+        "mixed_progress_waiting_resolution": True,
     }
 
 
@@ -117,20 +119,26 @@ def infer_local_status_signal(text: str | None) -> str:
             return "waiting"
         return "none"
 
-    completed_terms = (
-        "เรียบร้อย", "เสร็จแล้ว", "เสร็จเรียบร้อย", "ดำเนินการแล้ว",
-        "จ่ายแล้ว", "ชำระแล้ว", "โอนแล้ว", "ส่งแล้ว", "ตรวจแล้ว",
-        "แก้แล้ว", "ติดตั้งแล้ว", "อนุมัติแล้ว", "ได้รับแล้ว",
-    )
-    if any(term in compact for term in completed_terms):
-        return "completed"
-
+    # A message can report a completed sub-step while the overall task is still
+    # waiting on somebody else, e.g. "เปิด PO เรียบร้อยแล้ว แต่เซลล์ยังไม่ตอบรับ".
+    # Waiting/blocking language therefore has priority over completion language.
     waiting_terms = (
         "รอข้อมูล", "รออนุมัติ", "รอของ", "รอสินค้า", "รอsupplier",
-        "รอซัพพลายเออร์", "รอตอบกลับ", "ยังรอ",
+        "รอซัพพลายเออร์", "รอตอบกลับ", "ยังรอ", "ยังไม่ตอบรับ",
+        "ยังไม่ตอบ", "รอเค้าตอบ", "รอเขาตอบ", "รอเค้าตอบกลับ",
+        "รอเขาตอบกลับ", "รอเมลตอบ", "รออีเมลตอบ",
     )
     if any(term in compact for term in waiting_terms):
         return "waiting"
+
+    completed_terms = (
+        "เรียบร้อย", "เสร็จแล้ว", "เสร็จเรียบร้อย", "ดำเนินการแล้ว",
+        "ดำเนินการเสร็จแล้ว", "จ่ายแล้ว", "ชำระแล้ว", "โอนแล้ว",
+        "ส่งแล้ว", "ส่งเรียบร้อย", "ตรวจแล้ว", "แก้แล้ว", "ติดตั้งแล้ว",
+        "อนุมัติแล้ว", "ได้รับแล้ว",
+    )
+    if any(term in compact for term in completed_terms):
+        return "completed"
 
     progress_terms = (
         "กำลังทำ", "กำลังดำเนินการ", "กำลังตรวจ", "กำลังเช็ก",
@@ -1092,7 +1100,13 @@ async def _process_message(event: dict):
 async def handle_quoted_task_reply(
     group_id: str, user_id: str | None, sender_name: str | None, quoted_message_id: str, extraction, text: str
 ) -> str | None:
-    """Apply a LINE quote-reply to the exact task whose reminder was quoted.
+    """Apply a LINE quote-reply to the exact task whose assistant message was quoted.
+
+    v0.6.19 hardens identity handling: a LINE userId is globally unique, so we always
+    resolve the existing Person by userId before learning aliases. This prevents a
+    duplicate Person insert (and unique-constraint failure) when a task still stores an
+    old display name such as ``Tong Thanakrit`` while People Registry already knows the
+    same LINE account as ``ต้อง``/``พี่ต้อง``.
 
     Returns:
       None  -> quote wasn't one of our tracked task messages; continue normal matching.
@@ -1100,82 +1114,106 @@ async def handle_quoted_task_reply(
       str   -> owner notification text.
     """
     with SessionLocal() as db:
-        link = db.scalar(select(OutboundTaskMessage).where(
-            OutboundTaskMessage.line_message_id == str(quoted_message_id),
-            OutboundTaskMessage.group_id == group_id,
-        ))
-        target = None
-        if link:
-            target = db.get(Task, link.task_id)
-        else:
-            # A staff member may quote/reply to the original assignment message rather
-            # than the assistant reminder. source_message_id gives us the exact task too.
-            target = db.scalar(select(Task).where(
-                Task.source_message_id == str(quoted_message_id),
-                Task.group_id == group_id,
+        try:
+            link = db.scalar(select(OutboundTaskMessage).where(
+                OutboundTaskMessage.line_message_id == str(quoted_message_id),
+                OutboundTaskMessage.group_id == group_id,
             ))
-        if not target:
-            return None
-        if not target or target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
-            return ""
+            target = db.get(Task, link.task_id) if link else None
+            if not target:
+                # A staff member may quote/reply to the original assignment message.
+                target = db.scalar(select(Task).where(
+                    Task.source_message_id == str(quoted_message_id),
+                    Task.group_id == group_id,
+                ))
+            if not target:
+                return None
+            if target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+                return ""
 
-        canonical_sender = resolve_canonical_name(db, sender_name) or sender_name or "-"
+            # Resolve the sender by stable LINE userId first. Do not create a second
+            # Person row just because the task contains an older display-name alias.
+            sender_person = None
+            if user_id:
+                sender_person = db.scalar(select(Person).where(Person.line_user_id == user_id))
+                if not sender_person and sender_name:
+                    sender_person = bind_person_identity(db, sender_name, user_id, sender_name)
+                elif sender_person and sender_name:
+                    # Learn the latest LINE display name/alias on the existing person.
+                    sender_person = bind_person_identity(db, sender_person.canonical_name, user_id, sender_name)
 
-        # Once somebody quote-replies to a reminder addressed to this task, bind the
-        # LINE user ID to the task and learn their display-name alias automatically.
-        if user_id:
-            # A quote-reply identifies the task exactly, but it must not silently
-            # reassign a task that is already bound to a different LINE account.
-            if not target.assignee_user_id:
-                target.assignee_user_id = user_id
-            if target.assignee_name and target.assignee_user_id == user_id:
-                person = db.scalar(select(Person).where(Person.canonical_name == target.assignee_name))
-                if not person:
-                    person = Person(canonical_name=target.assignee_name, display_name=sender_name, call_name=target.assignee_name, role="EMPLOYEE", line_user_id=user_id, active=True)
-                    db.add(person)
-                    db.flush()
-                elif not person.line_user_id:
-                    person.line_user_id = user_id
-                alias_key = ''.join((sender_name or '').strip().lower().split())
-                if alias_key and not db.scalar(select(PersonAlias).where(PersonAlias.normalized_alias == alias_key)):
-                    db.add(PersonAlias(person_id=person.id, alias=sender_name or target.assignee_name, normalized_alias=alias_key))
-                canonical_sender = target.assignee_name
+            canonical_sender = (
+                sender_person.canonical_name if sender_person
+                else (resolve_canonical_name(db, sender_name) or sender_name or "-")
+            )
 
-        mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
-        new_status = mapping.get(extraction.status_signal)
-        old_status = target.status
+            # Bind an unbound task only when identity is compatible with its current
+            # assignee name. An exact quoted reply identifies the task, but it must not
+            # silently reassign a task already owned by somebody else.
+            if user_id and not target.assignee_user_id:
+                task_canonical = resolve_canonical_name(db, target.assignee_name) or target.assignee_name
+                same_identity = (
+                    not target.assignee_name
+                    or normalize_name(task_canonical) == normalize_name(canonical_sender)
+                    or normalize_name(target.assignee_name) == normalize_name(sender_name)
+                )
+                if same_identity:
+                    target.assignee_user_id = user_id
+                    if sender_person and target.assignee_name:
+                        target.assignee_name = sender_person.canonical_name
 
-        if new_status:
-            target.status = new_status
-            if new_status == "COMPLETED":
-                target.next_reminder_at = None
-            elif new_status == "WAITING":
-                target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
+            mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
+            signal = getattr(extraction, "status_signal", "none")
+            new_status = mapping.get(signal)
+            old_status = target.status
+
+            if new_status:
+                target.status = new_status
+                if new_status == "COMPLETED":
+                    target.next_reminder_at = None
+                elif new_status == "WAITING":
+                    target.next_reminder_at = datetime.utcnow() + timedelta(hours=24)
+                else:
+                    target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
+                event_type = "QUOTED_STATUS_REPLY"
             else:
                 target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
-            event_type = "QUOTED_STATUS_REPLY"
-        else:
-            # Any genuine human response should suppress an immediate repeat chase.
-            # Keep the task open, record the comment, and snooze by the normal repeat window.
-            target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
-            event_type = "QUOTED_COMMENT_REPLY"
+                event_type = "QUOTED_COMMENT_REPLY"
 
-        target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender}: {text}").strip()
-        record_task_event(
-            db, target, event_type, actor_name=canonical_sender, actor_user_id=user_id, text=text,
-            old_status=old_status, new_status=target.status, commit=False,
-        )
-        db.commit()
-        db.refresh(target)
+            target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender}: {text}").strip()
+            record_task_event(
+                db, target, event_type, actor_name=canonical_sender, actor_user_id=user_id, text=text,
+                old_status=old_status, new_status=target.status, commit=False,
+            )
 
-        status_th = STATUS_THAI.get(target.status, target.status)
-        return (
-            f"มีการตอบกลับงานแล้วค่ะ\n\n"
-            f"{target.task_code} {target.title}\n"
-            f"ผู้ตอบ: {canonical_sender}\n"
-            f"ข้อความ: {text}\n"
-            f"สถานะ: {status_th}"
-        )
+            # Quote replies are first-class task memory too. Without this event, the
+            # next reminder forgets what the assignee just said and repeats the original
+            # question.
+            memory = summarize_progress_update(text)
+            if memory:
+                record_task_event(
+                    db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
+                    text=memory, old_status=target.status, new_status=target.status, commit=False,
+                )
+
+            db.commit()
+            db.refresh(target)
+            print("quoted status update committed:", target.task_code, old_status, "->", target.status,
+                  "sender=", canonical_sender, "text=", repr(text))
+
+            status_th = STATUS_THAI.get(target.status, target.status)
+            return (
+                f"มีการตอบกลับงานแล้วค่ะ\n\n"
+                f"{target.task_code} {target.title}\n"
+                f"ผู้ตอบ: {canonical_sender}\n"
+                f"ข้อความ: {text}\n"
+                f"สถานะ: {status_th}"
+            )
+        except Exception as exc:
+            db.rollback()
+            print("quoted task reply failed:", type(exc).__name__, repr(exc),
+                  "quoted_message_id=", quoted_message_id, "sender=", repr(sender_name), "text=", repr(text))
+            raise
 
 
 async def try_update_task_from_status(group_id: str, user_id: str | None, sender_name: str | None, extraction, text: str) -> str | None:
