@@ -17,7 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard
-from intent_engine import classify_message_intent, intent_to_status_signal
+from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query
 )
 
-VERSION = "0.6.27"
+VERSION = "0.6.28"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -118,6 +118,8 @@ def health():
         "question_never_completes": True,
         "negation_never_completes": True,
         "milestone_completion_guard": True,
+        "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
+        "unrelated_status_response_guard": True,
         "task_event_message_trace": True,
     }
 
@@ -941,6 +943,7 @@ async def handle_query_or_followup_intent(
     *, group_id: str, user_id: str | None, sender_name: str | None,
     reply_token: str | None, quoted_message_id: str | None,
     message_id: str, text: str, intent_result,
+    mentioned_name: str | None = None, mentioned_user_id: str | None = None,
 ) -> bool:
     """Handle STATUS_QUERY/FOLLOW_UP without creating or completing tasks."""
     with SessionLocal() as db:
@@ -968,7 +971,8 @@ async def handle_query_or_followup_intent(
         # 3+) Safe content/history matching.
         if not target:
             target, match_confidence, ambiguous = find_task_for_explicit_query(
-                db, group_id, text, sender_name=sender_name, sender_user_id=user_id
+                db, group_id, text, sender_name=sender_name,
+                assignee_name=mentioned_name, assignee_user_id=mentioned_user_id
             )
             confidence = min(confidence, match_confidence) if match_confidence else confidence
 
@@ -1134,12 +1138,23 @@ async def _process_message(event: dict):
     # Classify intent before any state transition or task creation. Question/follow-up
     # messages are handled against existing tasks and can never close or duplicate them.
     intent_result = classify_message_intent(text)
+    primary_human_mention = select_primary_mention(mentions, None)
+    mentioned_name = primary_human_mention.get("display_name") if primary_human_mention else None
+    mentioned_user_id = primary_human_mention.get("user_id") if primary_human_mention else None
+    direct_human_task_request = bool(primary_human_mention) and is_direct_task_request(text)
+
+    # v0.6.28 HUMAN-DIRECTED REQUEST GUARD
+    if direct_human_task_request and intent_result.intent == "STATUS_QUERY":
+        print("[INTENT_OVERRIDE]", {"from": "STATUS_QUERY", "to": "NEW_TASK", "reason": "explicit_human_action_request"})
+        intent_result = type(intent_result)("NEW_TASK", 0.98, "explicit_human_action_request")
+
     print("[INTENT]", {"message": text, "intent": intent_result.intent, "confidence": intent_result.confidence, "reason": intent_result.reason})
     if intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
         await handle_query_or_followup_intent(
             group_id=source_id, user_id=user_id, sender_name=display_name,
             reply_token=reply_token, quoted_message_id=quoted_message_id,
             message_id=msg["id"], text=text, intent_result=intent_result,
+            mentioned_name=mentioned_name, mentioned_user_id=mentioned_user_id,
         )
         return
 
@@ -1166,6 +1181,15 @@ async def _process_message(event: dict):
             # while obvious status messages never reach this branch.
             print("extract_task failed:", repr(exc), "text=", repr(text))
             return
+
+    # v0.6.28: explicit actionable @mention remains a task request even if AI
+    # focuses on the question clause and returns is_task=False.
+    if direct_human_task_request and not extraction.is_task:
+        extraction = TaskExtraction(
+            is_task=True, confidence=0.98, title=text[:180],
+            assignee_name=mentioned_name, status_signal="none", is_task_reply=False,
+            related_task_hint=text, reason="explicit human action request fallback",
+        )
 
     # v0.5.4: if the user used LINE's quote/reply feature on one of the
     # assistant's reminder messages, resolve the exact task by quotedMessageId.

@@ -1541,11 +1541,17 @@ def find_task_for_explicit_query(
     text: str,
     *,
     sender_name: str | None = None,
-    sender_user_id: str | None = None,
+    assignee_name: str | None = None,
+    assignee_user_id: str | None = None,
 ) -> tuple[Task | None, float, list[Task]]:
-    """Resolve a status/follow-up query against open tasks, then recent completed tasks."""
+    """Resolve a status/follow-up query against open tasks, then recent completed tasks.
+
+    The sender is the person asking, not automatically the assignee. An explicit
+    @mentioned assignee is only a tie-breaker after meaningful topic evidence.
+    """
     target, score, ambiguous = find_existing_followup_task(
-        db, group_id, text, sender_name=sender_name, assignee_user_id=sender_user_id, min_confidence=0.72
+        db, group_id, text, sender_name=sender_name, assignee_name=assignee_name,
+        assignee_user_id=assignee_user_id, min_confidence=0.80
     )
     if target or ambiguous:
         return target, score, ambiguous
@@ -1556,7 +1562,7 @@ def find_task_for_explicit_query(
     ).all())
     if not recent_done:
         return None, score, []
-    rows = rank_status_targets_with_history(db, recent_done, sender_name, None, text, sender_user_id)
+    rows = rank_status_targets_with_history(db, recent_done, sender_name, assignee_name, text, assignee_user_id)
     if not rows:
         return None, score, []
     best = rows[0]

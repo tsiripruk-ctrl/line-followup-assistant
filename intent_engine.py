@@ -64,17 +64,40 @@ PROGRESS_PATTERNS = (
 )
 
 
+DIRECT_TASK_REQUEST_PATTERNS = (
+    "ฝากตรวจสอบ", "ช่วยตรวจสอบ", "รบกวนตรวจสอบ", "ฝากเช็ก", "ฝากเช็ค",
+    "ช่วยเช็ก", "ช่วยเช็ค", "รบกวนเช็ก", "รบกวนเช็ค", "ช่วยดู", "ฝากดู",
+    "ช่วยดำเนินการ", "ฝากดำเนินการ", "ช่วยแก้", "ฝากแก้", "ช่วยติดต่อ", "ฝากติดต่อ",
+)
+
+def is_direct_task_request(text: str | None) -> bool:
+    """Return True when the sentence contains an explicit actionable request.
+
+    This is deliberately narrower than generic question detection. A sentence can
+    contain a question such as "ใช้งานไม่ได้หรือเปล่า" and still be a NEW_TASK
+    when it ends with "ฝากตรวจสอบที".
+    """
+    value = _compact(text)
+    if not value:
+        return False
+    if _has_any(value, ("ตามเรื่อง", "ขออัปเดต", "อัปเดตหน่อย", "มีความคืบหน้า", "ถึงไหน")):
+        return False
+    return _has_any(value, DIRECT_TASK_REQUEST_PATTERNS)
+
+
 def classify_message_intent(text: str | None) -> IntentResult:
     raw = (text or "").strip()
     value = _compact(raw)
     if not value:
         return IntentResult("OTHER", 1.0, "empty")
 
+    # Explicit follow-up requests beat generic question-pattern words such as
+    # "ตามเรื่อง" / "ขออัปเดต". They still never complete a task.
+    if _has_any(value, FOLLOWUP_PATTERNS):
+        return IntentResult("FOLLOW_UP", 0.99, "explicit_followup_pattern")
+
     # Hard safety: question intent always beats completion words.
     if "?" in raw or "？" in raw or _has_any(value, QUESTION_PATTERNS):
-        # Conditional reminder phrases are follow-ups, not completion confirmations.
-        if _has_any(value, ("ถ้าเรียบร้อยแล้วแจ้ง", "ถ้าเสร็จแล้วแจ้ง")):
-            return IntentResult("FOLLOW_UP", 0.99, "conditional_followup")
         return IntentResult("STATUS_QUERY", 0.99, "question_pattern")
 
     if _has_any(value, CANCEL_PATTERNS):
@@ -85,9 +108,6 @@ def classify_message_intent(text: str | None) -> IntentResult:
         if _has_any(value, WAITING_PATTERNS) or _has_any(value, MILESTONE_PATTERNS):
             return IntentResult("PROGRESS_UPDATE", 0.98, "negated_or_waiting_progress")
         return IntentResult("NOT_COMPLETED", 0.99, "negation_pattern")
-
-    if _has_any(value, FOLLOWUP_PATTERNS):
-        return IntentResult("FOLLOW_UP", 0.96, "followup_pattern")
 
     # Milestones are progress even if they contain "แล้ว" or "เรียบร้อย".
     if _has_any(value, MILESTONE_PATTERNS):
