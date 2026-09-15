@@ -324,3 +324,26 @@ Post-deploy checks:
 - Thai weekdays are resolved in `Asia/Bangkok` and default to the start of the work window (08:30) unless the user includes an explicit time.
 - Adds `FOLLOW_UP_SCHEDULED` timeline events for traceability.
 - Completion safety and all v0.6.28 routing/duplicate protections are preserved.
+
+## v0.6.30 — Progressive Task Context & Progress Snapshot
+
+เป้าหมายของรุ่นนี้คือให้การติดตามแต่ละงาน "ต่อเนื่องจากความก้าวหน้าล่าสุด" แทนการถามซ้ำจากชื่อ Task เดิมทุกครั้ง
+
+เพิ่มข้อมูลแบบ task-local ในตาราง `tasks` (migration แบบ additive เท่านั้น):
+- `progress_summary` — สรุปอัปเดตล่าสุดที่เชื่อถือได้ของงานนี้
+- `waiting_on` — ประเด็นที่กำลังรอ ถ้ามี
+- `next_action` — ขั้นตอน/นัดหมายถัดไปที่ผู้รับผิดชอบแจ้งไว้
+- `last_progress_at` — เวลาที่อัปเดตความก้าวหน้าล่าสุด
+
+หลักการ:
+- อัปเดต Progress Snapshot เฉพาะหลังระบบจับ Task ได้แล้วเท่านั้น จึงไม่ใช้ snapshot เป็นตัวเดา Task และลดการปนบริบทข้ามงาน
+- Snapshot ใหม่ "แทนที่" snapshot เก่า ไม่สะสมข้อความขัดแย้งกันไปเรื่อย ๆ
+- Reminder ใช้โครง `งานเดิม → ล่าสุด → สิ่งที่ยังรอ/ขั้นตอนถัดไป → คำถามรอบนี้`
+- Task เก่าที่ยังไม่มี snapshot จะ fallback ไปใช้ timeline เดิม
+- Dashboard แสดง "ล่าสุด" และ "ถัดไป" ใต้ชื่องานเพื่อเห็นความก้าวหน้าได้ทันที
+
+ตัวอย่าง:
+`เปิด PO ให้ Futong เรียบร้อยแล้ว แต่ทางเซลล์ยังไม่ตอบรับ เดี๋ยวจะติดตามอีกที`
+จะทำให้ Reminder รอบถัดไปอ้างถึงว่าเปิด PO แล้วและกำลังรอเซลล์ ไม่ย้อนกลับไปถามว่าเปิด PO แล้วหรือยัง
+
+Automated regression tests: `30 passed` ณ ตอน build รุ่นนี้ (รวม intent, duplicate follow-up, date-aware scheduling, human-directed routing และ progress context)

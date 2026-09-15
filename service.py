@@ -1051,39 +1051,161 @@ def summarize_progress_update(text: str | None, max_len: int = 180) -> str:
     return x
 
 
-def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
-    """Build a reminder that continues from the latest known task state.
 
-    Returns (message_body, used_memory). assignee_token may be a textV2 substitution
-    token such as ``{assignee}`` or a plain display name.
+def _progress_clause(text: str | None, markers: tuple[str, ...], max_len: int = 140) -> str:
+    """Extract one operational clause containing one of ``markers``.
+
+    This is intentionally conservative and used only after a message has already been
+    matched to an exact task. It does not perform task matching itself.
     """
-    ev = latest_status_reply(db, task)
-    memory = summarize_progress_update(ev.text if ev else None)
+    if not text:
+        return ""
+    clean = " ".join(str(text).replace("\n", " ").split()).strip()
+    if not clean:
+        return ""
+    # Thai chat often separates steps with commas / แต่ / แล้ว / ส่วน. Keep enough
+    # context around the matching clause without manufacturing facts.
+    chunks = [c.strip(" ,;:-") for c in re.split(r"[.!?\n]|\s+(?:แต่|ส่วน|จากนั้น|แล้วก็)\s+", clean) if c.strip(" ,;:-")]
+    for chunk in chunks:
+        low = chunk.lower()
+        if any(m.lower() in low for m in markers):
+            if len(chunk) > max_len:
+                return chunk[:max_len - 1].rstrip() + "…"
+            return chunk
+    return ""
+
+
+def derive_progress_snapshot(text: str | None, status: str | None = None) -> dict[str, str]:
+    """Build a task-local progress snapshot from a trusted matched update.
+
+    The snapshot is deliberately descriptive rather than a guessed percentage. It
+    captures what the assignee most recently said, what the work is waiting on, and
+    an explicit next action/checkpoint when one is present.
+    """
+    summary = summarize_progress_update(text)
+    if not summary:
+        return {"summary": "", "waiting_on": "", "next_action": ""}
+
+    waiting = _progress_clause(
+        text,
+        (
+            "รอ", "ยังไม่ตอบ", "ยังไม่ได้", "ไม่ตอบรับ", "ติดปัญหา", "ติดขัด",
+            "รออนุมัติ", "รอข้อมูล", "รอเจ้าหน้าที่", "รอเซลล์", "รอทาง",
+        ),
+    )
+    next_action = _progress_clause(
+        text,
+        (
+            "เดี๋ยว", "จะติดตาม", "จะดำเนิน", "จะเข้า", "จะส่ง", "จะตรวจ", "จะเช็ก",
+            "นัด", "ต้อง", "ขั้นต่อไป", "พรุ่งนี้", "มะรืน", "วันจันทร์", "วันอังคาร",
+            "วันพุธ", "วันพฤหัส", "วันศุกร์", "วันเสาร์", "วันอาทิตย์",
+        ),
+    )
+
+    # A WAITING task can legitimately have no explicit dependency noun. Preserve the
+    # human wording rather than inventing one.
+    if status == "WAITING" and not waiting:
+        waiting = summary if any(k in summary for k in ("รอ", "ยังไม่", "ติด")) else ""
+
+    return {"summary": summary, "waiting_on": waiting, "next_action": next_action}
+
+
+def update_task_progress_snapshot(
+    db: Session,
+    task: Task,
+    text: str | None,
+    *,
+    actor_name: str | None = None,
+    actor_user_id: str | None = None,
+    message_id: str | None = None,
+    confidence: float | None = None,
+    commit: bool = False,
+) -> dict[str, str]:
+    """Replace the task's latest progress snapshot with a trusted matched update.
+
+    Important: callers must resolve the task first. This function never searches for
+    a task and therefore cannot mix context between tasks by itself.
+    """
+    snap = derive_progress_snapshot(text, task.status)
+    if not snap["summary"]:
+        return snap
+    task.progress_summary = snap["summary"]
+    task.waiting_on = snap["waiting_on"] or None
+    task.next_action = snap["next_action"] or None
+    task.last_progress_at = utcnow()
+    record_task_event(
+        db, task, "PROGRESS_SNAPSHOT_UPDATED",
+        actor_name=actor_name, actor_user_id=actor_user_id,
+        text=snap["summary"], old_status=task.status, new_status=task.status,
+        message_id=message_id, confidence=confidence, commit=False,
+    )
+    if commit:
+        db.commit()
+        db.refresh(task)
+    return snap
+
+
+def task_progress_context(task: Task) -> str:
+    """Human-readable current progress for dashboard / owner summaries."""
+    parts: list[str] = []
+    if task.progress_summary:
+        parts.append(f"ล่าสุด: {task.progress_summary}")
+    if task.waiting_on and task.waiting_on != task.progress_summary:
+        parts.append(f"กำลังรอ: {task.waiting_on}")
+    if task.next_action and task.next_action not in (task.progress_summary, task.waiting_on):
+        parts.append(f"ขั้นตอนถัดไป: {task.next_action}")
+    return "\n".join(parts)
+
+
+def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
+    """Build a reminder that visibly continues from this task's latest progress.
+
+    v0.6.30 prefers the structured task-local snapshot. Older tasks fall back to the
+    trusted event timeline. Cross-topic memory is still rejected by the integrity guard.
+    """
+    memory = (task.progress_summary or "").strip()
+    if not memory:
+        ev = latest_status_reply(db, task)
+        memory = summarize_progress_update(ev.text if ev else None)
     topic = task_reference_label(db, task)
     if memory and not _memory_relevant_to_task(db, task, memory):
         print("task memory rejected as cross-topic contamination:", task.task_code, repr(memory), "base=", repr(_base_task_text(db, task)))
         memory = ""
+
     if memory:
+        # Keep reminders concise and visibly progressive: original task -> latest
+        # progress -> only the unresolved point / next checkpoint.
         if task.status == "WAITING":
+            question = "ตอนนี้สิ่งที่กำลังรออยู่มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ"
+            if task.waiting_on:
+                question = f"ตอนนี้เรื่องที่กำลังรอ ({task.waiting_on}) มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ"
             return (
-                f"{assignee_token}คะ จากอัปเดตล่าสุดของงาน {topic} ที่แจ้งว่า {memory}\n"
-                f"ตอนนี้สิ่งที่กำลังรออยู่มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ",
+                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
+                f"ล่าสุด: {memory}\n{question}",
                 True,
             )
         if task.status == "IN_PROGRESS":
+            next_line = f"\nขั้นตอนถัดไปที่แจ้งไว้: {task.next_action}" if task.next_action else ""
             return (
-                f"{assignee_token}คะ จากอัปเดตล่าสุดของงาน {topic} ที่แจ้งว่า {memory}\n"
-                f"ตอนนี้ดำเนินการต่อถึงขั้นตอนไหนแล้วคะ หากเรียบร้อยแล้วแจ้ง{owner_name}ได้เลยค่ะ",
+                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
+                f"ล่าสุด: {memory}{next_line}\n"
+                f"ตอนนี้ดำเนินการต่อถึงขั้นตอนไหนแล้วคะ",
                 True,
             )
         if task.status == "OVERDUE":
             return (
-                f"{assignee_token}คะ ขออัปเดตต่อจากข้อมูลล่าสุดของงาน {topic} ที่แจ้งว่า {memory}\n"
+                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
+                f"ล่าสุด: {memory}\n"
                 f"ตอนนี้มีความคืบหน้าเพิ่มเติมหรือมีจุดติดขัดอะไรไหมคะ",
                 True,
             )
+        if task.status == "OPEN":
+            return (
+                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
+                f"ล่าสุด: {memory}\nตอนนี้มีความคืบหน้าเพิ่มเติมอย่างไรบ้างคะ",
+                True,
+            )
     return "", False
-
 
 def clean_display_name(value: str | None) -> str:
     if not value:

@@ -61,3 +61,25 @@ def ensure_task_event_schema() -> None:
     with engine.begin() as conn:
         for statement in statements:
             conn.execute(text(statement))
+
+
+def ensure_task_progress_schema() -> None:
+    """Non-destructive additive migration for v0.6.30 task progress snapshots."""
+    inspector = inspect(engine)
+    if "tasks" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("tasks")}
+    statements = []
+    if "progress_summary" not in existing:
+        statements.append("ALTER TABLE tasks ADD COLUMN progress_summary TEXT")
+    if "waiting_on" not in existing:
+        statements.append("ALTER TABLE tasks ADD COLUMN waiting_on TEXT")
+    if "next_action" not in existing:
+        statements.append("ALTER TABLE tasks ADD COLUMN next_action TEXT")
+    if "last_progress_at" not in existing:
+        statements.append("ALTER TABLE tasks ADD COLUMN last_progress_at TIMESTAMP")
+    if not statements:
+        return
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))

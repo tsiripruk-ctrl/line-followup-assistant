@@ -33,6 +33,12 @@ class Task(Base):
     reminder_count: Mapped[int] = mapped_column(Integer, default=0)
     last_reminded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # v0.6.30 structured progress snapshot. These fields represent only this task's
+    # latest trusted update and are refreshed on each matched progress reply.
+    progress_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    waiting_on: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     auto_created: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

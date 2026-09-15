@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
-from db import Base, engine, SessionLocal, ensure_people_registry_schema, ensure_task_event_schema
+from db import Base, engine, SessionLocal, ensure_people_registry_schema, ensure_task_event_schema, ensure_task_progress_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, TaskEvent
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
@@ -26,11 +26,11 @@ from service import (
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
-    contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target, delete_task_by_code,
+    contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.29"
+VERSION = "0.6.30"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -40,6 +40,7 @@ async def startup():
     Base.metadata.create_all(bind=engine)
     ensure_people_registry_schema()
     ensure_task_event_schema()
+    ensure_task_progress_schema()
     with SessionLocal() as db:
         imported = backfill_task_created_events(db)
         if imported:
@@ -123,6 +124,8 @@ def health():
         "date_aware_followup": True, "future_commitment_memory": True,
         "weekday_followup_scheduling": True,
         "task_event_message_trace": True,
+        "structured_task_progress": True, "progressive_followup_context": True,
+        "task_local_progress_snapshot": True, "progress_snapshot_dashboard": True,
     }
 
 
@@ -232,6 +235,10 @@ async def handle_multi_topic_update(
                     db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
                     text=memory, old_status=target.status, new_status=target.status, commit=False,
                 )
+            update_task_progress_snapshot(
+                db, target, seg, actor_name=canonical_sender, actor_user_id=user_id,
+                confidence=float(best["content"]), commit=False,
+            )
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {seg}").strip()
             matched.append((target.task_code, target.title))
         db.commit()
@@ -375,6 +382,13 @@ def _task_dict(t: Task):
         "status": t.status,
         "status_th": STATUS_THAI.get(t.status, t.status),
         "reminder_count": t.reminder_count,
+        "progress_summary": t.progress_summary,
+        "waiting_on": t.waiting_on,
+        "next_action": t.next_action,
+        "last_progress_at": (
+            t.last_progress_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone)).strftime("%d/%m/%Y %H:%M")
+            if t.last_progress_at else None
+        ),
     }
 
 
@@ -602,7 +616,10 @@ def dashboard(
         rows.append(
             "<tr>"
             f"<td><b>{code}</b><br><small>{escape(d['status_th'])}</small></td>"
-            f"<td>{escape(d['title'])}</td>"
+            f"<td>{escape(d['title'])}"
+            + (f"<br><small><b>ล่าสุด:</b> {escape(d['progress_summary'])}</small>" if d.get('progress_summary') else "")
+            + (f"<br><small><b>ถัดไป:</b> {escape(d['next_action'])}</small>" if d.get('next_action') else "")
+            + "</td>"
             f"<td>{escape(d['project'] or '-')}</td>"
             f"<td>{escape(d['assignee_name'] or '-')}</td>"
             f"<td>{escape(d['due'])}</td>"
@@ -1460,6 +1477,11 @@ async def handle_quoted_task_reply(
                         actor_user_id=user_id, text=memory, old_status=target.status,
                         new_status=target.status, commit=False,
                     )
+                update_task_progress_snapshot(
+                    db, target, text, actor_name=canonical_sender, actor_user_id=user_id,
+                    message_id=message_id, confidence=float(getattr(extraction, "confidence", 0.0) or 0.0),
+                    commit=False,
+                )
             except Exception as memory_exc:
                 print("quoted reply memory skipped:", type(memory_exc).__name__, repr(memory_exc))
 
@@ -1655,6 +1677,10 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
                     db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
                     text=memory, old_status=new_status, new_status=new_status, commit=False,
                 )
+            update_task_progress_snapshot(
+                db, target, text, actor_name=canonical_sender, actor_user_id=user_id,
+                message_id=message_id, confidence=extraction_confidence, commit=False,
+            )
             if commitment_at:
                 local_commitment = commitment_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
                 record_task_event(
