@@ -11,12 +11,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from html import escape
 from apscheduler.triggers.cron import CronTrigger
 
-from db import Base, engine, SessionLocal, ensure_people_registry_schema
+from db import Base, engine, SessionLocal, ensure_people_registry_schema, ensure_task_event_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, TaskEvent
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard
+from intent_engine import classify_message_intent, intent_to_status_signal
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -25,10 +26,11 @@ from service import (
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
-    contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target, delete_task_by_code
+    contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target, delete_task_by_code,
+    find_existing_followup_task, find_task_for_explicit_query
 )
 
-VERSION = "0.6.26"
+VERSION = "0.6.27"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -37,6 +39,7 @@ scheduler = AsyncIOScheduler(timezone=settings.timezone)
 async def startup():
     Base.metadata.create_all(bind=engine)
     ensure_people_registry_schema()
+    ensure_task_event_schema()
     with SessionLocal() as db:
         imported = backfill_task_created_events(db)
         if imported:
@@ -109,59 +112,27 @@ def health():
         "public_exception_fallback_disabled": True,
         "task_creation_guard": True, "leave_notice_filter": True,
         "owner_hard_delete_command": True,
+        "intent_classification_layer": True,
+        "completion_safety_guard": True,
+        "duplicate_followup_prevention": True,
+        "question_never_completes": True,
+        "negation_never_completes": True,
+        "milestone_completion_guard": True,
+        "task_event_message_trace": True,
     }
 
 
 def infer_local_status_signal(text: str | None) -> str:
-    """Deterministic Thai fallback for obvious task-status updates.
+    """Safety-first deterministic status signal derived from message intent.
 
-    The LLM remains the primary intent parser, but short operational messages such
-    as "จ่ายค่าประกันเรียบร้อย" must not become silent simply because the model
-    returns status_signal=none. Negative phrases are checked first.
+    Questions and negations can never produce a completed signal. Bare words such as
+    ``เรียบร้อย`` are intentionally treated as progress, not whole-task completion.
     """
+    result = classify_message_intent(text)
     compact = "".join((text or "").lower().split())
-    if not compact:
-        return "none"
-
-    negative_completion = (
-        "ยังไม่เรียบร้อย", "ยังไม่เสร็จ", "ยังไม่ได้เสร็จ",
-        "ยังไม่ได้จ่าย", "ไม่ได้จ่าย", "ยังไม่ชำระ", "ยังไม่ได้ชำระ",
-        "ยังไม่ได้โอน", "ไม่ได้โอน", "ยังไม่ได้ส่ง", "ไม่ได้ส่ง",
-    )
-    if any(term in compact for term in negative_completion):
-        if any(term in compact for term in ("รอ", "ยังไม่ได้", "ไม่ได้")):
-            return "waiting"
-        return "none"
-
-    # A message can report a completed sub-step while the overall task is still
-    # waiting on somebody else, e.g. "เปิด PO เรียบร้อยแล้ว แต่เซลล์ยังไม่ตอบรับ".
-    # Waiting/blocking language therefore has priority over completion language.
-    waiting_terms = (
-        "รอข้อมูล", "รออนุมัติ", "รอของ", "รอสินค้า", "รอsupplier",
-        "รอซัพพลายเออร์", "รอตอบกลับ", "ยังรอ", "ยังไม่ตอบรับ",
-        "ยังไม่ตอบ", "รอเค้าตอบ", "รอเขาตอบ", "รอเค้าตอบกลับ",
-        "รอเขาตอบกลับ", "รอเมลตอบ", "รออีเมลตอบ",
-    )
-    if any(term in compact for term in waiting_terms):
+    if result.intent == "PROGRESS_UPDATE" and "รอ" in compact:
         return "waiting"
-
-    completed_terms = (
-        "เรียบร้อย", "เสร็จแล้ว", "เสร็จเรียบร้อย", "ดำเนินการแล้ว",
-        "ดำเนินการเสร็จแล้ว", "จ่ายแล้ว", "ชำระแล้ว", "โอนแล้ว",
-        "ส่งแล้ว", "ส่งเรียบร้อย", "ตรวจแล้ว", "แก้แล้ว", "ติดตั้งแล้ว",
-        "อนุมัติแล้ว", "ได้รับแล้ว",
-    )
-    if any(term in compact for term in completed_terms):
-        return "completed"
-
-    progress_terms = (
-        "กำลังทำ", "กำลังดำเนินการ", "กำลังตรวจ", "กำลังเช็ก",
-        "กำลังเช็ค", "กำลังประสาน", "กำลังส่ง",
-    )
-    if any(term in compact for term in progress_terms):
-        return "in_progress"
-
-    return "none"
+    return intent_to_status_signal(result.intent)
 
 
 
@@ -909,6 +880,18 @@ async def safe_push_text(to: str | None, text: str, *, label: str = "notificatio
         return False
 
 
+async def safe_reply_or_push(reply_token: str | None, group_id: str, text: str, *, label: str = "group reply") -> bool:
+    try:
+        if reply_token:
+            await reply_text(reply_token, text)
+        else:
+            await push_text(group_id, text)
+        return True
+    except Exception as exc:
+        print(f"{label} failed:", repr(exc))
+        return False
+
+
 def _mention_text(text: str, mentionee: dict) -> str | None:
     """Best-effort visible @name extraction for mention entries without userId."""
     try:
@@ -952,6 +935,91 @@ def select_primary_mention(mentions: list[dict], extracted_assignee: str | None)
     # is treated as primary; future versions can add co-assignees.
     return mentions[0]
 
+
+
+async def handle_query_or_followup_intent(
+    *, group_id: str, user_id: str | None, sender_name: str | None,
+    reply_token: str | None, quoted_message_id: str | None,
+    message_id: str, text: str, intent_result,
+) -> bool:
+    """Handle STATUS_QUERY/FOLLOW_UP without creating or completing tasks."""
+    with SessionLocal() as db:
+        target = None
+        ambiguous = []
+        confidence = float(getattr(intent_result, "confidence", 0.0) or 0.0)
+
+        # 1) Exact quoted/replied assistant message.
+        if quoted_message_id:
+            link = db.scalar(select(OutboundTaskMessage).where(
+                OutboundTaskMessage.line_message_id == str(quoted_message_id),
+                OutboundTaskMessage.group_id == group_id,
+            ))
+            if link:
+                target = db.get(Task, link.task_id)
+
+        # 2) Explicit FU id in text.
+        if not target:
+            m = re.search(r"FU-\d{6}-\d{4}", text or "", flags=re.I)
+            if m:
+                target = get_task_by_code(db, m.group(0))
+                if target and target.group_id != group_id:
+                    target = None
+
+        # 3+) Safe content/history matching.
+        if not target:
+            target, match_confidence, ambiguous = find_task_for_explicit_query(
+                db, group_id, text, sender_name=sender_name, sender_user_id=user_id
+            )
+            confidence = min(confidence, match_confidence) if match_confidence else confidence
+
+        event_type = "STATUS_QUERY" if intent_result.intent == "STATUS_QUERY" else "FOLLOW_UP"
+        if target:
+            record_task_event(
+                db, target, event_type, actor_name=sender_name, actor_user_id=user_id,
+                text=text, new_status=target.status, commit=True,
+                message_id=message_id, confidence=confidence,
+            )
+            print("[INTENT]", {"message": text, "intent": intent_result.intent, "confidence": intent_result.confidence})
+            print("[TASK_MATCH]", {"task_id": target.task_code, "confidence": confidence})
+            print("[ACTION]", {"action": "ADD_TIMELINE", "status_change": "NONE"})
+
+            if intent_result.intent == "STATUS_QUERY":
+                if target.status == "COMPLETED":
+                    response = f"เรื่อง {target.title} เรียบร้อยแล้วค่ะ"
+                elif target.status == "WAITING":
+                    response = f"เรื่อง {target.title} ยังอยู่ระหว่างรอข้อมูล/การตอบกลับค่ะ"
+                elif target.status == "IN_PROGRESS":
+                    response = f"เรื่อง {target.title} ยังอยู่ระหว่างดำเนินการค่ะ"
+                else:
+                    response = f"เรื่อง {target.title} ยังอยู่ระหว่างติดตามค่ะ"
+                await safe_reply_or_push(reply_token, group_id, response, label="status query")
+            else:
+                # A follow-up request updates the existing timeline; it does not create a new FU.
+                await safe_reply_or_push(
+                    reply_token, group_id,
+                    f"รับทราบค่ะ จะติดตามเรื่อง {target.title} ต่อจากงานเดิมให้นะคะ",
+                    label="followup existing task",
+                )
+            return True
+
+        if ambiguous:
+            choices = "\n".join(f"{i}. {t.title}" for i, t in enumerate(ambiguous[:3], 1))
+            await safe_reply_or_push(
+                reply_token, group_id,
+                f"หมายถึงเรื่องไหนคะ\n{choices}",
+                label="ambiguous status query",
+            )
+            print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE"})
+            return True
+
+        # Explicit query/follow-up with no confident match: do not create a duplicate.
+        await safe_reply_or_push(
+            reply_token, group_id,
+            "ขอชื่อโครงการหรือเรื่องที่ต้องการติดตามเพิ่มอีกนิดได้ไหมคะ จะได้ตามต่อให้ตรงเรื่องค่ะ",
+            label="unmatched followup clarification",
+        )
+        print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE"})
+        return True
 
 async def process_message(event: dict):
     """Process one LINE message without allowing an obvious status update to fail silently.
@@ -1062,6 +1130,19 @@ async def _process_message(event: dict):
         print("non-task notice ignored:", precreation_guard.reason, repr(text))
         return
 
+    # v0.6.27 INTENT SAFETY LAYER
+    # Classify intent before any state transition or task creation. Question/follow-up
+    # messages are handled against existing tasks and can never close or duplicate them.
+    intent_result = classify_message_intent(text)
+    print("[INTENT]", {"message": text, "intent": intent_result.intent, "confidence": intent_result.confidence, "reason": intent_result.reason})
+    if intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
+        await handle_query_or_followup_intent(
+            group_id=source_id, user_id=user_id, sender_name=display_name,
+            reply_token=reply_token, quoted_message_id=quoted_message_id,
+            message_id=msg["id"], text=text, intent_result=intent_result,
+        )
+        return
+
     # v0.6.14 FAST LOCAL STATUS PATH
     # Detect obvious Thai status updates *before* calling the LLM. This is important
     # because a slow/failed OpenAI request previously caused messages such as
@@ -1092,7 +1173,7 @@ async def _process_message(event: dict):
     # "พราว" vs "Proud🤍" or from short reply text.
     if quoted_message_id:
         changed = await handle_quoted_task_reply(
-            source_id, user_id, display_name, quoted_message_id, extraction, text
+            source_id, user_id, display_name, quoted_message_id, extraction, text, msg["id"]
         )
         if changed is not None:
             await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
@@ -1107,7 +1188,7 @@ async def _process_message(event: dict):
             return
 
     if extraction.status_signal != "none":
-        changed = await try_update_task_from_status(source_id, user_id, display_name, extraction, text)
+        changed = await try_update_task_from_status(source_id, user_id, display_name, extraction, text, msg["id"])
         if changed is not None:
             await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
@@ -1209,6 +1290,39 @@ async def _process_message(event: dict):
             if contextual_person:
                 assignee_override = contextual_person.canonical_name
                 assignee_uid = contextual_person.line_user_id
+
+            # v0.6.27 DUPLICATE FOLLOW-UP PREVENTION
+            # Before creating any FU, search active tasks by content/history/project/assignee.
+            # A high-confidence match becomes a timeline FOLLOW_UP on the existing task.
+            existing, duplicate_confidence, ambiguous_dupes = find_existing_followup_task(
+                db, source_id, text, sender_name=display_name,
+                assignee_name=assignee_override or extraction.assignee_name,
+                assignee_user_id=assignee_uid, min_confidence=0.80,
+            )
+            if existing:
+                record_task_event(
+                    db, existing, "FOLLOW_UP", actor_name=display_name, actor_user_id=user_id,
+                    text=text, new_status=existing.status, commit=True,
+                    message_id=msg["id"], confidence=duplicate_confidence,
+                )
+                print("[TASK_MATCH]", {"task_id": existing.task_code, "similarity": round(duplicate_confidence, 3)})
+                print("[ACTION]", {"action": "ADD_TIMELINE", "status_change": "NONE", "duplicate_prevented": True})
+                await safe_reply_or_push(
+                    reply_token, source_id,
+                    f"รับทราบค่ะ จะติดตามเรื่อง {existing.title} ต่อจากงานเดิมให้นะคะ",
+                    label="duplicate followup",
+                )
+                return
+            if ambiguous_dupes:
+                choices = "\n".join(f"{i}. {t.title}" for i, t in enumerate(ambiguous_dupes[:3], 1))
+                await safe_reply_or_push(
+                    reply_token, source_id,
+                    f"เรื่องนี้คล้ายกับงานที่กำลังติดตามอยู่ค่ะ หมายถึงเรื่องไหนคะ\n{choices}",
+                    label="duplicate clarification",
+                )
+                print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE", "duplicate_prevented": True})
+                return
+
             task = create_task(
                 db, source_id, msg["id"], extraction, source_text=text,
                 actor_name=display_name, actor_user_id=user_id,
@@ -1230,7 +1344,8 @@ async def _process_message(event: dict):
 
 
 async def handle_quoted_task_reply(
-    group_id: str, user_id: str | None, sender_name: str | None, quoted_message_id: str, extraction, text: str
+    group_id: str, user_id: str | None, sender_name: str | None, quoted_message_id: str, extraction, text: str,
+    message_id: str | None = None,
 ) -> str | None:
     """Apply a LINE quote-reply to the exact task message safely.
 
@@ -1245,6 +1360,13 @@ async def handle_quoted_task_reply(
     """
     mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
     signal = getattr(extraction, "status_signal", "none")
+    safety_intent = classify_message_intent(text)
+    extraction_confidence = float(getattr(extraction, "confidence", 0.0) or 0.0)
+    if signal == "completed":
+        unsafe_intents = {"STATUS_QUERY", "FOLLOW_UP", "NOT_COMPLETED", "PROGRESS_UPDATE"}
+        if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
+            print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
+            signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
     new_status = mapping.get(signal)
 
     # Phase 1: resolve exact quoted task and commit the operational update only.
@@ -1287,10 +1409,18 @@ async def handle_quoted_task_reply(
                 event_type = "QUOTED_COMMENT_REPLY"
 
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender}: {text}").strip()
+            intent_event = "COMPLETION_CONFIRMATION" if new_status == "COMPLETED" else ("PROGRESS_UPDATE" if new_status else "COMMENT")
             record_task_event(
-                db, target, event_type, actor_name=canonical_sender, actor_user_id=user_id, text=text,
+                db, target, intent_event, actor_name=canonical_sender, actor_user_id=user_id, text=text,
                 old_status=old_status, new_status=target.status, commit=False,
+                message_id=message_id, confidence=float(getattr(extraction, "confidence", 0.0) or 0.0),
             )
+            if new_status and old_status != target.status:
+                record_task_event(
+                    db, target, "STATUS_CHANGE", actor_name=canonical_sender, actor_user_id=user_id, text=text,
+                    old_status=old_status, new_status=target.status, commit=False,
+                    message_id=message_id, confidence=float(getattr(extraction, "confidence", 0.0) or 0.0),
+                )
 
             # Memory is useful but cannot be allowed to abort the status update.
             try:
@@ -1361,7 +1491,7 @@ async def handle_quoted_task_reply(
     )
 
 
-async def try_update_task_from_status(group_id: str, user_id: str | None, sender_name: str | None, extraction, text: str) -> str | None:
+async def try_update_task_from_status(group_id: str, user_id: str | None, sender_name: str | None, extraction, text: str, message_id: str | None = None) -> str | None:
     """Resolve and update one task atomically.
 
     Matching failure returns None. Database/update failure is logged with a precise stage
@@ -1436,6 +1566,13 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
 
             mapping = {"completed": "COMPLETED", "in_progress": "IN_PROGRESS", "waiting": "WAITING"}
             signal = getattr(extraction, "status_signal", "none")
+            safety_intent = classify_message_intent(text)
+            extraction_confidence = float(getattr(extraction, "confidence", 0.0) or 0.0)
+            if signal == "completed":
+                unsafe_intents = {"STATUS_QUERY", "FOLLOW_UP", "NOT_COMPLETED", "PROGRESS_UPDATE"}
+                if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
+                    print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
+                    signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
             new_status = mapping.get(signal)
             if not new_status:
                 return None
@@ -1453,10 +1590,18 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             else:
                 target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
 
+            intent_event = "COMPLETION_CONFIRMATION" if new_status == "COMPLETED" else "PROGRESS_UPDATE"
             record_task_event(
-                db, target, "STATUS_REPLY", actor_name=canonical_sender, actor_user_id=user_id, text=text,
+                db, target, intent_event, actor_name=canonical_sender, actor_user_id=user_id, text=text,
                 old_status=old_status, new_status=new_status, commit=False,
+                message_id=message_id, confidence=extraction_confidence,
             )
+            if old_status != new_status:
+                record_task_event(
+                    db, target, "STATUS_CHANGE", actor_name=canonical_sender, actor_user_id=user_id, text=text,
+                    old_status=old_status, new_status=new_status, commit=False,
+                    message_id=message_id, confidence=extraction_confidence,
+                )
             # Store a compact task-memory snapshot so future reminders continue from this update.
             memory = summarize_progress_update(text)
             if memory:

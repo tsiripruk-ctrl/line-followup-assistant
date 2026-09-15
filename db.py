@@ -43,3 +43,21 @@ def ensure_people_registry_schema() -> None:
         for statement in statements:
             conn.execute(text(statement))
         conn.execute(text("UPDATE people SET role='EMPLOYEE' WHERE role IS NULL OR role=''"))
+
+
+def ensure_task_event_schema() -> None:
+    """Non-destructive additive migration for task-event traceability fields."""
+    inspector = inspect(engine)
+    if "task_events" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("task_events")}
+    statements = []
+    if "message_id" not in existing:
+        statements.append("ALTER TABLE task_events ADD COLUMN message_id VARCHAR(128)")
+    if "confidence" not in existing:
+        statements.append("ALTER TABLE task_events ADD COLUMN confidence FLOAT")
+    if not statements:
+        return
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))

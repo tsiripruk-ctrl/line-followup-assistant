@@ -61,6 +61,8 @@ class TaskEvent(Base):
     actor_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     actor_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     old_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     new_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

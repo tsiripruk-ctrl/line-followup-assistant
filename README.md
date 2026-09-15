@@ -243,3 +243,56 @@ Post-deploy smoke test:
 ### Regression test
 
 Run `python -m unittest discover -s tests -v`. Expected: all task-creation guard tests pass.
+
+## v0.6.27 — Completion Safety & Duplicate Follow-up Fix
+
+Base: v0.6.26. This release is intentionally numbered v0.6.27 (not v0.6.3) to preserve monotonic versioning.
+
+### What changed
+- Added deterministic intent layer: STATUS_QUERY, FOLLOW_UP, PROGRESS_UPDATE, COMPLETION_CONFIRMATION, NOT_COMPLETED, CANCEL_REQUEST, OTHER.
+- Hard safety: questions and negations never complete a task.
+- Bare `เรียบร้อย`, `เสร็จแล้ว`, `ส่งแล้ว` do not close a parent task by themselves.
+- Milestone updates such as `ส่ง Datasheet ... แล้ว` remain progress updates.
+- Completion requires strong confirmation and confident task matching.
+- Before creating a new FU, active tasks are searched first; high-confidence matches append a FOLLOW_UP event instead of creating a duplicate.
+- LINE message id remains the idempotency key in `messages` to protect against webhook retries.
+- `task_events` gains nullable `message_id` and `confidence` columns via an automatic additive migration on startup.
+- Added structured debug logs: `[INTENT]`, `[TASK_MATCH]`, `[ACTION]`, `[COMPLETION_BLOCKED]`.
+
+### Database migration
+No destructive migration. On startup, `ensure_task_event_schema()` adds only:
+- `task_events.message_id VARCHAR(128) NULL`
+- `task_events.confidence FLOAT NULL`
+
+### New environment variables
+None.
+
+### Automated tests
+Run:
+```bash
+python -m unittest discover -s tests -v
+```
+
+### Deploy on Render
+1. Back up the current v0.6.26 source/commit.
+2. Upload v0.6.27 files over the repository.
+3. Commit and push.
+4. Deploy latest commit on Render.
+5. Open `/health` and verify `version=0.6.27` plus the new safety flags.
+6. Run the LINE manual tests below before normal use.
+
+### Manual LINE smoke tests
+1. Create one clear test task.
+2. Send `งานนี้เรียบร้อยหรือยัง` → must NOT complete.
+3. Send `ยังไม่เรียบร้อยครับ` → must NOT complete.
+4. Send `ขออัปเดตเรื่องนี้หน่อย` → must NOT create a new FU.
+5. Send `ส่ง Datasheet แล้ว` → must remain progress, not complete the parent task.
+6. Send `ดำเนินการเรียบร้อยแล้วครับ` → may complete only when the task is matched confidently.
+7. Open Dashboard Timeline and verify STATUS_QUERY / FOLLOW_UP / PROGRESS_UPDATE / COMPLETION_CONFIRMATION / STATUS_CHANGE events.
+8. Re-send the same LINE webhook `message_id` in a controlled test → must process once.
+
+### Rollback
+If any smoke test fails, redeploy the previous known-good v0.6.26 commit. The two new task_event columns are nullable and may remain in the database; v0.6.26 ignores them.
+
+### Known limitation
+Full Render/LINE network behavior cannot be reproduced in an offline development container. Source compilation, SQLite startup/migration, matching tests, and regression tests are completed locally; real LINE webhook + PostgreSQL behavior must still pass the post-deploy smoke test before production use.

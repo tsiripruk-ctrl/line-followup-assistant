@@ -257,6 +257,9 @@ STATUS_NOISE_TERMS = (
     "ดำเนินการแล้ว", "ดำเนินการ", "ตรวจสอบแล้ว", "ตรวจแล้ว", "อัปเดต", "update",
     "กำลังดำเนินการ", "กำลังทำ", "กำลังเช็ก", "กำลังตรวจสอบ", "รอข้อมูล", "รออนุมัติ",
     "รับทราบ", "ค่ะ", "ครับ", "คะ", "นะคะ", "นะครับ",
+    # Follow-up/query noise: strip these before duplicate-task comparison.
+    "ขออัปเดต", "อัปเดตหน่อย", "ช่วยตาม", "ตามเรื่อง", "ติดตาม", "ช่วยถาม",
+    "ถึงไหนแล้ว", "เป็นยังไงบ้าง", "เป็นอย่างไรบ้าง", "หน่อย", "ด้วย", "เรื่อง",
 )
 
 
@@ -1406,10 +1409,12 @@ def record_task_event(
     db: Session, task: Task, event_type: str, *, actor_name: str | None = None,
     actor_user_id: str | None = None, text: str | None = None,
     old_status: str | None = None, new_status: str | None = None, commit: bool = True,
+    message_id: str | None = None, confidence: float | None = None,
 ) -> TaskEvent:
     ev = TaskEvent(
         task_id=task.id, event_type=event_type, actor_name=actor_name,
-        actor_user_id=actor_user_id, text=text, old_status=old_status, new_status=new_status,
+        actor_user_id=actor_user_id, text=text, message_id=message_id, confidence=confidence,
+        old_status=old_status, new_status=new_status,
     )
     db.add(ev)
     if commit:
@@ -1483,3 +1488,81 @@ def search_open_tasks(db: Session, query: str = "", project: str = "", assignee:
 
 def task_stats(db: Session) -> dict:
     return brief_counts(db)
+
+
+def find_existing_followup_task(
+    db: Session,
+    group_id: str,
+    text: str,
+    *,
+    sender_name: str | None = None,
+    assignee_name: str | None = None,
+    assignee_user_id: str | None = None,
+    min_confidence: float = 0.80,
+) -> tuple[Task | None, float, list[Task]]:
+    """Find an existing active task before any new FU is created.
+
+    Content evidence is mandatory. Assignee identity can improve confidence but cannot
+    turn a weak topical match into a duplicate. Returns (target, confidence, ambiguous).
+    """
+    tasks = open_tasks(db, group_id)
+    if not tasks:
+        return None, 0.0, []
+    match_text = text or ""
+    # Assignee names in a follow-up request are routing metadata, not task subject.
+    # Remove the explicit assignee from the semantic text before comparing subjects.
+    if assignee_name:
+        match_text = re.sub(re.escape(str(assignee_name)), " ", match_text, flags=re.IGNORECASE)
+    rows = rank_status_targets_with_history(
+        db, tasks, sender_name, assignee_name, match_text, assignee_user_id
+    )
+    if not rows:
+        return None, 0.0, []
+
+    best = rows[0]
+    best_content = float(best.get("content") or 0.0)
+    # Content dominates; identity adds only a small bonus after meaningful content exists.
+    confidence = min(1.0, best_content + (0.08 if best_content >= 0.55 and best.get("identity_match") else 0.0))
+    plausible = [r for r in rows if float(r.get("content") or 0.0) >= max(0.55, best_content - 0.10)]
+
+    if confidence < min_confidence:
+        return None, confidence, [r["task"] for r in plausible[:3]]
+    if len(plausible) > 1:
+        second = plausible[1]
+        second_conf = min(1.0, float(second.get("content") or 0.0) + (0.08 if second.get("identity_match") else 0.0))
+        if confidence - second_conf < 0.12:
+            return None, confidence, [r["task"] for r in plausible[:3]]
+    return best["task"], confidence, []
+
+
+def find_task_for_explicit_query(
+    db: Session,
+    group_id: str,
+    text: str,
+    *,
+    sender_name: str | None = None,
+    sender_user_id: str | None = None,
+) -> tuple[Task | None, float, list[Task]]:
+    """Resolve a status/follow-up query against open tasks, then recent completed tasks."""
+    target, score, ambiguous = find_existing_followup_task(
+        db, group_id, text, sender_name=sender_name, assignee_user_id=sender_user_id, min_confidence=0.72
+    )
+    if target or ambiguous:
+        return target, score, ambiguous
+
+    recent_done = list(db.scalars(
+        select(Task).where(Task.group_id == group_id, Task.status == "COMPLETED")
+        .order_by(Task.updated_at.desc(), Task.id.desc()).limit(30)
+    ).all())
+    if not recent_done:
+        return None, score, []
+    rows = rank_status_targets_with_history(db, recent_done, sender_name, None, text, sender_user_id)
+    if not rows:
+        return None, score, []
+    best = rows[0]
+    best_score = float(best.get("content") or 0.0)
+    if best_score < 0.80:
+        return None, best_score, []
+    if len(rows) > 1 and float(rows[1].get("content") or 0.0) >= best_score - 0.10:
+        return None, best_score, [r["task"] for r in rows[:3] if float(r.get("content") or 0.0) >= 0.55]
+    return best["task"], best_score, []
