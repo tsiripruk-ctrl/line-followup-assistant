@@ -27,6 +27,96 @@ def local_now() -> datetime:
     return datetime.now(ZoneInfo(settings.timezone))
 
 
+
+
+THAI_WEEKDAY_INDEX = {
+    "จันทร์": 0, "อังคาร": 1, "พุธ": 2, "พฤหัส": 3, "พฤหัสบดี": 3,
+    "ศุกร์": 4, "เสาร์": 5, "อาทิตย์": 6,
+}
+
+def extract_followup_commitment_at(text: str | None, *, now_local: datetime | None = None) -> datetime | None:
+    """Extract an explicit future follow-up commitment from a Thai progress update.
+
+    Returns a naive UTC datetime suitable for ``Task.next_reminder_at``.
+    This is deliberately conservative: it only reacts to explicit day/date language
+    such as ``วันศุกร์``, ``ศุกร์นี้``, ``พรุ่งนี้`` or a numeric Thai date.
+    The reminder is scheduled for the configured start of the workday (08:30 by default)
+    unless an explicit HH:MM time is present.
+    """
+    if not text:
+        return None
+    x = " ".join(str(text).replace("\n", " ").split())
+    local = now_local or local_now()
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=ZoneInfo(settings.timezone))
+    else:
+        local = local.astimezone(ZoneInfo(settings.timezone))
+
+    target_date = None
+    if "มะรืน" in x:
+        target_date = (local + timedelta(days=2)).date()
+    elif "พรุ่งนี้" in x:
+        target_date = (local + timedelta(days=1)).date()
+    elif "วันนี้" in x:
+        target_date = local.date()
+    else:
+        # Explicit Thai weekday. Use the next occurrence; if today is that weekday,
+        # plain ``วันศุกร์`` means the next future Friday rather than immediately now.
+        weekday_match = re.search(r"(?:วัน)?(จันทร์|อังคาร|พุธ|พฤหัสบดี|พฤหัส|ศุกร์|เสาร์|อาทิตย์)(?:นี้|หน้า)?", x)
+        if weekday_match:
+            wd = THAI_WEEKDAY_INDEX[weekday_match.group(1)]
+            days = (wd - local.weekday()) % 7
+            if days == 0:
+                days = 7
+            target_date = (local + timedelta(days=days)).date()
+
+    # Numeric date such as 18/9, 18/09/69, 18/09/2569. This overrides weekday.
+    date_match = re.search(r"(?<!\d)([0-3]?\d)[/\-]([01]?\d)(?:[/\-](\d{2,4}))?(?!\d)", x)
+    if date_match:
+        day, month = int(date_match.group(1)), int(date_match.group(2))
+        raw_year = date_match.group(3)
+        if raw_year:
+            year = int(raw_year)
+            if year >= 2400:
+                year -= 543
+            elif year < 100:
+                year += 2000
+        else:
+            year = local.year
+        try:
+            candidate = datetime(year, month, day).date()
+            if not raw_year and candidate < local.date():
+                candidate = datetime(year + 1, month, day).date()
+            target_date = candidate
+        except ValueError:
+            pass
+
+    if target_date is None:
+        return None
+
+    hour = settings.followup_start_hour
+    minute = settings.followup_start_minute
+    # Respect an explicit time, e.g. ``วันศุกร์ 14:00`` or ``ศุกร์ 14.30 น.``
+    time_match = re.search(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?:\s*น\.?)?", x)
+    if time_match:
+        hour, minute = int(time_match.group(1)), int(time_match.group(2))
+
+    target_local = datetime.combine(target_date, datetime.min.time()).replace(
+        hour=hour, minute=minute, second=0, microsecond=0, tzinfo=ZoneInfo(settings.timezone)
+    )
+    # Never schedule outside the permitted work window. Clamp to the start of work.
+    start_minutes = settings.followup_start_hour * 60 + settings.followup_start_minute
+    end_minutes = settings.followup_end_hour * 60 + settings.followup_end_minute
+    target_minutes = target_local.hour * 60 + target_local.minute
+    if target_minutes < start_minutes:
+        target_local = target_local.replace(hour=settings.followup_start_hour, minute=settings.followup_start_minute)
+    elif target_minutes >= end_minutes:
+        target_local = (target_local + timedelta(days=1)).replace(
+            hour=settings.followup_start_hour, minute=settings.followup_start_minute
+        )
+
+    return target_local.astimezone(timezone.utc).replace(tzinfo=None)
+
 def task_code(task_id: int) -> str:
     return f"FU-{local_now().strftime('%y%m%d')}-{task_id:04d}"
 

@@ -297,7 +297,7 @@ If any smoke test fails, redeploy the previous known-good v0.6.26 commit. The tw
 ### Known limitation
 Full Render/LINE network behavior cannot be reproduced in an offline development container. Source compilation, SQLite startup/migration, matching tests, and regression tests are completed locally; real LINE webhook + PostgreSQL behavior must still pass the post-deploy smoke test before production use.
 
-## v0.6.28 — Human-Directed Request Routing Fix
+## v0.6.29 — Human-Directed Request Routing Fix
 
 Base: v0.6.27.
 
@@ -317,3 +317,10 @@ Post-deploy checks:
 2. `@Proud ... ฝากตรวจสอบที` must not produce status text from an unrelated old task.
 3. `@Proud เรื่อง Flow Account ถึงไหนแล้ว` may query the matching Proud task only when topic evidence is strong.
 4. `@MARCH ช่วยตามเรื่องมิเตอร์ให้หน่อย` must be FOLLOW_UP, not a new duplicate task.
+
+
+## v0.6.29 – Date-aware Follow-up Scheduling
+- When a progress reply contains an explicit future checkpoint such as `วันศุกร์`, `พรุ่งนี้`, `มะรืน` or a numeric date, `next_reminder_at` is moved to that checkpoint instead of following up again the next day.
+- Thai weekdays are resolved in `Asia/Bangkok` and default to the start of the work window (08:30) unless the user includes an explicit time.
+- Adds `FOLLOW_UP_SCHEDULED` timeline events for traceability.
+- Completion safety and all v0.6.28 routing/duplicate protections are preserved.

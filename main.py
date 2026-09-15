@@ -27,10 +27,10 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
     contextual_followup_text, summarize_progress_update, task_reference_label, recent_reminder_context_target, delete_task_by_code,
-    find_existing_followup_task, find_task_for_explicit_query
+    find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.28"
+VERSION = "0.6.29"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -120,6 +120,8 @@ def health():
         "milestone_completion_guard": True,
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
+        "date_aware_followup": True, "future_commitment_memory": True,
+        "weekday_followup_scheduling": True,
         "task_event_message_trace": True,
     }
 
@@ -1421,8 +1423,11 @@ async def handle_quoted_task_reply(
             # on People Registry writes or alias uniqueness.
             if new_status:
                 target.status = new_status
+                commitment_at = extract_followup_commitment_at(text) if new_status != "COMPLETED" else None
                 if new_status == "COMPLETED":
                     target.next_reminder_at = None
+                elif commitment_at:
+                    target.next_reminder_at = commitment_at
                 elif new_status == "WAITING":
                     target.next_reminder_at = datetime.utcnow() + timedelta(hours=24)
                 else:
@@ -1457,6 +1462,18 @@ async def handle_quoted_task_reply(
                     )
             except Exception as memory_exc:
                 print("quoted reply memory skipped:", type(memory_exc).__name__, repr(memory_exc))
+
+            if new_status != "COMPLETED":
+                commitment_at = extract_followup_commitment_at(text)
+                if commitment_at:
+                    local_commitment = commitment_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
+                    record_task_event(
+                        db, target, "FOLLOW_UP_SCHEDULED", actor_name=canonical_sender, actor_user_id=user_id,
+                        text=f"ติดตามอีกครั้ง {local_commitment.strftime('%d/%m/%Y %H:%M')}",
+                        old_status=target.status, new_status=target.status, commit=False,
+                        message_id=message_id, confidence=1.0,
+                    )
+                    print("[FOLLOW_UP_SCHEDULED]", target.task_code, local_commitment.isoformat(), "source=quoted_reply")
 
             db.commit()
             db.refresh(target)
@@ -1604,8 +1621,13 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             old_status = target.status
             target.status = new_status
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
+            commitment_at = extract_followup_commitment_at(text) if new_status != "COMPLETED" else None
             if new_status == "COMPLETED":
                 target.next_reminder_at = None
+            elif commitment_at:
+                # A human supplied a concrete future checkpoint (e.g. "นัดเซ็นวันศุกร์").
+                # Respect that checkpoint instead of asking again tomorrow.
+                target.next_reminder_at = commitment_at
             elif new_status == "WAITING":
                 # External dependencies need breathing room; do not chase the assignee every few hours.
                 target.next_reminder_at = datetime.utcnow() + timedelta(hours=24)
@@ -1633,6 +1655,15 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
                     db, target, "TASK_MEMORY_UPDATED", actor_name=canonical_sender, actor_user_id=user_id,
                     text=memory, old_status=new_status, new_status=new_status, commit=False,
                 )
+            if commitment_at:
+                local_commitment = commitment_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
+                record_task_event(
+                    db, target, "FOLLOW_UP_SCHEDULED", actor_name=canonical_sender, actor_user_id=user_id,
+                    text=f"ติดตามอีกครั้ง {local_commitment.strftime('%d/%m/%Y %H:%M')}",
+                    old_status=new_status, new_status=new_status, commit=False,
+                    message_id=message_id, confidence=1.0,
+                )
+                print("[FOLLOW_UP_SCHEDULED]", target.task_code, local_commitment.isoformat(), "source=status_update")
             db.commit()
             db.refresh(target)
             print("status update committed:", target.task_code, old_status, "->", new_status, repr(text))
