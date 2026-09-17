@@ -159,3 +159,40 @@ def intent_to_status_signal(intent: str) -> str:
     if intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"}:
         return "in_progress"
     return "none"
+
+# v0.6.34: Exact LINE quote/reply may safely confirm a whole-task completion
+# with short natural phrases that are intentionally *not* safe in free chat.
+QUOTED_COMPLETION_PATTERNS = (
+    "เรียบร้อยแล้ว", "เสร็จแล้ว", "เสร็จเรียบร้อยแล้ว", "จบแล้ว",
+    "งานเรียบร้อยแล้ว", "งานเสร็จแล้ว", "ปิดได้เลย", "ปิดงานได้เลย",
+    "ดำเนินการเสร็จแล้ว", "ดำเนินการเรียบร้อยแล้ว", "เสร็จสมบูรณ์แล้ว",
+)
+
+
+def is_safe_quoted_completion(text: str | None) -> bool:
+    """Return True only for a clear completion reply to an *exactly quoted task*.
+
+    This helper deliberately allows short replies like "เรียบร้อยแล้ว" only when
+    the caller has already resolved the exact task from LINE quotedMessageId.
+    Questions, negations/waiting language, and milestone-only updates always win.
+    """
+    raw = (text or "").strip()
+    value = _compact(raw)
+    if not value:
+        return False
+
+    # Hard safety rules always win, even inside an exact quote reply.
+    if "?" in raw or "？" in raw or _has_any(value, QUESTION_PATTERNS):
+        return False
+    if _has_any(value, NEGATION_PATTERNS):
+        return False
+    if _has_any(value, MILESTONE_PATTERNS):
+        return False
+
+    # Accept common short whole-task confirmations, including polite suffixes.
+    polite_trimmed = re.sub(r"(?:ครับ|ค่ะ|คะ|นะครับ|นะคะ|ครับผม)$", "", value)
+    if polite_trimmed in {_compact(p) for p in QUOTED_COMPLETION_PATTERNS}:
+        return True
+
+    # Longer explicit whole-task confirmation remains safe too.
+    return classify_message_intent(raw).intent == "COMPLETION_CONFIRMATION"

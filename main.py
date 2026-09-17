@@ -17,7 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard
-from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, parse_command_prefix
+from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, parse_command_prefix, is_safe_quoted_completion
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.33"
+VERSION = "0.6.34"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -101,6 +101,7 @@ def health():
         "task_state_continuity": True, "context_aware_reminders": True, "waiting_followup_memory": True,
         "quoted_reply_identity_guard": True, "quoted_reply_task_memory": True,
         "quoted_reply_atomic_status": True, "quoted_reply_identity_best_effort": True,
+        "quoted_reply_completion_override": True, "quoted_reply_short_completion": True,
         "mixed_progress_waiting_resolution": True,
         "working_hours_followup": True, "followup_window": "08:30-17:30",
         "daily_followup_limits": True, "staggered_group_followups": True,
@@ -1448,7 +1449,17 @@ async def handle_quoted_task_reply(
     signal = getattr(extraction, "status_signal", "none")
     safety_intent = classify_message_intent(text)
     extraction_confidence = float(getattr(extraction, "confidence", 0.0) or 0.0)
-    if signal == "completed":
+
+    # v0.6.34: quotedMessageId already gives us an exact task identity. In that
+    # narrow context, short natural confirmations such as "เรียบร้อยแล้ว" are
+    # safe to treat as whole-task completion. Question/negation/milestone safety
+    # still has absolute priority and can never be overridden.
+    quoted_completion = is_safe_quoted_completion(text)
+    if quoted_completion:
+        signal = "completed"
+        extraction_confidence = max(extraction_confidence, 1.0)
+        print("[QUOTED_COMPLETION_OVERRIDE]", {"intent": safety_intent.intent, "text": text})
+    elif signal == "completed":
         unsafe_intents = {"STATUS_QUERY", "FOLLOW_UP", "NOT_COMPLETED", "PROGRESS_UPDATE"}
         if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
             print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
