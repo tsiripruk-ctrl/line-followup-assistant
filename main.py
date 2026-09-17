@@ -16,7 +16,7 @@ from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, Task
 from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
-from intent_guard import classify_precreation_guard
+from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
 from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, parse_command_prefix, is_safe_quoted_completion
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.35"
+VERSION = "0.6.36"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -103,6 +103,9 @@ def health():
         "quoted_reply_atomic_status": True, "quoted_reply_identity_best_effort": True,
         "quoted_reply_completion_override": True, "quoted_reply_short_completion": True,
         "quoted_reply_effective_ack": True, "completion_snapshot_guard": True,
+        "passive_conversation_guard": True,
+        "explicit_work_request_required_for_autocreate": True,
+        "passive_chatter_no_followup": True,
         "mixed_progress_waiting_resolution": True,
         "working_hours_followup": True, "followup_window": "08:30-17:30",
         "daily_followup_limits": True, "staggered_group_followups": True,
@@ -1176,6 +1179,8 @@ async def _process_message(event: dict):
     mentioned_name = primary_human_mention.get("display_name") if primary_human_mention else None
     mentioned_user_id = primary_human_mention.get("user_id") if primary_human_mention else None
     direct_human_task_request = bool(primary_human_mention) and is_direct_task_request(text)
+    explicit_work_request = bool(forced_command_intent == "NEW_TASK" or direct_human_task_request or has_explicit_work_request(text))
+    passive_conversation = looks_like_passive_conversation(text)
 
     # v0.6.28 HUMAN-DIRECTED REQUEST GUARD
     if direct_human_task_request and intent_result.intent == "STATUS_QUERY":
@@ -1239,6 +1244,18 @@ async def _process_message(event: dict):
             assignee_name=mentioned_name, status_signal="none", is_task_reply=False,
             related_task_hint=text, reason="explicit human action request fallback",
         )
+
+    # v0.6.36 PASSIVE CONVERSATION GUARD
+    # Free-form work chatter must not create a new FU or become a synthetic task
+    # update merely because the LLM recognized operational nouns/verbs. Exact
+    # quoted replies are handled below and remain authoritative.
+    if not quoted_message_id and passive_conversation and not explicit_work_request:
+        extraction = TaskExtraction(
+            is_task=False, confidence=max(float(getattr(extraction, "confidence", 0.0) or 0.0), 0.99),
+            status_signal="none", is_task_reply=False, related_task_hint=None,
+            reason="passive_conversation_guard",
+        )
+        print("[PASSIVE_CONVERSATION]", {"action": "IGNORE_FOR_TASK_AUTOMATION", "text": text})
 
     # v0.5.4: if the user used LINE's quote/reply feature on one of the
     # assistant's reminder messages, resolve the exact task by quotedMessageId.
@@ -1353,6 +1370,14 @@ async def _process_message(event: dict):
                     label="unmatched comment owner",
                 )
             return
+
+    # v0.6.36 CREATION CONSENT GUARD
+    # Auto-create only when the message itself carries a clear work-request signal.
+    # This intentionally favors missing an ambiguous chatter message over creating
+    # a false FU that later annoys the group.
+    if extraction.is_task and not explicit_work_request:
+        print("[TASK_CREATION_BLOCKED]", {"reason": "no_explicit_work_request", "text": text, "confidence": extraction.confidence})
+        return
 
     if extraction.is_task and extraction.confidence >= settings.auto_create_confidence:
         primary_mention = select_primary_mention(mentions, extraction.assignee_name)
