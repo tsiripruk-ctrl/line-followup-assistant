@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.34"
+VERSION = "0.6.35"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -102,6 +102,7 @@ def health():
         "quoted_reply_identity_guard": True, "quoted_reply_task_memory": True,
         "quoted_reply_atomic_status": True, "quoted_reply_identity_best_effort": True,
         "quoted_reply_completion_override": True, "quoted_reply_short_completion": True,
+        "quoted_reply_effective_ack": True, "completion_snapshot_guard": True,
         "mixed_progress_waiting_resolution": True,
         "working_hours_followup": True, "followup_window": "08:30-17:30",
         "daily_followup_limits": True, "staggered_group_followups": True,
@@ -1248,7 +1249,12 @@ async def _process_message(event: dict):
             source_id, user_id, display_name, quoted_message_id, extraction, text, msg["id"]
         )
         if changed is not None:
-            await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
+            # v0.6.35: acknowledgement must follow the *committed* quoted-reply result,
+            # not the original AI extraction. Short quote replies such as "เรียบร้อยแล้ว"
+            # can be safely promoted to completion inside handle_quoted_task_reply(),
+            # while extraction.status_signal may still be "none".
+            effective_ack_signal = "completed" if is_safe_quoted_completion(text) else extraction.status_signal
+            await acknowledge_task_reply(reply_token, source_id, effective_ack_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(settings.owner_line_user_id, changed, label="quoted status owner")
             return

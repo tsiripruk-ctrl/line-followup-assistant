@@ -1287,6 +1287,21 @@ def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner
         return (f"{assignee_token}คะ เรื่อง{topic} ตอนนี้ไปถึงไหนแล้วคะ", True)
 
     memory = _clip_message_piece(memory, 100)
+
+    # v0.6.35 consistency guard: a task must never send a reminder that says
+    # "ล่าสุด: ...เรียบร้อยแล้ว" while still asking for more progress. Structured
+    # snapshots can outlive an older state bug or migration. Keep the reminder
+    # human-safe by falling back to the stable task topic when the snapshot itself
+    # looks like a whole-task completion statement. State transition remains the
+    # responsibility of the message-processing path, so this guard does not auto-close.
+    completion_like = (
+        any(x in memory for x in ("เรียบร้อยแล้ว", "เสร็จแล้ว", "เสร็จเรียบร้อย", "จบแล้ว"))
+        and not any(x in memory for x in ("ยังไม่", "รอ", "แต่", "ติด", "เหลือ"))
+    )
+    if completion_like and task.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+        print("completion-like stale snapshot suppressed:", task.task_code, repr(memory), "status=", task.status)
+        memory = ""
+
     question = _progress_question(task)
 
     # Appointment / future-commitment follow-ups should sound like a checkpoint, not
