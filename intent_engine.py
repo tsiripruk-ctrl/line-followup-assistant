@@ -64,6 +64,30 @@ PROGRESS_PATTERNS = (
 )
 
 
+
+
+COMMAND_PREFIXES = (
+    ("NEW_TASK", ("งานใหม่:", "งานใหม่：", "มอบหมายงาน:", "มอบหมายงาน：")),
+    ("FOLLOW_UP", ("ติดตามงาน:", "ติดตามงาน：")),
+    ("PROGRESS_UPDATE", ("อัปเดตงาน:", "อัพเดตงาน:", "อัปเดตงาน：", "อัพเดตงาน：")),
+    ("COMPLETION_CONFIRMATION", ("ปิดงาน:", "ปิดงาน：")),
+)
+
+def parse_command_prefix(text: str | None):
+    """Return (intent, cleaned_text, prefix) for explicit owner/user command prefixes.
+
+    Prefixes are a hard routing signal and must beat question words such as "หรือยัง".
+    Example: "งานใหม่: @Proud ส่งมอบงานแล้วหรือยัง" is NEW_TASK, not STATUS_QUERY.
+    """
+    raw = (text or "").strip()
+    lowered = raw.lower()
+    for intent, prefixes in COMMAND_PREFIXES:
+        for prefix in prefixes:
+            if lowered.startswith(prefix.lower()):
+                cleaned = raw[len(prefix):].strip()
+                return intent, cleaned, prefix
+    return None, raw, None
+
 DIRECT_TASK_REQUEST_PATTERNS = (
     "ฝากตรวจสอบ", "ช่วยตรวจสอบ", "รบกวนตรวจสอบ", "ฝากเช็ก", "ฝากเช็ค",
     "ช่วยเช็ก", "ช่วยเช็ค", "รบกวนเช็ก", "รบกวนเช็ค", "ช่วยดู", "ฝากดู",
@@ -87,6 +111,9 @@ def is_direct_task_request(text: str | None) -> bool:
 
 def classify_message_intent(text: str | None) -> IntentResult:
     raw = (text or "").strip()
+    forced_intent, cleaned, prefix = parse_command_prefix(raw)
+    if forced_intent:
+        return IntentResult(forced_intent, 1.0, f"explicit_command_prefix:{prefix}")
     value = _compact(raw)
     if not value:
         return IntentResult("OTHER", 1.0, "empty")

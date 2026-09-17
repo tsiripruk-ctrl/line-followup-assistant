@@ -17,7 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard
-from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request
+from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, parse_command_prefix
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.32"
+VERSION = "0.6.33"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -130,6 +130,8 @@ def health():
         "reminder_queue_self_healing": True,
         "missing_next_reminder_repair": True,
         "overdue_waiting_reconciliation": True, "state_driven_message_style": True,
+        "explicit_command_prefix_routing": True, "new_task_prefix_question_override": True,
+        "command_prefix_semantic_cleaning": True,
         "generic_followup_template_disabled": True, "deterministic_followup_variety": True,
         "short_contextual_reminders": True,
     }
@@ -1159,6 +1161,11 @@ async def _process_message(event: dict):
         print("non-task notice ignored:", precreation_guard.reason, repr(text))
         return
 
+    # v0.6.33 EXPLICIT COMMAND PREFIX ROUTING
+    # Prefixes such as "งานใหม่:" / "ติดตามงาน:" are hard routing signals and
+    # must be evaluated before question words such as "หรือยัง".
+    forced_command_intent, command_text, command_prefix = parse_command_prefix(text)
+
     # v0.6.27 INTENT SAFETY LAYER
     # Classify intent before any state transition or task creation. Question/follow-up
     # messages are handled against existing tasks and can never close or duplicate them.
@@ -1178,7 +1185,7 @@ async def _process_message(event: dict):
         await handle_query_or_followup_intent(
             group_id=source_id, user_id=user_id, sender_name=display_name,
             reply_token=reply_token, quoted_message_id=quoted_message_id,
-            message_id=msg["id"], text=text, intent_result=intent_result,
+            message_id=msg["id"], text=(command_text or text), intent_result=intent_result,
             mentioned_name=mentioned_name, mentioned_user_id=mentioned_user_id,
         )
         return
@@ -1199,13 +1206,28 @@ async def _process_message(event: dict):
         print("fast local status:", local_status, repr(text))
     else:
         try:
-            extraction = await asyncio.to_thread(extract_task, text, display_name)
+            extraction = await asyncio.to_thread(extract_task, (command_text or text), display_name)
         except Exception as exc:
             # Do not kill the webhook worker silently if the LLM is temporarily
             # unavailable. Non-obvious messages can wait for the next human message,
             # while obvious status messages never reach this branch.
             print("extract_task failed:", repr(exc), "text=", repr(text))
             return
+
+    # v0.6.33: "งานใหม่:" is an explicit instruction from the user. Even when
+    # the payload itself is phrased as a question (e.g. "ส่งมอบแล้วหรือยัง"),
+    # it must create a new follow-up task instead of searching unrelated old tasks.
+    if forced_command_intent == "NEW_TASK":
+        extraction = TaskExtraction(
+            is_task=True, confidence=1.0,
+            title=(getattr(extraction, "title", None) or command_text or text)[:500],
+            project=getattr(extraction, "project", None),
+            assignee_name=getattr(extraction, "assignee_name", None),
+            due_at_iso=getattr(extraction, "due_at_iso", None),
+            status_signal="none", is_task_reply=False,
+            related_task_hint=(command_text or text),
+            reason="explicit งานใหม่ command prefix",
+        )
 
     # v0.6.28: explicit actionable @mention remains a task request even if AI
     # focuses on the question clause and returns is_task=False.
@@ -1343,11 +1365,15 @@ async def _process_message(event: dict):
             # v0.6.27 DUPLICATE FOLLOW-UP PREVENTION
             # Before creating any FU, search active tasks by content/history/project/assignee.
             # A high-confidence match becomes a timeline FOLLOW_UP on the existing task.
-            existing, duplicate_confidence, ambiguous_dupes = find_existing_followup_task(
-                db, source_id, text, sender_name=display_name,
-                assignee_name=assignee_override or extraction.assignee_name,
-                assignee_user_id=assignee_uid, min_confidence=0.80,
-            )
+            if forced_command_intent == "NEW_TASK":
+                existing, duplicate_confidence, ambiguous_dupes = None, 0.0, []
+                print("[NEW_TASK_PREFIX]", {"action": "FORCE_CREATE_NEW", "text": command_text or text})
+            else:
+                existing, duplicate_confidence, ambiguous_dupes = find_existing_followup_task(
+                    db, source_id, (command_text or text), sender_name=display_name,
+                    assignee_name=assignee_override or extraction.assignee_name,
+                    assignee_user_id=assignee_uid, min_confidence=0.80,
+                )
             if existing:
                 record_task_event(
                     db, existing, "FOLLOW_UP", actor_name=display_name, actor_user_id=user_id,
@@ -1373,10 +1399,21 @@ async def _process_message(event: dict):
                 return
 
             task = create_task(
-                db, source_id, msg["id"], extraction, source_text=text,
+                db, source_id, msg["id"], extraction, source_text=(command_text or text),
                 actor_name=display_name, actor_user_id=user_id,
                 assignee_name_override=assignee_override, assignee_user_id=assignee_uid,
             )
+            # v0.6.33: preserve all explicit mentions for traceability. The current
+            # schema still has one primary assignee, so additional mentions are recorded
+            # in Timeline instead of being silently discarded.
+            if forced_command_intent == "NEW_TASK" and len(mentions) > 1:
+                co_names = [m.get("display_name") or m.get("visible_name") or m.get("user_id") for m in mentions]
+                record_task_event(
+                    db, task, "CO_ASSIGNEES_MENTIONED", actor_name=display_name, actor_user_id=user_id,
+                    text="ผู้เกี่ยวข้อง: " + ", ".join([n for n in co_names if n]),
+                    new_status=task.status, commit=True, message_id=msg["id"], confidence=1.0,
+                )
+
             # If AI found a plain-text assignee and that person is already known in
             # People Registry, attach their stable LINE userId too.
             if not task.assignee_user_id and task.assignee_name:
