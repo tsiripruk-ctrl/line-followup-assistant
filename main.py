@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.31"
+VERSION = "0.6.32"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
