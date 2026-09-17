@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.30"
+VERSION = "0.6.31"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -126,6 +126,12 @@ def health():
         "task_event_message_trace": True,
         "structured_task_progress": True, "progressive_followup_context": True,
         "task_local_progress_snapshot": True, "progress_snapshot_dashboard": True,
+        "humanized_context_followup": True,
+        "reminder_queue_self_healing": True,
+        "missing_next_reminder_repair": True,
+        "overdue_waiting_reconciliation": True, "state_driven_message_style": True,
+        "generic_followup_template_disabled": True, "deterministic_followup_variety": True,
+        "short_contextual_reminders": True,
     }
 
 
@@ -1951,9 +1957,49 @@ def schedule_next_followup(task: Task, candidate_utc: datetime, *, force_next_da
     return next_work_window_utc(candidate_utc, task, next_day=force_next_day)
 
 
+def repair_missing_reminder_schedule(db, now_utc: datetime) -> int:
+    """Repair open tasks that lost their reminder schedule.
+
+    Older tasks or interrupted status updates can leave ``next_reminder_at`` NULL.
+    The reminder scanner historically ignored those rows forever.  This repair is
+    intentionally conservative: it only touches active tasks with no schedule at
+    all.  Existing future commitments/schedules are never moved.
+    """
+    tasks = list(db.scalars(select(Task).where(
+        Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
+        Task.next_reminder_at == None,
+    )).all())
+    repaired = 0
+    for task in tasks:
+        # If an unfinished task is already past its due date, make it eligible
+        # in the current working window.  Otherwise use the due date, or the
+        # next working window for undated tasks.
+        if task.due_at and task.due_at > now_utc:
+            candidate = task.due_at
+        else:
+            candidate = now_utc
+        task.next_reminder_at = schedule_next_followup(task, candidate)
+        record_task_event(
+            db, task, "REMINDER_SCHEDULE_REPAIRED",
+            actor_name="LINE Follow-up Assistant",
+            text="ซ่อมคิวติดตามอัตโนมัติสำหรับงานที่ยังเปิดอยู่",
+            old_status=task.status, new_status=task.status, commit=False,
+        )
+        repaired += 1
+    if repaired:
+        db.commit()
+        print("reminder schedule repaired:", repaired)
+    return repaired
+
+
 async def reminder_scan(force: bool = False):
-    stats = {"due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0, "skipped_daily_cap": 0, "deferred_spread": 0}
+    stats = {"due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0, "skipped_daily_cap": 0, "deferred_spread": 0, "repaired_schedule": 0}
     now = datetime.utcnow()
+
+    # Self-heal legacy/open tasks that have no next reminder at all. Without
+    # this, they are invisible to the due query and can remain unfollowed forever.
+    with SessionLocal() as repair_db:
+        stats["repaired_schedule"] = repair_missing_reminder_schedule(repair_db, now)
 
     # Group follow-up is strictly limited to the working window 08:30-17:30.
     # Due reminders are preserved and delivered after the next window opens.
@@ -2019,38 +2065,15 @@ async def reminder_scan(force: bool = False):
                 if is_pre_due:
                     due_text = format_due_local(t)
                     body = (
-                        f"{greeting} ขอแจ้งเตือนเรื่อง{topic}ค่ะ\n"
-                        f"งานนี้กำหนด {due_text} ถ้าเรียบร้อยแล้วแจ้ง{settings.owner_display_name}ได้เลยนะคะ"
+                        f"{greeting} เรื่อง{topic}กำหนด {due_text} นะคะ\n"
+                        f"ตอนนี้ยังเป็นไปตามแผนอยู่ไหมคะ"
                     )
                     # After the advance reminder, the next check is the due time itself.
                     t.next_reminder_at = schedule_next_followup(t, t.due_at)
                 elif t.status in ("OVERDUE", "WAITING", "IN_PROGRESS"):
-                    memory_body, used_memory = contextual_followup_text(
+                    body, _ = contextual_followup_text(
                         db, t, greeting[:-2] if greeting.endswith("คะ") else greeting, settings.owner_display_name
                     )
-                    if used_memory:
-                        body = memory_body
-                    elif t.status == "OVERDUE":
-                        if t.reminder_count >= settings.escalation_after_reminders:
-                            body = (
-                                f"{greeting} ขออัปเดตเรื่อง{topic}อีกครั้งค่ะ\n"
-                                f"ตอนนี้เลยกำหนดแล้ว หากยังติดปัญหาตรงไหน รบกวนแจ้งสาเหตุและวันที่คาดว่าจะเรียบร้อยให้{settings.owner_display_name}ทราบด้วยนะคะ"
-                            )
-                        else:
-                            body = (
-                                f"{greeting} ขออัปเดตเรื่อง{topic}หน่อยค่ะ\n"
-                                f"ตอนนี้เลยกำหนดแล้ว หากยังติดอะไรอยู่แจ้ง{settings.owner_display_name}ไว้ได้เลยนะคะ"
-                            )
-                    elif t.status == "WAITING":
-                        body = (
-                            f"{greeting} ขออัปเดตเรื่อง{topic}หน่อยค่ะ\n"
-                            f"เรื่องที่รออยู่มีความคืบหน้าเพิ่มเติมไหมคะ"
-                        )
-                    else:
-                        body = (
-                            f"{greeting} ขออัปเดตความคืบหน้าเรื่อง{topic}หน่อยค่ะ\n"
-                            f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
-                        )
 
                     if t.status == "WAITING":
                         t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=24))
@@ -2059,9 +2082,8 @@ async def reminder_scan(force: bool = False):
                     else:
                         t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
                 else:
-                    body = (
-                        f"{greeting} ขออัปเดตเรื่อง{topic}หน่อยค่ะ\n"
-                        f"ถ้าเรียบร้อยแล้ว รบกวนแจ้ง{settings.owner_display_name}ด้วยนะคะ"
+                    body, _ = contextual_followup_text(
+                        db, t, greeting[:-2] if greeting.endswith("คะ") else greeting, settings.owner_display_name
                     )
                     t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
 

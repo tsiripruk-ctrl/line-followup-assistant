@@ -1065,10 +1065,13 @@ def _progress_clause(text: str | None, markers: tuple[str, ...], max_len: int = 
         return ""
     # Thai chat often separates steps with commas / แต่ / แล้ว / ส่วน. Keep enough
     # context around the matching clause without manufacturing facts.
-    chunks = [c.strip(" ,;:-") for c in re.split(r"[.!?\n]|\s+(?:แต่|ส่วน|จากนั้น|แล้วก็)\s+", clean) if c.strip(" ,;:-")]
+    chunks = [c.strip(" ,;:-") for c in re.split(r"[.!?\n]|(?:\s+แต่|\s+ส่วน|\s+จากนั้น|\s+แล้วก็)\s*", clean) if c.strip(" ,;:-")]
     for chunk in chunks:
         low = chunk.lower()
-        if any(m.lower() in low for m in markers):
+        # Thai substring safety: the waiting marker "รอ" must not fire merely
+        # because it appears inside the completion word "เรียบร้อย".
+        marker_text = low.replace("เรียบร้อย", "")
+        if any(m.lower() in marker_text for m in markers):
             if len(chunk) > max_len:
                 return chunk[:max_len - 1].rstrip() + "…"
             return chunk
@@ -1157,55 +1160,157 @@ def task_progress_context(task: Task) -> str:
     return "\n".join(parts)
 
 
-def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
-    """Build a reminder that visibly continues from this task's latest progress.
+def _clip_message_piece(value: str | None, max_len: int = 92) -> str:
+    if not value:
+        return ""
+    x = " ".join(str(value).replace("\n", " ").split()).strip(" ,-:|.")
+    if len(x) > max_len:
+        return x[: max_len - 1].rstrip() + "…"
+    return x
 
-    v0.6.30 prefers the structured task-local snapshot. Older tasks fall back to the
-    trusted event timeline. Cross-topic memory is still rejected by the integrity guard.
+
+def _normalize_waiting_phrase(value: str | None) -> str:
+    x = _clip_message_piece(value, 80)
+    if not x:
+        return ""
+    # Keep the operational noun, not a nested phrase such as "รอ (รอเซลล์...)".
+    x = re.sub(r"^(?:ตอนนี้)?\s*(?:กำลัง)?\s*รอ\s*", "", x).strip()
+    return x
+
+
+def _appointment_like(value: str | None) -> bool:
+    x = (value or "").lower()
+    return any(k in x for k in (
+        "นัด", "พรุ่งนี้", "มะรืน", "วันจันทร์", "วันอังคาร", "วันพุธ",
+        "วันพฤหัส", "วันศุกร์", "วันเสาร์", "วันอาทิตย์",
+    )) or bool(re.search(r"\b\d{1,2}[/:]\d{1,2}(?:[/:]\d{2,4})?\b", x))
+
+
+def _waiting_question(waiting_on: str, reminder_count: int = 0) -> str:
+    """Ask only about the unresolved dependency, using its actual business state."""
+    w = _normalize_waiting_phrase(waiting_on)
+    low = w.lower()
+    if not w:
+        return "ตอนนี้สิ่งที่รออยู่ขยับไปถึงไหนแล้วคะ"
+
+    # Extract the party being waited on instead of echoing a whole progress sentence.
+    party = ""
+    m = re.search(r"(?:ทาง)?\s*(เซลล์|sales|เจ้าหน้าที่|ผู้ขาย|supplier|futong)[^,.;]*?(?:ยังไม่ตอบรับ|ยังไม่ตอบ|ตอบกลับ|ตอบรับ|ตอบ)", low)
+    if m:
+        raw = m.group(1)
+        party_map = {"sales": "เซลล์", "supplier": "ผู้ขาย", "futong": "Futong"}
+        party = party_map.get(raw, raw)
+    if party:
+        prefix = "" if party == "เจ้าหน้าที่" else "ทาง"
+        return f"ตอนนี้{prefix}{party}ตอบกลับมาแล้วหรือยังคะ"
+
+    if any(k in low for k in ("เอกสาร", "ใบตรวจรับ", "หนังสือ", "datasheet", "data sheet")):
+        if "เจ้าหน้าที่" in low or "ตอบ" in low:
+            return "ตอนนี้เจ้าหน้าที่ตอบกลับมาเพิ่มเติมแล้วหรือยังคะ"
+        return "ตอนนี้เอกสารที่รออยู่กลับมาแล้วหรือยังคะ"
+    if any(k in low for k in ("อนุมัติ", "อนุญาต", "เซ็น", "ลงนาม")):
+        return "ตอนนี้ขั้นตอนอนุมัติ/ลงนามผ่านแล้วหรือยังคะ"
+    if any(k in low for k in ("ของ", "สินค้า", "อุปกรณ์", "ตู้", "สาย", "fiber", "ไฟเบอร์")):
+        return "ตอนนี้ของที่รออยู่เข้ามาแล้วหรือยังคะ"
+
+    # Remove stale/completed clauses before echoing a generic dependency.
+    dep = re.sub(r".*?(?:แต่|ตอนนี้)\s*", "", w).strip()
+    dep = re.sub(r"(?:ยังไม่ตอบรับ|ยังไม่ตอบ|กำลังรอ|รอ)\s*", "", dep).strip(" ,-:|.")
+    if len(dep) > 42:
+        dep = dep[:41].rstrip() + "…"
+    if dep:
+        variants = (
+            f"ตอนนี้เรื่อง{dep}มีความคืบหน้าแล้วหรือยังคะ",
+            f"เรื่อง{dep}ตอนนี้ขยับไปถึงไหนแล้วคะ",
+        )
+        return variants[reminder_count % len(variants)]
+    return "ตอนนี้สิ่งที่รออยู่ขยับไปถึงไหนแล้วคะ"
+
+
+def _progress_question(task: Task) -> str:
+    """Select a question style from task state, not from random sentence rotation."""
+    rc = int(task.reminder_count or 0)
+    if task.waiting_on:
+        return _waiting_question(task.waiting_on, rc)
+    if task.next_action:
+        action = _clip_message_piece(task.next_action, 86)
+        if _appointment_like(action):
+            return "วันนี้เป็นช่วงที่นัดไว้ ตอนนี้ดำเนินการเป็นอย่างไรบ้างคะ"
+        if any(k in action.lower() for k in ("ส่ง", "ส่งของ", "ส่งเอกสาร")):
+            return "ขั้นตอนที่ต้องส่งต่อ ตอนนี้ดำเนินการเรียบร้อยหรือยังคะ"
+        return f"ขั้นตอนถัดไปเรื่อง{action} ตอนนี้ไปถึงไหนแล้วคะ"
+    if task.status == "OVERDUE":
+        return (
+            "ตอนนี้คาดว่าจะเรียบร้อยได้ประมาณเมื่อไหร่คะ"
+            if rc % 2 == 0 else
+            "ตอนนี้ยังติดตรงส่วนไหนอยู่ไหมคะ และคาดว่าจะจบได้เมื่อไหร่คะ"
+        )
+    if task.status == "IN_PROGRESS":
+        return (
+            "ตอนนี้เหลือขั้นตอนไหนอีกบ้างคะ"
+            if rc % 2 == 0 else
+            "จากที่ทำต่อมา ตอนนี้ไปถึงขั้นตอนไหนแล้วคะ"
+        )
+    return (
+        "ตอนนี้ไปถึงไหนแล้วคะ"
+        if rc % 2 == 0 else
+        "ตอนนี้มีอะไรขยับเพิ่มเติมแล้วบ้างคะ"
+    )
+
+
+def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
+    """Humanized, state-driven follow-up text for v0.6.31.
+
+    The function first validates task-local memory, then asks only about the current
+    unresolved dependency / next action. Variation is deterministic within the
+    selected state style; it is never random sentence swapping.
     """
+    structured_memory = bool((task.progress_summary or "").strip())
     memory = (task.progress_summary or "").strip()
     if not memory:
         ev = latest_status_reply(db, task)
         memory = summarize_progress_update(ev.text if ev else None)
-    topic = task_reference_label(db, task)
-    if memory and not _memory_relevant_to_task(db, task, memory):
+    topic = _clip_message_piece(task_reference_label(db, task), 76)
+    # Structured progress_snapshot is written only after a task has already been
+    # resolved. Treat it as trusted task-local state. The integrity guard remains
+    # for legacy timeline fallback, where old contaminated events may exist.
+    if memory and not structured_memory and not _memory_relevant_to_task(db, task, memory):
         print("task memory rejected as cross-topic contamination:", task.task_code, repr(memory), "base=", repr(_base_task_text(db, task)))
         memory = ""
 
-    if memory:
-        # Keep reminders concise and visibly progressive: original task -> latest
-        # progress -> only the unresolved point / next checkpoint.
-        if task.status == "WAITING":
-            question = "ตอนนี้สิ่งที่กำลังรออยู่มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ"
-            if task.waiting_on:
-                question = f"ตอนนี้เรื่องที่กำลังรอ ({task.waiting_on}) มีความคืบหน้าเพิ่มเติมแล้วหรือยังคะ"
-            return (
-                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
-                f"ล่าสุด: {memory}\n{question}",
-                True,
-            )
-        if task.status == "IN_PROGRESS":
-            next_line = f"\nขั้นตอนถัดไปที่แจ้งไว้: {task.next_action}" if task.next_action else ""
-            return (
-                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
-                f"ล่าสุด: {memory}{next_line}\n"
-                f"ตอนนี้ดำเนินการต่อถึงขั้นตอนไหนแล้วคะ",
-                True,
-            )
+    # If there is no trusted progress yet, use the stable original task only. This
+    # still gives a natural first follow-up without fabricating memory.
+    if not memory:
         if task.status == "OVERDUE":
-            return (
-                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
-                f"ล่าสุด: {memory}\n"
-                f"ตอนนี้มีความคืบหน้าเพิ่มเติมหรือมีจุดติดขัดอะไรไหมคะ",
-                True,
-            )
-        if task.status == "OPEN":
-            return (
-                f"{assignee_token}คะ ขออัปเดตต่อจากงาน {topic} ค่ะ\n"
-                f"ล่าสุด: {memory}\nตอนนี้มีความคืบหน้าเพิ่มเติมอย่างไรบ้างคะ",
-                True,
-            )
-    return "", False
+            q = _progress_question(task)
+            return (f"{assignee_token}คะ เรื่อง{topic}เลยกำหนดแล้วค่ะ\n{q}", True)
+        return (f"{assignee_token}คะ เรื่อง{topic} ตอนนี้ไปถึงไหนแล้วคะ", True)
+
+    memory = _clip_message_piece(memory, 100)
+    question = _progress_question(task)
+
+    # Appointment / future-commitment follow-ups should sound like a checkpoint, not
+    # a generic status chase. Date-aware scheduling guarantees this is not sent early.
+    if task.next_action and _appointment_like(task.next_action):
+        return (
+            f"{assignee_token}คะ เรื่อง{topic} วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ\n"
+            f"ตอนนี้ดำเนินการเป็นอย่างไรบ้างคะ",
+            True,
+        )
+
+    # Waiting tasks ask only about the dependency; do not repeat completed milestones.
+    if task.status == "WAITING" or task.waiting_on:
+        return (
+            f"{assignee_token}คะ เรื่อง{topic} ล่าสุด: {memory}\n{question}",
+            True,
+        )
+
+    # In-progress / overdue tasks retain just enough context to make the question feel
+    # continuous. No full timeline dump, no generic "ขออัปเดต" template.
+    return (
+        f"{assignee_token}คะ เรื่อง{topic} ล่าสุด: {memory}\n{question}",
+        True,
+    )
 
 def clean_display_name(value: str | None) -> str:
     if not value:

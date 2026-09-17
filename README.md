@@ -325,7 +325,7 @@ Post-deploy checks:
 - Adds `FOLLOW_UP_SCHEDULED` timeline events for traceability.
 - Completion safety and all v0.6.28 routing/duplicate protections are preserved.
 
-## v0.6.30 — Progressive Task Context & Progress Snapshot
+## v0.6.32 — Progressive Task Context & Progress Snapshot
 
 เป้าหมายของรุ่นนี้คือให้การติดตามแต่ละงาน "ต่อเนื่องจากความก้าวหน้าล่าสุด" แทนการถามซ้ำจากชื่อ Task เดิมทุกครั้ง
 
@@ -347,3 +347,20 @@ Post-deploy checks:
 จะทำให้ Reminder รอบถัดไปอ้างถึงว่าเปิด PO แล้วและกำลังรอเซลล์ ไม่ย้อนกลับไปถามว่าเปิด PO แล้วหรือยัง
 
 Automated regression tests: `30 passed` ณ ตอน build รุ่นนี้ (รวม intent, duplicate follow-up, date-aware scheduling, human-directed routing และ progress context)
+
+
+## v0.6.32 – Humanized Context-aware Follow-up
+
+- Reminder text is generated from the task's trusted progress snapshot, waiting dependency, next action and appointment state.
+- Generic repeated phrases such as `ขออัปเดตเรื่อง...` and `เรื่องที่รออยู่มีความคืบหน้าเพิ่มเติมไหมคะ` are removed from the reminder path.
+- Message style is state-driven (waiting / next action / appointment / overdue / in-progress / first follow-up), with deterministic variation only inside the selected state.
+- Reminder messages remain concise (normally 1–2 lines) and never expose technical system language in the work group.
+- Existing working-hour, daily-cap, date-aware, identity, quiet-mode and task-context-integrity protections remain intact.
+- No database migration or new environment variable is required for this release.
+
+
+## v0.6.32 – Reminder Queue Self-Healing
+- Repairs active OPEN/IN_PROGRESS/WAITING/OVERDUE tasks whose `next_reminder_at` became NULL.
+- Existing future commitments are preserved; only missing schedules are repaired.
+- Past-due WAITING tasks become eligible for follow-up in the current work window instead of being silently skipped forever.
+- Adds `REMINDER_SCHEDULE_REPAIRED` to the task timeline for traceability.
