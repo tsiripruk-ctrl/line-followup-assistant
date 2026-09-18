@@ -4,7 +4,7 @@ import json
 from difflib import SequenceMatcher
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, or_
 from sqlalchemy.orm import Session
 from models import Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
 from config import settings
@@ -2098,6 +2098,55 @@ def search_open_tasks(db: Session, query: str = "", project: str = "", assignee:
 
 def task_stats(db: Session) -> dict:
     return brief_counts(db)
+
+
+def _smart_search_terms(query: str) -> list[str]:
+    """Conservative owner-search normalization. Never mutates tasks."""
+    q = " ".join((query or "").strip().split()).lower()
+    if not q:
+        return []
+    terms = {q}
+    # Business synonyms/orthographic variants. Expand only well-known equivalents.
+    groups = [
+        {"meter", "metre", "มิเตอร์", "มิเตอร์ไฟ", "มิเตอร์ชั่วคราว"},
+        {"po", "p.o.", "ใบสั่งซื้อ"},
+        {"อบต", "อบต."},
+        {"เทศบาล", "เทศบาลเมือง", "เทศบาลตำบล"},
+    ]
+    for group in groups:
+        if q in group or any(token in q.split() for token in group):
+            terms.update(group)
+    # harmless spacing/punctuation variants
+    terms.add(q.replace(" ", ""))
+    return [t for t in terms if t]
+
+
+def smart_search_tasks(db: Session, query: str, limit: int = 50) -> list[Task]:
+    """Read-only natural owner search across task identity, progress and timeline.
+
+    Searches every status so completed historical work is discoverable. Exact/lexical
+    evidence is required; this function deliberately does not use fuzzy similarity to
+    avoid cross-project contamination.
+    """
+    terms = _smart_search_terms(query)
+    if not terms:
+        return []
+    task_clauses = []
+    event_clauses = []
+    for t in terms:
+        like = f"%{t}%"
+        task_clauses.extend([
+            Task.task_code.ilike(like), Task.title.ilike(like), Task.project.ilike(like),
+            Task.assignee_name.ilike(like), Task.notes.ilike(like),
+            Task.progress_summary.ilike(like), Task.waiting_on.ilike(like), Task.next_action.ilike(like),
+        ])
+        event_clauses.append(TaskEvent.text.ilike(like))
+    event_task_ids = select(TaskEvent.task_id).where(or_(*event_clauses))
+    stmt = (select(Task)
+            .where(or_(or_(*task_clauses), Task.id.in_(event_task_ids)))
+            .order_by(Task.updated_at.desc(), Task.id.desc())
+            .limit(limit))
+    return list(db.scalars(stmt).all())
 
 
 def find_existing_followup_task(

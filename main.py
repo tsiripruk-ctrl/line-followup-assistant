@@ -22,7 +22,7 @@ from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
     format_task, choose_status_target, STATUS_THAI, brief_counts,
-    event_exists, record_event, search_open_tasks, task_stats,
+    event_exists, record_event, search_open_tasks, smart_search_tasks, task_stats,
     resolve_canonical_name, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
@@ -33,7 +33,7 @@ from service import (
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state
 )
 
-VERSION = "0.6.42"
+VERSION = "0.6.43"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -163,6 +163,10 @@ def health():
         "owner_tone_typo_cleanup": True,
         "multi_phrase_blacklist_command": True,
         "owner_state_question_rules": True,
+        "natural_task_search": True,
+        "smart_keyword_search": True,
+        "timeline_search": True,
+        "search_read_only": True,
         "natural_policy_instruction_routing": True,
         "policy_command_precedence_guard": True,
         "runtime_state_question_override": True,
@@ -2430,8 +2434,8 @@ async def handle_owner_command(user_id: str, text: str):
     if low.startswith("ค้นหา "):
         query = raw.split(" ", 1)[1].strip()
         with SessionLocal() as db:
-            tasks = search_open_tasks(db, query=query, status="ACTIVE")
-        await send_task_list(user_id, f"ผลค้นหา {query}", tasks)
+            tasks = smart_search_tasks(db, query)
+        await send_smart_search_results(user_id, query, tasks)
         return
 
     if "สรุปเช้า" in low or "brief เช้า" in low:
@@ -2471,6 +2475,16 @@ async def handle_owner_command(user_id: str, text: str):
         await send_task_list(user_id, "สรุปงานติดตามที่ยังไม่ปิด", tasks)
         return
 
+    # v0.6.43 Natural Task Search: a short unmatched owner-private message is
+    # navigation/search, never task creation or mutation. This makes queries such
+    # as "ชุมแสง", "Meter", "Futong" usable without a command prefix.
+    if 1 <= len(raw) <= 80 and "\n" not in raw:
+        with SessionLocal() as db:
+            tasks = smart_search_tasks(db, raw)
+        if tasks:
+            await send_smart_search_results(user_id, raw, tasks)
+            return
+
     await push_text(user_id,
         "สั่งได้แบบนี้ค่ะ\n"
         "• สรุปงานค้าง\n"
@@ -2501,6 +2515,28 @@ async def handle_owner_command(user_id: str, text: str):
         "• ทดลองข้อความติดตาม\n"
         "• คืนค่ารูปแบบติดตาม"
     )
+
+
+async def send_smart_search_results(user_id: str, query: str, tasks: list[Task]):
+    if not tasks:
+        await push_text(user_id, f"ยังไม่พบงานที่เกี่ยวข้องกับ {query} ค่ะ")
+        return
+    lines = [f"พบงานที่เกี่ยวข้องกับ {query} {len(tasks)} งานค่ะ", ""]
+    for t in tasks[:12]:
+        context = t.progress_summary or t.waiting_on or t.next_action
+        lines.append(f"{t.task_code} — {t.title}")
+        if t.project:
+            lines.append(f"โครงการ/หน่วยงาน: {t.project}")
+        if t.assignee_name:
+            lines.append(f"ผู้รับผิดชอบ: {t.assignee_name}")
+        lines.append(f"สถานะ: {STATUS_THAI.get(t.status, t.status)}")
+        if context:
+            short = " ".join(str(context).split())[:140]
+            lines.append(f"ล่าสุด: {short}")
+        lines.append("")
+    if len(tasks) > 12:
+        lines.append(f"และมีอีก {len(tasks)-12} งานค่ะ")
+    await push_text(user_id, "\n".join(lines))
 
 
 async def send_task_list(user_id: str, title: str, tasks: list[Task]):
