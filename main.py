@@ -27,10 +27,11 @@ from service import (
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
-    find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
+    find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
+    get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy
 )
 
-VERSION = "0.6.38"
+VERSION = "0.6.39"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -146,6 +147,12 @@ def health():
         "silence_before_clarification": True,
         "unmatched_status_query_silent": True,
         "clarification_requires_task_evidence": True,
+        "owner_followup_diagnostics": True,
+        "owner_queue_inspector": True,
+        "owner_followup_policy_control": True,
+        "owner_followup_preview": True,
+        "runtime_followup_style_update": True,
+        "owner_followup_reschedule": True,
     }
 
 
@@ -1838,9 +1845,357 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             raise
 
 
+
+def _fmt_local_dt(value: datetime | None) -> str:
+    if not value:
+        return "ยังไม่กำหนด"
+    return value.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone)).strftime("%d/%m/%Y %H:%M")
+
+
+def _latest_followup_schedule_event(db, task: Task):
+    return db.scalar(
+        select(TaskEvent).where(
+            TaskEvent.task_id == task.id,
+            TaskEvent.event_type == "FOLLOW_UP_SCHEDULED",
+        ).order_by(TaskEvent.created_at.desc(), TaskEvent.id.desc()).limit(1)
+    )
+
+
+def followup_diagnostic(db, task: Task, now_utc: datetime | None = None) -> dict:
+    """Explain the scheduler's current decision for one task using real DB state."""
+    now_utc = now_utc or datetime.utcnow()
+    local_now = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
+    active = task.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
+    sent_today = followups_sent_today(db, task, now_utc) if active else 0
+    cap = settings.waiting_max_followups_per_day if task.status == "WAITING" else settings.max_followups_per_task_per_day
+    code = "READY"
+    reason = "งานถึงคิวติดตามแล้ว และจะถูกพิจารณาใน cron รอบถัดไปค่ะ"
+
+    if not active:
+        code = "CLOSED"
+        reason = f"สถานะงานเป็น {STATUS_THAI.get(task.status, task.status)} จึงไม่อยู่ในคิวติดตามค่ะ"
+    elif task.next_reminder_at is None:
+        code = "MISSING_NEXT_REMINDER"
+        reason = "งานยังเปิดอยู่ แต่ไม่มีเวลาติดตามครั้งถัดไป จึงถือว่าหลุดจากคิวค่ะ"
+    elif not in_followup_window(local_now):
+        code = "OUTSIDE_WORKING_HOURS"
+        reason = "ขณะนี้อยู่นอกเวลาติดตาม 08:30–17:30 ระบบจะรอช่วงเวลางานค่ะ"
+    elif sent_today >= cap:
+        code = "WAITING_DAILY_LIMIT" if task.status == "WAITING" else "DAILY_LIMIT_REACHED"
+        reason = f"วันนี้ติดตามงานนี้แล้ว {sent_today} ครั้ง ครบเพดาน {cap} ครั้ง/วันค่ะ"
+    elif task.next_reminder_at > now_utc:
+        schedule_ev = _latest_followup_schedule_event(db, task)
+        code = "FUTURE_COMMITMENT" if schedule_ev else "NOT_DUE_YET"
+        if schedule_ev:
+            reason = f"มีนัดติดตามครั้งถัดไป {_fmt_local_dt(task.next_reminder_at)} จึงยังไม่ควรถามก่อนเวลาค่ะ"
+        else:
+            reason = f"ยังไม่ถึงเวลาติดตามครั้งถัดไป {_fmt_local_dt(task.next_reminder_at)} ค่ะ"
+
+    return {
+        "code": code,
+        "reason": reason,
+        "sent_today": sent_today,
+        "daily_cap": cap,
+        "next_reminder_at": task.next_reminder_at,
+        "line_bound": bool(task.assignee_user_id),
+    }
+
+
+def _diagnostic_text(task: Task, diag: dict) -> str:
+    lines = [
+        f"{task.task_code} {task.title}",
+        f"สถานะ: {STATUS_THAI.get(task.status, task.status)}",
+        f"ผู้รับผิดชอบ: {task.assignee_name or 'ยังไม่ระบุ'}",
+        f"ติดตามครั้งถัดไป: {_fmt_local_dt(task.next_reminder_at)}",
+        f"ติดตามวันนี้: {diag['sent_today']}/{diag['daily_cap']} ครั้ง",
+        f"เหตุผล: {diag['reason']}",
+    ]
+    if task.assignee_name and not task.assignee_user_id:
+        lines.append("หมายเหตุ: ยังไม่ผูก LINE ผู้รับผิดชอบ จึง Mention โดยตรงไม่ได้ค่ะ")
+    return "\n".join(lines)
+
+
+def _owner_policy_summary(policy: dict) -> str:
+    tone_map = {
+        "friendly_professional": "เป็นกันเองแบบมืออาชีพ",
+        "soft": "นุ่มนวล",
+        "direct": "ตรงประเด็น",
+        "concise": "กระชับ",
+    }
+    avoid = policy.get("avoid_phrases") or []
+    return (
+        "รูปแบบการติดตามปัจจุบันค่ะ\n"
+        f"• โทน: {tone_map.get(policy.get('tone'), policy.get('tone'))}\n"
+        f"• ความยาว: ไม่เกิน {policy.get('max_lines', 2)} บรรทัด / {policy.get('max_chars', 200)} ตัวอักษร\n"
+        f"• คำที่หลีกเลี่ยง: {', '.join(avoid) if avoid else 'ยังไม่ได้กำหนด'}"
+    )
+
+
+def _extract_quoted_phrase(raw: str) -> str:
+    m = re.search(r'[\"“”\']([^\"“”\']+)[\"“”\']', raw)
+    if m:
+        return m.group(1).strip()
+    if "ว่า" in raw:
+        return raw.split("ว่า", 1)[1].strip(" :\"'“”")
+    return ""
+
+
+async def _send_followup_preview(user_id: str):
+    with SessionLocal() as db:
+        tasks = open_tasks(db)[:3]
+        policy = get_followup_policy(db)
+        previews = []
+        for idx, task in enumerate(tasks, 1):
+            token = task.assignee_name or "ทีม"
+            body, _ = contextual_followup_text(db, task, token, settings.owner_display_name)
+            previews.append(f"ตัวอย่าง {idx}\n{body}")
+    if not previews:
+        await push_text(user_id, _owner_policy_summary(policy) + "\n\nตอนนี้ยังไม่มีงานเปิดสำหรับสร้างตัวอย่างค่ะ")
+        return
+    await push_text(user_id, _owner_policy_summary(policy) + "\n\n" + "\n\n".join(previews))
+
 async def handle_owner_command(user_id: str, text: str):
     raw = text.strip()
     low = raw.lower()
+
+    # v0.6.39 Owner Follow-up Diagnostics & Control Center -----------------
+    if low.startswith("ทำไมไม่ตาม "):
+        code = raw.split(maxsplit=1)[1].strip().upper()
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            diag = followup_diagnostic(db, task)
+            message = _diagnostic_text(task, diag)
+        await push_text(user_id, message)
+        return
+
+    if low.startswith("ทำไมวันนี้ไม่ตาม "):
+        assignee = raw.split("ทำไมวันนี้ไม่ตาม ", 1)[1].strip()
+        with SessionLocal() as db:
+            tasks = search_open_tasks(db, assignee=assignee, status="ACTIVE")
+            rows = [(t, followup_diagnostic(db, t)) for t in tasks[:10]]
+        if not rows:
+            await push_text(user_id, f"ไม่พบงานเปิดของ {assignee} ค่ะ")
+            return
+        await push_text(user_id, f"เหตุผลของงาน {assignee} ค่ะ\n\n" + "\n\n".join(_diagnostic_text(t, d) for t, d in rows))
+        return
+
+    if low.startswith("ทำไมงาน") and ("ไม่ถูกตาม" in low or "ไม่เตือน" in low):
+        body = re.sub(r"^ทำไมงาน\s*", "", raw, flags=re.IGNORECASE)
+        body = re.sub(r"\s*(?:ไม่ถูกตาม|ไม่เตือน).*$", "", body, flags=re.IGNORECASE).strip()
+        if not body:
+            await push_text(user_id, "พิมพ์เช่น: ทำไมงานชุมแสงไม่ถูกตาม ค่ะ")
+            return
+        with SessionLocal() as db:
+            tasks = search_open_tasks(db, query=body, status="ACTIVE")
+            rows = [(t, followup_diagnostic(db, t)) for t in tasks[:5]]
+        if not rows:
+            await push_text(user_id, f"ไม่พบงานเปิดที่ตรงกับ “{body}” ค่ะ")
+            return
+        await push_text(user_id, "\n\n".join(_diagnostic_text(t, d) for t, d in rows))
+        return
+
+    if low in ("งานไหนหลุดจากคิวติดตาม", "งานหลุดจากคิว", "ตรวจงานหลุดจากคิว"):
+        with SessionLocal() as db:
+            tasks = list(db.scalars(select(Task).where(
+                Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
+                Task.next_reminder_at == None,
+            ).order_by(Task.id.desc()).limit(20)).all())
+        if not tasks:
+            await push_text(user_id, "ตรวจแล้วค่ะ ตอนนี้ไม่พบงานเปิดที่หลุดจากคิวติดตาม")
+            return
+        lines = [f"พบงานหลุดจากคิว {len(tasks)} รายการค่ะ", ""]
+        for t in tasks:
+            lines.append(f"• {t.task_code} {t.title}")
+        lines.append("\nพิมพ์ “ซ่อมคิวติดตาม” เพื่อซ่อมรายการที่ไม่มีเวลาติดตามค่ะ")
+        await push_text(user_id, "\n".join(lines))
+        return
+
+    if low == "ตรวจคิวติดตาม" or low == "เช็กคิวติดตาม":
+        now = datetime.utcnow()
+        with SessionLocal() as db:
+            active = list(db.scalars(select(Task).where(Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]))).all())
+            missing = [t for t in active if t.next_reminder_at is None]
+            due = [t for t in active if t.next_reminder_at is not None and t.next_reminder_at <= now]
+            future = [t for t in active if t.next_reminder_at is not None and t.next_reminder_at > now]
+            ready = [t for t in due if followup_diagnostic(db, t, now)["code"] == "READY"]
+        await push_text(
+            user_id,
+            "ตรวจคิวติดตามแล้วค่ะ\n"
+            f"• งานเปิดทั้งหมด: {len(active)}\n"
+            f"• มีคิวแล้ว: {len(active)-len(missing)}\n"
+            f"• ถึงเวลาติดตาม: {len(due)}\n"
+            f"• พร้อมส่งในรอบถัดไป: {len(ready)}\n"
+            f"• รอเวลาในอนาคต: {len(future)}\n"
+            f"• หลุดจากคิว: {len(missing)}"
+        )
+        return
+
+    if low in ("วันนี้มีงานไหนที่ควรตามแต่ยังไม่ได้ตาม", "วันนี้มีงานอะไรควรตามแต่ยังไม่ได้ตาม"):
+        now = datetime.utcnow()
+        with SessionLocal() as db:
+            active = list(db.scalars(select(Task).where(Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]))).all())
+            rows = []
+            for task in active:
+                diag = followup_diagnostic(db, task, now)
+                if diag["code"] in {"READY", "MISSING_NEXT_REMINDER"} and diag["sent_today"] == 0:
+                    rows.append((task, diag))
+        if not rows:
+            await push_text(user_id, "ตอนนี้ไม่พบงานที่ควรตามแต่ยังไม่ได้ตามค่ะ")
+            return
+        await push_text(user_id, "งานที่ควรตรวจเพิ่มค่ะ\n\n" + "\n\n".join(_diagnostic_text(t, d) for t, d in rows[:10]))
+        return
+
+    if low == "ซ่อมคิวติดตาม":
+        with SessionLocal() as db:
+            repaired = repair_missing_reminder_schedule(db, datetime.utcnow())
+        await push_text(user_id, f"ตรวจและซ่อมคิวแล้วค่ะ ซ่อม {repaired} รายการ")
+        return
+
+    if low.startswith("ซ่อมคิว "):
+        code = raw.split(maxsplit=1)[1].strip().upper()
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            if task.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+                await push_text(user_id, f"{code} ปิดแล้ว จึงไม่ต้องซ่อมคิวค่ะ")
+                return
+            if task.next_reminder_at is not None:
+                await push_text(user_id, f"{code} มีคิวอยู่แล้วค่ะ\nติดตามครั้งถัดไป: {_fmt_local_dt(task.next_reminder_at)}")
+                return
+            task.next_reminder_at = schedule_next_followup(task, datetime.utcnow())
+            record_task_event(
+                db, task, "OWNER_QUEUE_REPAIR", actor_name=settings.owner_display_name,
+                actor_user_id=user_id, text="ซ่อมคิวจาก LINE ส่วนตัว", commit=False,
+            )
+            db.commit()
+            when = _fmt_local_dt(task.next_reminder_at)
+        await push_text(user_id, f"ซ่อมคิว {code} แล้วค่ะ\nติดตามครั้งถัดไป: {when}")
+        return
+
+    if low.startswith("เลื่อนติดตาม "):
+        m = re.match(r"^เลื่อนติดตาม\s+(FU-\d{6}-\d{4,})\s+(.+)$", raw, flags=re.IGNORECASE)
+        if not m:
+            await push_text(user_id, "รูปแบบ: เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์ หรือ พรุ่งนี้ 14:00 ค่ะ")
+            return
+        code, when_text = m.group(1).upper(), m.group(2).strip()
+        new_time = extract_followup_commitment_at(when_text)
+        if not new_time:
+            await push_text(user_id, "ยังอ่านวัน/เวลาที่ต้องการไม่ได้ค่ะ เช่น วันศุกร์, พรุ่งนี้ 14:00, 20/09/2569")
+            return
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            task.next_reminder_at = new_time
+            record_task_event(
+                db, task, "OWNER_FOLLOWUP_RESCHEDULED", actor_name=settings.owner_display_name,
+                actor_user_id=user_id, text=f"เลื่อนติดตาม: {when_text}", commit=False,
+            )
+            db.commit()
+        await push_text(user_id, f"เลื่อนติดตาม {code} แล้วค่ะ\nครั้งถัดไป: {_fmt_local_dt(new_time)}")
+        return
+
+    if low in ("ดูรูปแบบการติดตามปัจจุบัน", "ดูโทนติดตาม", "ตั้งค่าการติดตาม"):
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+        await push_text(user_id, _owner_policy_summary(policy))
+        return
+
+    if low.startswith("ตั้งโทนติดตาม:") or low.startswith("ปรับโทนติดตาม:"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else ""
+        desc_low = desc.lower()
+        if "นุ่ม" in desc_low or "ไม่กดดัน" in desc_low:
+            tone = "soft"
+        elif "ตรง" in desc_low:
+            tone = "direct"
+        elif "สั้น" in desc_low or "กระชับ" in desc_low:
+            tone = "concise"
+        else:
+            tone = "friendly_professional"
+        changes = {"tone": tone, "custom_instruction": desc}
+        if "สั้น" in desc_low or "กระชับ" in desc_low:
+            changes.update({"max_lines": 2, "max_chars": 160})
+        with SessionLocal() as db:
+            policy = patch_followup_policy(db, **changes)
+        await push_text(user_id, "ปรับโทนการติดตามแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low in ("ติดตามให้สั้นลง", "ปรับข้อความติดตามให้สั้นลง"):
+        with SessionLocal() as db:
+            policy = patch_followup_policy(db, tone="concise", max_lines=2, max_chars=150)
+        await push_text(user_id, "ปรับให้ข้อความติดตามสั้นลงแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low in ("ติดตามให้นุ่มนวลขึ้น", "ปรับข้อความติดตามให้นุ่มนวลขึ้น"):
+        with SessionLocal() as db:
+            policy = patch_followup_policy(db, tone="soft")
+        await push_text(user_id, "ปรับให้ข้อความติดตามนุ่มนวลขึ้นแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low in ("ติดตามแบบตรงประเด็น", "ปรับข้อความติดตามให้ตรงประเด็น"):
+        with SessionLocal() as db:
+            policy = patch_followup_policy(db, tone="direct")
+        await push_text(user_id, "ปรับเป็นโทนตรงประเด็นแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low.startswith("ตั้งความยาวติดตาม:"):
+        body = raw.split(":", 1)[1] if ":" in raw else ""
+        lm = re.search(r"(\d+)\s*บรรทัด", body)
+        cm = re.search(r"(\d+)\s*(?:ตัวอักษร|ตัว)", body)
+        changes = {}
+        if lm:
+            changes["max_lines"] = max(1, min(4, int(lm.group(1))))
+        if cm:
+            changes["max_chars"] = max(80, min(400, int(cm.group(1))))
+        if not changes:
+            await push_text(user_id, "รูปแบบ: ตั้งความยาวติดตาม: 2 บรรทัด 180 ตัวอักษร ค่ะ")
+            return
+        with SessionLocal() as db:
+            policy = patch_followup_policy(db, **changes)
+        await push_text(user_id, "ปรับความยาวแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low.startswith("ห้ามใช้คำว่า") or low.startswith("อย่าใช้คำว่า"):
+        phrase = _extract_quoted_phrase(raw)
+        if not phrase:
+            await push_text(user_id, 'พิมพ์เช่น: ห้ามใช้คำว่า "ขออัปเดต" ค่ะ')
+            return
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+            avoid = list(policy.get("avoid_phrases") or [])
+            if phrase not in avoid:
+                avoid.append(phrase)
+            policy = patch_followup_policy(db, avoid_phrases=avoid)
+        await push_text(user_id, f"รับทราบค่ะ จะหลีกเลี่ยงคำว่า “{phrase}” ในข้อความติดตาม\n" + _owner_policy_summary(policy))
+        return
+
+    if low.startswith("เลิกห้ามใช้คำว่า"):
+        phrase = _extract_quoted_phrase(raw)
+        if not phrase:
+            await push_text(user_id, 'พิมพ์เช่น: เลิกห้ามใช้คำว่า "ขออัปเดต" ค่ะ')
+            return
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+            avoid = [x for x in policy.get("avoid_phrases") or [] if x != phrase]
+            policy = patch_followup_policy(db, avoid_phrases=avoid)
+        await push_text(user_id, f"นำ “{phrase}” ออกจากรายการคำที่หลีกเลี่ยงแล้วค่ะ")
+        return
+
+    if low in ("ทดลองข้อความติดตาม", "พรีวิวข้อความติดตาม", "preview ข้อความติดตาม"):
+        await _send_followup_preview(user_id)
+        return
+
+    if low in ("คืนค่ารูปแบบติดตาม", "รีเซ็ตรูปแบบติดตาม"):
+        with SessionLocal() as db:
+            policy = reset_followup_policy(db)
+        await push_text(user_id, "คืนค่ารูปแบบการติดตามเป็นค่าเริ่มต้นแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
 
     if low.startswith("ลบ "):
         parts = raw.split(maxsplit=1)
@@ -1977,7 +2332,16 @@ async def handle_owner_command(user_id: str, text: str):
         "• รวมชื่อ Tong Thanakrit = ต้น\n"
         "• สรุปเช้า / สรุปเย็น\n"
         "• ปิด FU-xxxxxx-xxxx\n"
-        "• ลบ FU-xxxxxx-xxxx"
+        "• ลบ FU-xxxxxx-xxxx\n"
+        "• ทำไมไม่ตาม FU-xxxxxx-xxxx\n"
+        "• ตรวจคิวติดตาม / งานไหนหลุดจากคิวติดตาม\n"
+        "• ซ่อมคิว FU-xxxxxx-xxxx / ซ่อมคิวติดตาม\n"
+        "• เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์\n"
+        "• ดูรูปแบบการติดตามปัจจุบัน\n"
+        "• ตั้งโทนติดตาม: เป็นกันเอง กระชับ ไม่กดดัน\n"
+        "• ห้ามใช้คำว่า \"ขออัปเดต\"\n"
+        "• ทดลองข้อความติดตาม\n"
+        "• คืนค่ารูปแบบติดตาม"
     )
 
 
@@ -2188,10 +2552,10 @@ async def reminder_scan(force: bool = False):
 
                 if is_pre_due:
                     due_text = format_due_local(t)
-                    body = (
+                    body = apply_followup_policy(db, (
                         f"{greeting} เรื่อง{topic}กำหนด {due_text} นะคะ\n"
                         f"ตอนนี้ยังเป็นไปตามแผนอยู่ไหมคะ"
-                    )
+                    ))
                     # After the advance reminder, the next check is the due time itself.
                     t.next_reminder_at = schedule_next_followup(t, t.due_at)
                 elif t.status in ("OVERDUE", "WAITING", "IN_PROGRESS"):

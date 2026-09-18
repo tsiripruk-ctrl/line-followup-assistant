@@ -374,3 +374,30 @@ Automated regression tests: `30 passed` ณ ตอน build รุ่นนี�
 - Existing-task matching still runs first, so real questions such as “เรื่องมิเตอร์ถึงไหนแล้ว” can resolve normally when there is a confident match.
 - Directed @mention work questions from v0.6.37 remain supported.
 - Quiet-by-default is preserved: ordinary conversation is never converted into a new FU merely because it contains question words such as “ไหม/หรือเปล่า”.
+
+## v0.6.39 — Owner Control Center
+
+เพิ่มการควบคุมและตรวจสอบระบบจาก LINE ส่วนตัวของ Owner โดยไม่ต้องเปิด Render/Dashboard ทุกครั้ง
+
+### Follow-up diagnostics
+- `ทำไมไม่ตาม FU-xxxxxx-xxxx`
+- `ทำไมวันนี้ไม่ตาม MARCH`
+- `ทำไมงานชุมแสงไม่ถูกตาม`
+- `ตรวจคิวติดตาม`
+- `งานไหนหลุดจากคิวติดตาม`
+- `ซ่อมคิว FU-xxxxxx-xxxx`
+- `ซ่อมคิวติดตาม`
+- `เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์`
+
+### Runtime language controls
+- `ดูรูปแบบการติดตามปัจจุบัน`
+- `ตั้งโทนติดตาม: เป็นกันเอง กระชับ ไม่กดดัน`
+- `ติดตามให้สั้นลง`
+- `ติดตามให้นุ่มนวลขึ้น`
+- `ติดตามแบบตรงประเด็น`
+- `ตั้งความยาวติดตาม: 2 บรรทัด 180 ตัวอักษร`
+- `ห้ามใช้คำว่า "ขออัปเดต"`
+- `ทดลองข้อความติดตาม`
+- `คืนค่ารูปแบบติดตาม`
+
+การตั้งค่าถูกเก็บใน `owner_preferences` และมีผลกับ Reminder รอบถัดไปทันทีโดยไม่ต้อง Deploy ใหม่ ส่วนสถานะงาน, Task Matching, Completion Safety, Quiet-by-default, working hours 08:30–17:30 และ daily follow-up limits ยังคงทำงานตามเดิม

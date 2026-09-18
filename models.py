@@ -104,3 +104,16 @@ class SystemEvent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     event_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class OwnerPreference(Base):
+    """Persistent owner-controlled runtime preference.
+
+    Values are intentionally stored as text so conversational controls can be
+    expanded without destructive schema migrations. The table is created by
+    SQLAlchemy create_all() on startup.
+    """
+    __tablename__ = "owner_preferences"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -1,11 +1,12 @@
 from datetime import datetime, timedelta, timezone
 import re
+import json
 from difflib import SequenceMatcher
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
-from models import Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage
+from models import Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
 from config import settings
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
@@ -1186,6 +1187,108 @@ def _appointment_like(value: str | None) -> bool:
     )) or bool(re.search(r"\b\d{1,2}[/:]\d{1,2}(?:[/:]\d{2,4})?\b", x))
 
 
+
+DEFAULT_FOLLOWUP_POLICY = {
+    "tone": "friendly_professional",
+    "max_lines": 2,
+    "max_chars": 200,
+    "avoid_phrases": [],
+    "overdue_style": "ask_expected_completion",
+    "waiting_style": "specific_dependency",
+    "custom_instruction": "",
+}
+
+
+def get_followup_policy(db: Session) -> dict:
+    """Return owner-controlled follow-up language policy with safe defaults."""
+    row = db.scalar(select(OwnerPreference).where(OwnerPreference.key == "followup_policy"))
+    policy = dict(DEFAULT_FOLLOWUP_POLICY)
+    if row and row.value:
+        try:
+            loaded = json.loads(row.value)
+            if isinstance(loaded, dict):
+                policy.update({k: v for k, v in loaded.items() if k in policy})
+        except Exception:
+            pass
+    try:
+        policy["max_lines"] = max(1, min(4, int(policy.get("max_lines") or 2)))
+    except Exception:
+        policy["max_lines"] = 2
+    try:
+        policy["max_chars"] = max(80, min(400, int(policy.get("max_chars") or 200)))
+    except Exception:
+        policy["max_chars"] = 200
+    if not isinstance(policy.get("avoid_phrases"), list):
+        policy["avoid_phrases"] = []
+    policy["avoid_phrases"] = [str(x).strip() for x in policy["avoid_phrases"] if str(x).strip()][:30]
+    return policy
+
+
+def save_followup_policy(db: Session, policy: dict) -> dict:
+    clean = dict(DEFAULT_FOLLOWUP_POLICY)
+    clean.update({k: v for k, v in (policy or {}).items() if k in clean})
+    # Reuse the validator/normalizer through a temporary serialization round.
+    row = db.scalar(select(OwnerPreference).where(OwnerPreference.key == "followup_policy"))
+    payload = json.dumps(clean, ensure_ascii=False)
+    if row:
+        row.value = payload
+        row.updated_at = utcnow()
+    else:
+        row = OwnerPreference(key="followup_policy", value=payload)
+        db.add(row)
+    db.commit()
+    return get_followup_policy(db)
+
+
+def patch_followup_policy(db: Session, **changes) -> dict:
+    policy = get_followup_policy(db)
+    policy.update({k: v for k, v in changes.items() if k in DEFAULT_FOLLOWUP_POLICY})
+    return save_followup_policy(db, policy)
+
+
+def reset_followup_policy(db: Session) -> dict:
+    row = db.scalar(select(OwnerPreference).where(OwnerPreference.key == "followup_policy"))
+    if row:
+        db.delete(row)
+        db.commit()
+    return dict(DEFAULT_FOLLOWUP_POLICY)
+
+
+def apply_followup_policy(db: Session, text: str) -> str:
+    """Apply owner language controls without changing task-state semantics."""
+    policy = get_followup_policy(db)
+    out = str(text or "").strip()
+    tone = str(policy.get("tone") or "friendly_professional")
+
+    if tone == "soft":
+        out = out.replace("เลยกำหนดแล้วค่ะ", "เห็นว่ากำหนดเดิมผ่านแล้วนะคะ")
+        out = out.replace("ตอนนี้คาดว่าจะเรียบร้อยได้ประมาณเมื่อไหร่คะ", "พอจะประเมินได้ไหมคะว่าน่าจะเรียบร้อยประมาณเมื่อไหร่")
+    elif tone == "direct":
+        out = out.replace("ล่าสุด: ", "")
+        out = out.replace("วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ", "วันนี้ถึงวันที่นัดไว้แล้วค่ะ")
+    elif tone == "concise":
+        out = out.replace(" วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ", " วันนี้ถึงวันที่นัดไว้แล้วค่ะ")
+
+    for phrase in policy.get("avoid_phrases") or []:
+        if phrase and phrase in out:
+            out = out.replace(phrase, "")
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip(" \n-,:;")
+
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    max_lines = int(policy.get("max_lines") or 2)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    out = "\n".join(lines)
+    max_chars = int(policy.get("max_chars") or 200)
+    if len(out) > max_chars:
+        clipped = out[:max_chars - 1].rstrip()
+        # Prefer clipping at a whitespace boundary so Thai/English mixed text stays readable.
+        if " " in clipped[-30:]:
+            clipped = clipped.rsplit(" ", 1)[0]
+        out = clipped.rstrip(" ,:;-_") + "…"
+    return out
+
 def _waiting_question(waiting_on: str, reminder_count: int = 0) -> str:
     """Ask only about the unresolved dependency, using its actual business state."""
     w = _normalize_waiting_phrase(waiting_on)
@@ -1259,41 +1362,27 @@ def _progress_question(task: Task) -> str:
 
 
 def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
-    """Humanized, state-driven follow-up text for v0.6.31.
-
-    The function first validates task-local memory, then asks only about the current
-    unresolved dependency / next action. Variation is deterministic within the
-    selected state style; it is never random sentence swapping.
-    """
+    """State-driven follow-up text, finalized by the owner's live language policy."""
     structured_memory = bool((task.progress_summary or "").strip())
     memory = (task.progress_summary or "").strip()
     if not memory:
         ev = latest_status_reply(db, task)
         memory = summarize_progress_update(ev.text if ev else None)
     topic = _clip_message_piece(task_reference_label(db, task), 76)
-    # Structured progress_snapshot is written only after a task has already been
-    # resolved. Treat it as trusted task-local state. The integrity guard remains
-    # for legacy timeline fallback, where old contaminated events may exist.
     if memory and not structured_memory and not _memory_relevant_to_task(db, task, memory):
         print("task memory rejected as cross-topic contamination:", task.task_code, repr(memory), "base=", repr(_base_task_text(db, task)))
         memory = ""
 
-    # If there is no trusted progress yet, use the stable original task only. This
-    # still gives a natural first follow-up without fabricating memory.
+    def finish(value: str) -> tuple[str, bool]:
+        return apply_followup_policy(db, value), True
+
     if not memory:
         if task.status == "OVERDUE":
             q = _progress_question(task)
-            return (f"{assignee_token}คะ เรื่อง{topic}เลยกำหนดแล้วค่ะ\n{q}", True)
-        return (f"{assignee_token}คะ เรื่อง{topic} ตอนนี้ไปถึงไหนแล้วคะ", True)
+            return finish(f"{assignee_token}คะ เรื่อง{topic}เลยกำหนดแล้วค่ะ\n{q}")
+        return finish(f"{assignee_token}คะ เรื่อง{topic} ตอนนี้ไปถึงไหนแล้วคะ")
 
     memory = _clip_message_piece(memory, 100)
-
-    # v0.6.35 consistency guard: a task must never send a reminder that says
-    # "ล่าสุด: ...เรียบร้อยแล้ว" while still asking for more progress. Structured
-    # snapshots can outlive an older state bug or migration. Keep the reminder
-    # human-safe by falling back to the stable task topic when the snapshot itself
-    # looks like a whole-task completion statement. State transition remains the
-    # responsibility of the message-processing path, so this guard does not auto-close.
     completion_like = (
         any(x in memory for x in ("เรียบร้อยแล้ว", "เสร็จแล้ว", "เสร็จเรียบร้อย", "จบแล้ว"))
         and not any(x in memory for x in ("ยังไม่", "รอ", "แต่", "ติด", "เหลือ"))
@@ -1303,29 +1392,14 @@ def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner
         memory = ""
 
     question = _progress_question(task)
-
-    # Appointment / future-commitment follow-ups should sound like a checkpoint, not
-    # a generic status chase. Date-aware scheduling guarantees this is not sent early.
     if task.next_action and _appointment_like(task.next_action):
-        return (
+        return finish(
             f"{assignee_token}คะ เรื่อง{topic} วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ\n"
-            f"ตอนนี้ดำเนินการเป็นอย่างไรบ้างคะ",
-            True,
+            f"ตอนนี้ดำเนินการเป็นอย่างไรบ้างคะ"
         )
-
-    # Waiting tasks ask only about the dependency; do not repeat completed milestones.
     if task.status == "WAITING" or task.waiting_on:
-        return (
-            f"{assignee_token}คะ เรื่อง{topic} ล่าสุด: {memory}\n{question}",
-            True,
-        )
-
-    # In-progress / overdue tasks retain just enough context to make the question feel
-    # continuous. No full timeline dump, no generic "ขออัปเดต" template.
-    return (
-        f"{assignee_token}คะ เรื่อง{topic} ล่าสุด: {memory}\n{question}",
-        True,
-    )
+        return finish(f"{assignee_token}คะ เรื่อง{topic} ล่าสุด: {memory}\n{question}")
+    return finish(f"{assignee_token}คะ เรื่อง{topic} ล่าสุด: {memory}\n{question}")
 
 def clean_display_name(value: str | None) -> str:
     if not value:
