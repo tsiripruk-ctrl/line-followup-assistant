@@ -28,10 +28,11 @@ from service import (
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
-    get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy
+    get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
+    get_runtime_preference, set_runtime_preference, owner_reopen_task_state
 )
 
-VERSION = "0.6.39"
+VERSION = "0.6.40"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -153,6 +154,9 @@ def health():
         "owner_followup_preview": True,
         "runtime_followup_style_update": True,
         "owner_followup_reschedule": True,
+        "owner_status_correction": True,
+        "owner_reopen_completed_task": True,
+        "owner_last_task_context": True,
     }
 
 
@@ -1954,6 +1958,26 @@ async def _send_followup_preview(user_id: str):
         return
     await push_text(user_id, _owner_policy_summary(policy) + "\n\n" + "\n\n".join(previews))
 
+def _remember_owner_task_context(db, task: Task | None) -> None:
+    if task and task.task_code:
+        set_runtime_preference(db, "owner_last_task_code", task.task_code)
+
+
+def _owner_reactivate_task(db, task: Task, *, user_id: str, reason: str = "") -> tuple[str, datetime]:
+    now = datetime.utcnow()
+    next_at = schedule_next_followup(task, now + timedelta(minutes=1))
+    new_status = owner_reopen_task_state(
+        db, task, next_reminder_at=next_at, actor_name=settings.owner_display_name,
+        actor_user_id=user_id, reason=reason, now_utc=now,
+    )
+    return new_status, task.next_reminder_at
+
+
+def _extract_fu_code(raw: str) -> str | None:
+    m = re.search(r"FU-\d{6}-\d{4,}", raw or "", flags=re.IGNORECASE)
+    return m.group(0).upper() if m else None
+
+
 async def handle_owner_command(user_id: str, text: str):
     raw = text.strip()
     low = raw.lower()
@@ -1966,9 +1990,56 @@ async def handle_owner_command(user_id: str, text: str):
             if not task:
                 await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
                 return
+            _remember_owner_task_context(db, task)
             diag = followup_diagnostic(db, task)
             message = _diagnostic_text(task, diag)
         await push_text(user_id, message)
+        return
+
+    # Owner state correction: reopen a task that was marked complete by mistake.
+    # Explicit FU code is preferred; otherwise the most recently inspected task is used.
+    reopen_phrase = (
+        raw.startswith("ติดตามต่อ ")
+        or raw.startswith("ให้ติดตามต่อ")
+        or ("ติดตามต่อ" in raw and "ยังไม่เสร็จ" in raw)
+        or raw.startswith("เปิดงาน ")
+        or raw.startswith("เปิดใหม่ ")
+        or raw.startswith("แก้สถานะ ") and "ยังไม่เสร็จ" in raw
+        or raw in {"งานนี้ยังไม่เสร็จ", "ให้ติดตามต่อ เพราะยังไม่เสร็จ", "ติดตามต่อ เพราะยังไม่เสร็จ"}
+    )
+    if reopen_phrase:
+        explicit_code = _extract_fu_code(raw)
+        with SessionLocal() as db:
+            code = explicit_code or get_runtime_preference(db, "owner_last_task_code")
+            if not code:
+                await push_text(user_id, "ระบุเลขงานด้วยนะคะ เช่น ติดตามต่อ FU-260911-0013 เพราะยังไม่เสร็จ")
+                return
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            _remember_owner_task_context(db, task)
+            if task.status == "CANCELLED" and not (raw.startswith("เปิดงาน ") or raw.startswith("เปิดใหม่ ")):
+                await push_text(user_id, f"{code} ถูกยกเลิกอยู่ค่ะ ถ้าต้องการเปิดใหม่ให้พิมพ์ “เปิดงาน {code}”")
+                return
+            if task.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+                if task.next_reminder_at is None:
+                    task.next_reminder_at = schedule_next_followup(task, datetime.utcnow() + timedelta(minutes=1))
+                    record_task_event(
+                        db, task, "OWNER_QUEUE_REPAIR", actor_name=settings.owner_display_name,
+                        actor_user_id=user_id, text="เจ้าของยืนยันให้ติดตามงานต่อ", commit=False,
+                    )
+                    db.commit()
+                when = _fmt_local_dt(task.next_reminder_at)
+                await push_text(user_id, f"{code} ยังเป็นงานเปิดอยู่ค่ะ\nจะติดตามต่อให้ตามคิวเดิม\nครั้งถัดไป: {when}")
+                return
+            reason = raw
+            new_status, when_utc = _owner_reactivate_task(db, task, user_id=user_id, reason=reason)
+            title = task.title
+        await push_text(
+            user_id,
+            f"เปิดงาน {code} กลับมาติดตามต่อแล้วค่ะ\n{title}\nสถานะใหม่: {STATUS_THAI.get(new_status, new_status)}\nติดตามครั้งถัดไป: {_fmt_local_dt(when_utc)}"
+        )
         return
 
     if low.startswith("ทำไมวันนี้ไม่ตาม "):
@@ -2334,6 +2405,7 @@ async def handle_owner_command(user_id: str, text: str):
         "• ปิด FU-xxxxxx-xxxx\n"
         "• ลบ FU-xxxxxx-xxxx\n"
         "• ทำไมไม่ตาม FU-xxxxxx-xxxx\n"
+        "• ติดตามต่อ FU-xxxxxx-xxxx เพราะยังไม่เสร็จ / งานนี้ยังไม่เสร็จ\n"
         "• ตรวจคิวติดตาม / งานไหนหลุดจากคิวติดตาม\n"
         "• ซ่อมคิว FU-xxxxxx-xxxx / ซ่อมคิวติดตาม\n"
         "• เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์\n"

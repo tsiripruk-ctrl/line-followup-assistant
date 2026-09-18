@@ -401,3 +401,16 @@ Automated regression tests: `30 passed` ณ ตอน build รุ่นนี�
 - `คืนค่ารูปแบบติดตาม`
 
 การตั้งค่าถูกเก็บใน `owner_preferences` และมีผลกับ Reminder รอบถัดไปทันทีโดยไม่ต้อง Deploy ใหม่ ส่วนสถานะงาน, Task Matching, Completion Safety, Quiet-by-default, working hours 08:30–17:30 และ daily follow-up limits ยังคงทำงานตามเดิม
+
+
+## v0.6.40 – Owner Status Correction & Reopen Tracking
+
+เพิ่มคำสั่ง Owner Private สำหรับแก้สถานะงานที่ถูกปิดผิด และเปิดคิวติดตามต่อโดยไม่ลบประวัติเดิม
+
+ตัวอย่าง:
+- `ทำไมไม่ตาม FU-260911-0013`
+- `ให้ติดตามต่อ เพราะยังไม่เสร็จ` (ใช้กับงานล่าสุดที่เพิ่งตรวจ)
+- `ติดตามต่อ FU-260911-0013 เพราะยังไม่เสร็จ`
+- `เปิดงาน FU-260911-0013`
+
+ระบบจะคืนสถานะก่อนถูกปิดเมื่อหาได้จาก Timeline, ตั้ง `next_reminder_at` ใหม่ในเวลางาน, และบันทึก `OWNER_STATUS_CORRECTION` / `REMINDER_REACTIVATED`.

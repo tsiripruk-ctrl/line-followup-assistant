@@ -1978,3 +1978,76 @@ def find_task_for_explicit_query(
     if len(rows) > 1 and float(rows[1].get("content") or 0.0) >= best_score - 0.10:
         return None, best_score, [r["task"] for r in rows[:3] if float(r.get("content") or 0.0) >= 0.55]
     return best["task"], best_score, []
+
+
+# v0.6.40 owner private-context helpers ---------------------------------------
+def get_runtime_preference(db: Session, key: str, default: str | None = None) -> str | None:
+    row = db.scalar(select(OwnerPreference).where(OwnerPreference.key == key))
+    return row.value if row and row.value is not None else default
+
+
+def set_runtime_preference(db: Session, key: str, value: str) -> str:
+    row = db.scalar(select(OwnerPreference).where(OwnerPreference.key == key))
+    if row:
+        row.value = str(value)
+        row.updated_at = utcnow()
+    else:
+        row = OwnerPreference(key=key, value=str(value))
+        db.add(row)
+    db.commit()
+    return str(value)
+
+
+def owner_reopen_task_state(
+    db: Session,
+    task: Task,
+    *,
+    next_reminder_at: datetime,
+    actor_name: str | None = None,
+    actor_user_id: str | None = None,
+    reason: str = "",
+    now_utc: datetime | None = None,
+) -> str:
+    """Correct a falsely-completed task back to an active state.
+
+    This is intentionally owner-only at the routing layer. The function preserves
+    history, restores the active status immediately preceding the latest completion
+    when available, and creates explicit correction/reactivation timeline events.
+    """
+    now = now_utc or utcnow()
+    old_status = task.status
+    latest_completion = db.scalar(
+        select(TaskEvent).where(
+            TaskEvent.task_id == task.id,
+            TaskEvent.new_status == "COMPLETED",
+        ).order_by(TaskEvent.created_at.desc(), TaskEvent.id.desc()).limit(1)
+    )
+    if latest_completion and latest_completion.old_status in OPEN_STATUSES:
+        new_status = latest_completion.old_status
+    elif task.due_at and task.due_at < now:
+        new_status = "OVERDUE"
+    else:
+        new_status = "IN_PROGRESS"
+
+    task.status = new_status
+    task.next_reminder_at = next_reminder_at
+    correction = (reason or "เจ้าของยืนยันว่างานยังไม่เสร็จ").strip()
+    current_progress = task.progress_summary or ""
+    if not current_progress or any(k in current_progress.lower() for k in ("เรียบร้อย", "เสร็จ", "ปิดงาน", "completed")):
+        task.progress_summary = correction
+    current_action = task.next_action or ""
+    if not current_action or any(k in current_action.lower() for k in ("ปิดงาน", "เสร็จ", "เรียบร้อย", "completed")):
+        task.next_action = "ติดตามความคืบหน้าต่อ"
+    task.last_progress_at = now
+
+    record_task_event(
+        db, task, "OWNER_STATUS_CORRECTION", actor_name=actor_name, actor_user_id=actor_user_id,
+        text=correction, old_status=old_status, new_status=new_status, commit=False,
+    )
+    record_task_event(
+        db, task, "REMINDER_REACTIVATED", actor_name=actor_name, actor_user_id=actor_user_id,
+        text="เปิดคิวติดตามอีกครั้ง", old_status=new_status, new_status=new_status, commit=False,
+    )
+    db.commit()
+    db.refresh(task)
+    return new_status
