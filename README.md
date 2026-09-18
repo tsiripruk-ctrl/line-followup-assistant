@@ -1,6 +1,14 @@
-# LINE Follow-up Assistant v0.6.44
+# LINE Follow-up Assistant v0.6.45
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
+
+## New in v0.6.45 — Quoted Human Message Context Safety
+
+- A quoted completion can no longer close a merely recent/unrelated task.
+- Quoted human messages resolve from exact `TaskEvent.message_id` first, then from the quoted message text with a strict unique topic match.
+- The unsafe same-user recent-task fallback is disabled for completion.
+- If the quoted context cannot identify one task confidently, the system stays safe and does not close anything.
+
 
 ## New in v0.6.6 — People Registry Profile
 

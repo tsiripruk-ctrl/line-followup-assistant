@@ -6,7 +6,7 @@ from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, func, delete, or_
 from sqlalchemy.orm import Session
-from models import Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
+from models import Message, Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
 from config import settings
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
@@ -60,6 +60,87 @@ def link_outbound_task_message(
     return row
 
 
+
+
+
+def resolve_quoted_task_context(
+    db: Session, group_id: str, quoted_message_id: str, *, min_text_confidence: float = 0.85,
+) -> tuple[Task | None, str, float]:
+    """Resolve a quoted LINE message to one active task without recency guessing.
+
+    Resolution order is deliberately evidence-first:
+      1) assistant outbound message explicitly linked to a task,
+      2) original task source message id,
+      3) a task event recorded from the exact quoted human message id,
+      4) semantic/topic match using the exact quoted human message text.
+
+    The old v0.6.44 fallback that selected a merely *recent* task owned/referenced by
+    the same human is intentionally excluded because it can close an unrelated task.
+    """
+    qid = str(quoted_message_id or "").strip()
+    if not qid:
+        return None, "missing_quoted_message_id", 0.0
+
+    # 1) Strongest evidence: this is one of the assistant's task-linked messages.
+    link = db.scalar(select(OutboundTaskMessage).where(
+        OutboundTaskMessage.line_message_id == qid,
+        OutboundTaskMessage.group_id == group_id,
+    ))
+    if link:
+        task = db.get(Task, link.task_id)
+        if task and task.group_id == group_id and task.status in OPEN_STATUSES:
+            return task, "outbound_task_message", 1.0
+
+    # 2) Original message that created the task.
+    task = db.scalar(select(Task).where(
+        Task.source_message_id == qid,
+        Task.group_id == group_id,
+        Task.status.in_(OPEN_STATUSES),
+    ))
+    if task:
+        return task, "task_source_message", 1.0
+
+    # 3) Exact human message already recorded in this task's timeline.
+    rows = db.scalars(
+        select(Task)
+        .join(TaskEvent, TaskEvent.task_id == Task.id)
+        .where(
+            Task.group_id == group_id,
+            Task.status.in_(OPEN_STATUSES),
+            TaskEvent.message_id == qid,
+        )
+        .order_by(TaskEvent.created_at.desc(), Task.id.desc())
+    ).all()
+    unique = []
+    seen = set()
+    for candidate in rows:
+        if candidate.id in seen:
+            continue
+        seen.add(candidate.id)
+        unique.append(candidate)
+    if len(unique) == 1:
+        return unique[0], "task_event_message_id", 1.0
+    if len(unique) > 1:
+        return None, "ambiguous_task_event_message_id", 0.0
+
+    # 4) The quoted message was written by a human and exists in message history.
+    # Match from the quoted text itself, never from a different recent task.
+    quoted = db.scalar(select(Message).where(
+        Message.line_message_id == qid,
+        Message.source_id == group_id,
+    ))
+    quoted_text = (quoted.text or "").strip() if quoted else ""
+    if quoted_text:
+        target, score, ambiguous = find_task_for_explicit_query(
+            db, group_id, quoted_text, sender_name=None, assignee_name=None, assignee_user_id=None
+        )
+        if target and target.status in OPEN_STATUSES and not ambiguous and float(score or 0.0) >= float(min_text_confidence):
+            return target, "quoted_human_message_text", float(score or 0.0)
+        if ambiguous:
+            return None, "ambiguous_quoted_human_message_text", float(score or 0.0)
+        return None, "unmatched_quoted_human_message_text", float(score or 0.0)
+
+    return None, "unmapped_quoted_message", 0.0
 
 def recent_explicit_query_task(
     db: Session, group_id: str, user_id: str | None, *, within_minutes: int = 30,

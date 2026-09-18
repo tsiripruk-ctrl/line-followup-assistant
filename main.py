@@ -30,10 +30,10 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
     normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
-    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, recent_explicit_query_task
+    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context
 )
 
-VERSION = "0.6.44"
+VERSION = "0.6.45"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -173,7 +173,11 @@ def health():
         "task_linked_outbound_reply": True,
         "bare_quoted_completion": True,
         "status_reply_quote_completion": True,
-        "legacy_status_quote_recovery": True,
+        "legacy_status_quote_recovery": False,
+        "quoted_human_message_task_resolution": True,
+        "quoted_event_message_id_resolution": True,
+        "quoted_text_semantic_resolution": True,
+        "unsafe_recent_quote_fallback_disabled": True,
     }
 
 
@@ -1377,6 +1381,15 @@ async def _process_message(event: dict):
         changed = await handle_quoted_task_reply(
             source_id, user_id, display_name, quoted_message_id, extraction, text, msg["id"]
         )
+        # v0.6.45: a short completion reply to an unmapped quote must never fall
+        # through to recency/identity-based matching.  Silence is safer than closing
+        # a different task.  Exact task identity can be recovered only from the quoted
+        # message itself (outbound mapping, task event id, or quoted text).
+        if changed is None and is_safe_quoted_completion(text):
+            print("[UNRESOLVED_QUOTED_COMPLETION_BLOCKED]", {
+                "quoted_message_id": quoted_message_id, "sender": display_name, "text": text
+            })
+            return
         if changed is not None:
             # v0.6.35: acknowledgement must follow the *committed* quoted-reply result,
             # not the original AI extraction. Short quote replies such as "เรียบร้อยแล้ว"
@@ -1614,24 +1627,23 @@ async def handle_quoted_task_reply(
     canonical_sender = sender_name or "-"
     with SessionLocal() as db:
         try:
-            link = db.scalar(select(OutboundTaskMessage).where(
-                OutboundTaskMessage.line_message_id == str(quoted_message_id),
-                OutboundTaskMessage.group_id == group_id,
-            ))
-            target = db.get(Task, link.task_id) if link else None
+            target, quote_resolution_reason, quote_resolution_confidence = resolve_quoted_task_context(
+                db, group_id, quoted_message_id
+            )
+            if target:
+                print("[QUOTED_TASK_RESOLVED]", {
+                    "task": target.task_code,
+                    "reason": quote_resolution_reason,
+                    "confidence": quote_resolution_confidence,
+                    "quoted_message_id": quoted_message_id,
+                })
             if not target:
-                target = db.scalar(select(Task).where(
-                    Task.source_message_id == str(quoted_message_id),
-                    Task.group_id == group_id,
-                ))
-            if not target and quoted_completion:
-                # v0.6.44 recovery for assistant status/follow-up messages sent by older
-                # versions that did not persist their outbound LINE message id.  Recover
-                # only when this same human recently referenced exactly one active task.
-                target = recent_explicit_query_task(db, group_id, user_id, within_minutes=30)
-                if target:
-                    print("[LEGACY_QUOTE_RECOVERY]", {"task": target.task_code, "quoted_message_id": quoted_message_id})
-            if not target:
+                print("[QUOTED_TASK_UNRESOLVED]", {
+                    "reason": quote_resolution_reason,
+                    "confidence": quote_resolution_confidence,
+                    "quoted_message_id": quoted_message_id,
+                    "text": text,
+                })
                 return None
             if target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
                 return ""
