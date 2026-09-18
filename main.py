@@ -33,7 +33,7 @@ from service import (
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state
 )
 
-VERSION = "0.6.43"
+VERSION = "0.6.44"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
