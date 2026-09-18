@@ -17,7 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
-from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, parse_command_prefix, is_safe_quoted_completion
+from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, parse_command_prefix, is_safe_quoted_completion
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.36"
+VERSION = "0.6.37"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -106,6 +106,9 @@ def health():
         "passive_conversation_guard": True,
         "explicit_work_request_required_for_autocreate": True,
         "passive_chatter_no_followup": True,
+        "directed_question_new_task_fallback": True,
+        "project_optional_for_new_task_question": True,
+        "existing_task_first_for_directed_question": True,
         "mixed_progress_waiting_resolution": True,
         "working_hours_followup": True, "followup_window": "08:30-17:30",
         "daily_followup_limits": True, "staggered_group_followups": True,
@@ -976,7 +979,8 @@ async def handle_query_or_followup_intent(
     reply_token: str | None, quoted_message_id: str | None,
     message_id: str, text: str, intent_result,
     mentioned_name: str | None = None, mentioned_user_id: str | None = None,
-) -> bool:
+    allow_new_task_if_unmatched: bool = False,
+) -> str:
     """Handle STATUS_QUERY/FOLLOW_UP without creating or completing tasks."""
     with SessionLocal() as db:
         target = None
@@ -1036,7 +1040,7 @@ async def handle_query_or_followup_intent(
                     f"รับทราบค่ะ จะติดตามเรื่อง {target.title} ต่อจากงานเดิมให้นะคะ",
                     label="followup existing task",
                 )
-            return True
+            return "matched"
 
         if ambiguous:
             choices = "\n".join(f"{i}. {t.title}" for i, t in enumerate(ambiguous[:3], 1))
@@ -1046,7 +1050,15 @@ async def handle_query_or_followup_intent(
                 label="ambiguous status query",
             )
             print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE"})
-            return True
+            return "ambiguous"
+
+        # v0.6.37: a direct @mention + work-topic question can be the first
+        # request of a brand-new task. Existing-task matching has already run; if
+        # nothing matched, let the caller create a new task without requiring a
+        # project name.
+        if allow_new_task_if_unmatched:
+            print("[QUERY_TO_NEW_TASK]", {"reason": "mentioned_work_question_no_existing_match", "text": text})
+            return "unmatched_new_candidate"
 
         # Explicit query/follow-up with no confident match: do not create a duplicate.
         await safe_reply_or_push(
@@ -1055,7 +1067,7 @@ async def handle_query_or_followup_intent(
             label="unmatched followup clarification",
         )
         print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE"})
-        return True
+        return "handled"
 
 async def process_message(event: dict):
     """Process one LINE message without allowing an obvious status update to fail silently.
@@ -1179,7 +1191,11 @@ async def _process_message(event: dict):
     mentioned_name = primary_human_mention.get("display_name") if primary_human_mention else None
     mentioned_user_id = primary_human_mention.get("user_id") if primary_human_mention else None
     direct_human_task_request = bool(primary_human_mention) and is_direct_task_request(text)
-    explicit_work_request = bool(forced_command_intent == "NEW_TASK" or direct_human_task_request or has_explicit_work_request(text))
+    directed_new_work_question = bool(primary_human_mention) and is_directed_new_work_question(text)
+    explicit_work_request = bool(
+        forced_command_intent == "NEW_TASK" or direct_human_task_request or
+        directed_new_work_question or has_explicit_work_request(text)
+    )
     passive_conversation = looks_like_passive_conversation(text)
 
     # v0.6.28 HUMAN-DIRECTED REQUEST GUARD
@@ -1189,13 +1205,20 @@ async def _process_message(event: dict):
 
     print("[INTENT]", {"message": text, "intent": intent_result.intent, "confidence": intent_result.confidence, "reason": intent_result.reason})
     if intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
-        await handle_query_or_followup_intent(
+        query_outcome = await handle_query_or_followup_intent(
             group_id=source_id, user_id=user_id, sender_name=display_name,
             reply_token=reply_token, quoted_message_id=quoted_message_id,
             message_id=msg["id"], text=(command_text or text), intent_result=intent_result,
             mentioned_name=mentioned_name, mentioned_user_id=mentioned_user_id,
+            allow_new_task_if_unmatched=(intent_result.intent == "STATUS_QUERY" and directed_new_work_question),
         )
-        return
+        if query_outcome != "unmatched_new_candidate":
+            return
+        # v0.6.37: the message is a direct work question to a real LINE mention,
+        # but it did not match any existing task. Treat the question itself as the
+        # opening request for a new task. Project is optional.
+        print("[INTENT_OVERRIDE]", {"from": "STATUS_QUERY", "to": "NEW_TASK", "reason": "mentioned_work_question_no_existing_match"})
+        intent_result = type(intent_result)("NEW_TASK", 0.96, "mentioned_work_question_no_existing_match")
 
     # v0.6.14 FAST LOCAL STATUS PATH
     # Detect obvious Thai status updates *before* calling the LLM. This is important
@@ -1236,13 +1259,20 @@ async def _process_message(event: dict):
             reason="explicit งานใหม่ command prefix",
         )
 
-    # v0.6.28: explicit actionable @mention remains a task request even if AI
-    # focuses on the question clause and returns is_task=False.
-    if direct_human_task_request and not extraction.is_task:
+    # v0.6.28/v0.6.37: an actionable @mention, or an unmatched direct work
+    # question to a mentioned person, remains a new task even if AI focuses on the
+    # question clause and returns is_task=False.
+    if (direct_human_task_request or (directed_new_work_question and intent_result.intent == "NEW_TASK")) and not extraction.is_task:
+        fallback_title = text[:180]
+        if directed_new_work_question and not direct_human_task_request:
+            fallback_title = ("ตรวจสอบ " + re.sub(r"@\S+", "", text).strip())[:180]
         extraction = TaskExtraction(
-            is_task=True, confidence=0.98, title=text[:180],
+            is_task=True, confidence=0.98 if direct_human_task_request else 0.96, title=fallback_title,
             assignee_name=mentioned_name, status_signal="none", is_task_reply=False,
-            related_task_hint=text, reason="explicit human action request fallback",
+            related_task_hint=text, reason=(
+                "explicit human action request fallback" if direct_human_task_request
+                else "mentioned work question new-task fallback"
+            ),
         )
 
     # v0.6.36 PASSIVE CONVERSATION GUARD

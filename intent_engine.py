@@ -109,6 +109,44 @@ def is_direct_task_request(text: str | None) -> bool:
     return _has_any(value, DIRECT_TASK_REQUEST_PATTERNS)
 
 
+
+# v0.6.37: A direct @mention can introduce a brand-new work question even when
+# the sentence is grammatically a question (e.g. "ค่าซ่อมรถตีราคาครบแล้วถูกไหม").
+# This helper is intentionally conservative: it requires a recognizable work-topic
+# anchor and rejects classic follow-up/status wording. The caller must additionally
+# require a real LINE @mention and must search existing tasks first.
+WORK_TOPIC_PATTERNS = (
+    "งาน", "โครงการ", "ราคา", "ค่าบริการ", "ค่าซ่อม", "ซ่อม", "รถ",
+    "เอกสาร", "หนังสือ", "ใบเสนอราคา", "ใบแจ้งหนี้", "invoice", "po", "พีโอ",
+    "ส่งมอบ", "ส่งของ", "สินค้า", "อุปกรณ์", "สั่งซื้อ", "จัดซื้อ", "ติดตั้ง",
+    "ระบบ", "เบอร์ออฟฟิต", "เบอร์ออฟฟิศ", "บัญชี", "flowaccount", "flow account",
+    "กล้อง", "cctv", "มิเตอร์", "fiber", "ไฟเบอร์", "สัญญา", "ประกัน",
+    "ชำระ", "จ่าย", "อนุมัติ", "ตรวจรับ", "datasheet", "ดาต้าชีท",
+)
+
+DIRECTED_NEW_WORK_QUESTION_EXCLUSIONS = (
+    "ถึงไหน", "ความคืบหน้า", "ขออัปเดต", "อัปเดตหน่อย", "ตามเรื่อง",
+    "ติดตาม", "สถานะ", "งานค้าง", "ล่าสุดเป็นยังไง", "ล่าสุดเป็นอย่างไร",
+)
+
+def is_directed_new_work_question(text: str | None) -> bool:
+    """Return True for a work-topic question that may itself open a new task.
+
+    Important: this does *not* decide creation by itself. In main.py it is used only
+    when LINE metadata confirms a real @mention. Existing-task matching always runs
+    first; only an unmatched question may fall through to NEW_TASK creation.
+    """
+    raw = (text or "").strip()
+    value = _compact(raw)
+    if not value:
+        return False
+    if _has_any(value, DIRECTED_NEW_WORK_QUESTION_EXCLUSIONS):
+        return False
+    has_question = ("?" in raw or "？" in raw or _has_any(value, QUESTION_PATTERNS))
+    if not has_question:
+        return False
+    return _has_any(value, tuple(_compact(x) for x in WORK_TOPIC_PATTERNS))
+
 def classify_message_intent(text: str | None) -> IntentResult:
     raw = (text or "").strip()
     forced_intent, cleaned, prefix = parse_command_prefix(raw)
