@@ -30,6 +30,70 @@ def local_now() -> datetime:
 
 
 
+
+
+def link_outbound_task_message(
+    db: Session, *, line_message_id: str | None, task_id: int, group_id: str,
+    message_kind: str = "TASK_REPLY", commit: bool = True,
+) -> OutboundTaskMessage | None:
+    """Persist the LINE message id of one assistant message that refers to one task.
+
+    This is what makes a later LINE quote/reply an exact task identifier.  It is
+    deliberately idempotent because LINE/API retries may return/reuse the same id.
+    """
+    if not line_message_id:
+        return None
+    line_message_id = str(line_message_id)
+    existing = db.scalar(select(OutboundTaskMessage).where(
+        OutboundTaskMessage.line_message_id == line_message_id
+    ))
+    if existing:
+        return existing
+    row = OutboundTaskMessage(
+        line_message_id=line_message_id, task_id=task_id, group_id=group_id,
+        message_kind=message_kind,
+    )
+    db.add(row)
+    if commit:
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+
+def recent_explicit_query_task(
+    db: Session, group_id: str, user_id: str | None, *, within_minutes: int = 30,
+) -> Task | None:
+    """Conservative recovery for legacy task-specific assistant replies.
+
+    Before v0.6.44 some STATUS_QUERY/FOLLOW_UP assistant responses were sent without
+    persisting their outbound LINE message id.  If the same human immediately quotes
+    one of those old responses, recover only when that human has referenced exactly
+    one active task in this group during the recent window.
+    """
+    if not user_id:
+        return None
+    cutoff = utcnow() - timedelta(minutes=max(1, int(within_minutes)))
+    rows = db.scalars(
+        select(Task)
+        .join(TaskEvent, TaskEvent.task_id == Task.id)
+        .where(
+            Task.group_id == group_id,
+            Task.status.in_(OPEN_STATUSES),
+            TaskEvent.actor_user_id == user_id,
+            TaskEvent.event_type.in_(["STATUS_QUERY", "FOLLOW_UP"]),
+            TaskEvent.created_at >= cutoff,
+        )
+        .order_by(TaskEvent.created_at.desc())
+    ).all()
+    unique = []
+    seen = set()
+    for task in rows:
+        if task.id in seen:
+            continue
+        seen.add(task.id)
+        unique.append(task)
+    return unique[0] if len(unique) == 1 else None
 THAI_WEEKDAY_INDEX = {
     "จันทร์": 0, "อังคาร": 1, "พุธ": 2, "พฤหัส": 3, "พฤหัสบดี": 3,
     "ศุกร์": 4, "เสาร์": 5, "อาทิตย์": 6,

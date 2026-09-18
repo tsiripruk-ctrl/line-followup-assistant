@@ -30,10 +30,10 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
     normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
-    get_runtime_preference, set_runtime_preference, owner_reopen_task_state
+    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, recent_explicit_query_task
 )
 
-VERSION = "0.6.43"
+VERSION = "0.6.44"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -170,6 +170,10 @@ def health():
         "natural_policy_instruction_routing": True,
         "policy_command_precedence_guard": True,
         "runtime_state_question_override": True,
+        "task_linked_outbound_reply": True,
+        "bare_quoted_completion": True,
+        "status_reply_quote_completion": True,
+        "legacy_status_quote_recovery": True,
     }
 
 
@@ -957,6 +961,42 @@ async def safe_reply_or_push(reply_token: str | None, group_id: str, text: str, 
         return False
 
 
+async def safe_reply_or_push_task(
+    reply_token: str | None, group_id: str, text: str, task_id: int,
+    *, message_kind: str = "TASK_REPLY", label: str = "task-linked reply",
+) -> str | None:
+    """Send one task-specific LINE message and persist its LINE message id.
+
+    Any assistant message that names or reports the state of one exact task may be
+    quoted by a human later.  Persisting the outbound message id is therefore part
+    of task identity, not merely notification bookkeeping.
+    """
+    try:
+        if reply_token:
+            sent_message_id = await reply_text(reply_token, text)
+        else:
+            sent_message_id = await push_text(group_id, text)
+    except Exception as exc:
+        print(f"{label} failed:", repr(exc))
+        return None
+
+    if not sent_message_id:
+        print(f"{label} sent without message id; quote linking unavailable")
+        return None
+
+    try:
+        with SessionLocal() as db:
+            link_outbound_task_message(
+                db, line_message_id=str(sent_message_id), task_id=task_id, group_id=group_id,
+                message_kind=message_kind, commit=True,
+            )
+        print("[OUTBOUND_TASK_LINK]", {"message_id": str(sent_message_id), "task_id": task_id, "kind": message_kind})
+    except Exception as exc:
+        # Sending succeeded, so never create another public message because storage failed.
+        print(f"{label} mapping failed:", type(exc).__name__, repr(exc), "task_id=", task_id)
+    return str(sent_message_id)
+
+
 def _mention_text(text: str, mentionee: dict) -> str | None:
     """Best-effort visible @name extraction for mention entries without userId."""
     try:
@@ -1061,13 +1101,16 @@ async def handle_query_or_followup_intent(
                     response = f"เรื่อง {target.title} ยังอยู่ระหว่างดำเนินการค่ะ"
                 else:
                     response = f"เรื่อง {target.title} ยังอยู่ระหว่างติดตามค่ะ"
-                await safe_reply_or_push(reply_token, group_id, response, label="status query")
+                await safe_reply_or_push_task(
+                    reply_token, group_id, response, target.id,
+                    message_kind="STATUS_QUERY_REPLY", label="status query",
+                )
             else:
                 # A follow-up request updates the existing timeline; it does not create a new FU.
-                await safe_reply_or_push(
+                await safe_reply_or_push_task(
                     reply_token, group_id,
                     f"รับทราบค่ะ จะติดตามเรื่อง {target.title} ต่อจากงานเดิมให้นะคะ",
-                    label="followup existing task",
+                    target.id, message_kind="FOLLOWUP_REPLY", label="followup existing task",
                 )
             return "matched"
 
@@ -1483,10 +1526,10 @@ async def _process_message(event: dict):
                 )
                 print("[TASK_MATCH]", {"task_id": existing.task_code, "similarity": round(duplicate_confidence, 3)})
                 print("[ACTION]", {"action": "ADD_TIMELINE", "status_change": "NONE", "duplicate_prevented": True})
-                await safe_reply_or_push(
+                await safe_reply_or_push_task(
                     reply_token, source_id,
                     f"รับทราบค่ะ จะติดตามเรื่อง {existing.title} ต่อจากงานเดิมให้นะคะ",
-                    label="duplicate followup",
+                    existing.id, message_kind="DUPLICATE_FOLLOWUP_REPLY", label="duplicate followup",
                 )
                 return
             if ambiguous_dupes:
@@ -1581,6 +1624,13 @@ async def handle_quoted_task_reply(
                     Task.source_message_id == str(quoted_message_id),
                     Task.group_id == group_id,
                 ))
+            if not target and quoted_completion:
+                # v0.6.44 recovery for assistant status/follow-up messages sent by older
+                # versions that did not persist their outbound LINE message id.  Recover
+                # only when this same human recently referenced exactly one active task.
+                target = recent_explicit_query_task(db, group_id, user_id, within_minutes=30)
+                if target:
+                    print("[LEGACY_QUOTE_RECOVERY]", {"task": target.task_code, "quoted_message_id": quoted_message_id})
             if not target:
                 return None
             if target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:

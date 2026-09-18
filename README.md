@@ -1,4 +1,4 @@
-# LINE Follow-up Assistant v0.6.42
+# LINE Follow-up Assistant v0.6.44
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
@@ -439,3 +439,8 @@ Automated regression tests: `30 passed` ณ ตอน build รุ่นนี�
 - `ล้างกติกาคำถามติดตาม`
 
 กติกานี้มีผลเฉพาะ Message Generation ไม่แก้ Intent, Task Matching หรือ Task Status
+
+
+## v0.6.44 – Task-linked Reply Identity & Bare Quote Completion
+- Task-specific status/follow-up responses now persist their LINE message id so later quote replies resolve the exact task.
+- Exact quote reply `เรียบร้อย` / `เสร็จเรียบร้อย` can close the linked task, while questions/negations/milestones remain blocked.
