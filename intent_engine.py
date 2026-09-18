@@ -201,7 +201,7 @@ def intent_to_status_signal(intent: str) -> str:
 # v0.6.34: Exact LINE quote/reply may safely confirm a whole-task completion
 # with short natural phrases that are intentionally *not* safe in free chat.
 QUOTED_COMPLETION_PATTERNS = (
-    "เรียบร้อย", "เรียบร้อยแล้ว", "เสร็จ", "เสร็จแล้ว", "เสร็จเรียบร้อย", "เสร็จเรียบร้อยแล้ว", "จบ", "จบแล้ว",
+    "เรียบร้อยแล้ว", "เสร็จแล้ว", "เสร็จเรียบร้อยแล้ว", "จบแล้ว",
     "งานเรียบร้อยแล้ว", "งานเสร็จแล้ว", "ปิดได้เลย", "ปิดงานได้เลย",
     "ดำเนินการเสร็จแล้ว", "ดำเนินการเรียบร้อยแล้ว", "เสร็จสมบูรณ์แล้ว",
 )
