@@ -17,7 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
-from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, parse_command_prefix, is_safe_quoted_completion
+from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, parse_command_prefix, is_safe_quoted_completion, should_clarify_unmatched_query
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -30,7 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at
 )
 
-VERSION = "0.6.37"
+VERSION = "0.6.38"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -142,6 +142,10 @@ def health():
         "command_prefix_semantic_cleaning": True,
         "generic_followup_template_disabled": True, "deterministic_followup_variety": True,
         "short_contextual_reminders": True,
+        "general_conversation_guard": True,
+        "silence_before_clarification": True,
+        "unmatched_status_query_silent": True,
+        "clarification_requires_task_evidence": True,
     }
 
 
@@ -980,6 +984,7 @@ async def handle_query_or_followup_intent(
     message_id: str, text: str, intent_result,
     mentioned_name: str | None = None, mentioned_user_id: str | None = None,
     allow_new_task_if_unmatched: bool = False,
+    clarify_if_unmatched: bool = False,
 ) -> str:
     """Handle STATUS_QUERY/FOLLOW_UP without creating or completing tasks."""
     with SessionLocal() as db:
@@ -1060,14 +1065,23 @@ async def handle_query_or_followup_intent(
             print("[QUERY_TO_NEW_TASK]", {"reason": "mentioned_work_question_no_existing_match", "text": text})
             return "unmatched_new_candidate"
 
-        # Explicit query/follow-up with no confident match: do not create a duplicate.
-        await safe_reply_or_push(
-            reply_token, group_id,
-            "ขอชื่อโครงการหรือเรื่องที่ต้องการติดตามเพิ่มอีกนิดได้ไหมคะ จะได้ตามต่อให้ตรงเรื่องค่ะ",
-            label="unmatched followup clarification",
-        )
-        print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE"})
-        return "handled"
+        # v0.6.38 GENERAL CONVERSATION / CLARIFICATION GUARD
+        # A generic Thai question is not evidence of a task.  If there is no
+        # confident existing-task match, no explicit follow-up command, no FU id
+        # and no directed-new-work path, stay silent in the group.  This prevents
+        # ordinary conversation such as "จริงไหม จากสายตาเราดู" from triggering
+        # a bot-like "ขอชื่อโครงการ..." prompt.
+        if clarify_if_unmatched:
+            await safe_reply_or_push(
+                reply_token, group_id,
+                "ต้องการให้ตามเรื่องไหนคะ บอกชื่อเรื่องสั้น ๆ ได้เลยค่ะ",
+                label="explicit followup clarification",
+            )
+            print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE", "reason": "explicit_followup_without_match"})
+            return "handled"
+
+        print("[GENERAL_CHAT_GUARD]", {"action": "SILENT_UNMATCHED_QUERY", "text": text})
+        return "handled_silent"
 
 async def process_message(event: dict):
     """Process one LINE message without allowing an obvious status update to fail silently.
@@ -1211,6 +1225,7 @@ async def _process_message(event: dict):
             message_id=msg["id"], text=(command_text or text), intent_result=intent_result,
             mentioned_name=mentioned_name, mentioned_user_id=mentioned_user_id,
             allow_new_task_if_unmatched=(intent_result.intent == "STATUS_QUERY" and directed_new_work_question),
+            clarify_if_unmatched=should_clarify_unmatched_query((command_text or text), intent_result.intent, forced_command_intent),
         )
         if query_outcome != "unmatched_new_candidate":
             return

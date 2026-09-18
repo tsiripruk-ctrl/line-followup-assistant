@@ -234,3 +234,21 @@ def is_safe_quoted_completion(text: str | None) -> bool:
 
     # Longer explicit whole-task confirmation remains safe too.
     return classify_message_intent(raw).intent == "COMPLETION_CONFIRMATION"
+
+
+# v0.6.38: Clarification is opt-in, not a generic fallback.
+def should_clarify_unmatched_query(text: str | None, intent: str, forced_command_intent: str | None = None) -> bool:
+    """Return True only when the human explicitly asked the assistant to follow work.
+
+    A plain question may be ordinary group conversation.  When it does not match
+    an existing task, the safe UX is silence.  Explicit follow-up commands remain
+    eligible for a short natural clarification.
+    """
+    raw = (text or "").strip()
+    if forced_command_intent == "FOLLOW_UP":
+        return True
+    if intent == "FOLLOW_UP":
+        return True
+    if re.search(r"FU-\d{6}-\d{4}", raw, flags=re.I):
+        return True
+    return False

@@ -364,3 +364,13 @@ Automated regression tests: `30 passed` ณ ตอน build รุ่นนี�
 - Existing future commitments are preserved; only missing schedules are repaired.
 - Past-due WAITING tasks become eligible for follow-up in the current work window instead of being silently skipped forever.
 - Adds `REMINDER_SCHEDULE_REPAIRED` to the task timeline for traceability.
+
+
+## v0.6.38 — General Conversation & Clarification Guard
+
+- Generic group questions no longer trigger the fallback “ขอชื่อโครงการ...” prompt.
+- Unmatched `STATUS_QUERY` is silent by default.
+- Clarification is allowed only for explicit follow-up intent/prefix or an explicit FU id.
+- Existing-task matching still runs first, so real questions such as “เรื่องมิเตอร์ถึงไหนแล้ว” can resolve normally when there is a confident match.
+- Directed @mention work questions from v0.6.37 remain supported.
+- Quiet-by-default is preserved: ordinary conversation is never converted into a new FU merely because it contains question words such as “ไหม/หรือเปล่า”.
