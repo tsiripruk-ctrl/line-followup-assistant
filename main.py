@@ -29,11 +29,11 @@ from service import (
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
-    normalize_followup_tone_instruction, infer_followup_tone,
+    normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state
 )
 
-VERSION = "0.6.41"
+VERSION = "0.6.42"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -162,6 +162,10 @@ def health():
         "natural_secretary_tone": True,
         "owner_tone_typo_cleanup": True,
         "multi_phrase_blacklist_command": True,
+        "owner_state_question_rules": True,
+        "natural_policy_instruction_routing": True,
+        "policy_command_precedence_guard": True,
+        "runtime_state_question_override": True,
     }
 
 
@@ -1935,11 +1939,19 @@ def _owner_policy_summary(policy: dict) -> str:
     custom = normalize_followup_tone_instruction(policy.get("custom_instruction"))
     tone_text = custom or tone_map.get(policy.get("tone"), policy.get("tone"))
     avoid = policy.get("avoid_phrases") or []
+    state_questions = policy.get("state_questions") or {}
+    rule_text = "ยังไม่ได้กำหนด"
+    if state_questions:
+        rule_text = "; ".join(
+            f"{STATE_QUESTION_LABELS.get(k, k)} → {v}"
+            for k, v in list(state_questions.items())[:6]
+        )
     return (
         "รูปแบบการติดตามปัจจุบันค่ะ\n"
         f"• โทน: {tone_text}\n"
         f"• ความยาว: ไม่เกิน {policy.get('max_lines', 2)} บรรทัด / {policy.get('max_chars', 200)} ตัวอักษร\n"
-        f"• คำที่หลีกเลี่ยง: {', '.join(avoid) if avoid else 'ยังไม่ได้กำหนด'}"
+        f"• คำที่หลีกเลี่ยง: {', '.join(avoid) if avoid else 'ยังไม่ได้กำหนด'}\n"
+        f"• กติกาคำถามตามสถานะ: {rule_text}"
     )
 
 
@@ -1989,6 +2001,43 @@ def _extract_fu_code(raw: str) -> str | None:
 async def handle_owner_command(user_id: str, text: str):
     raw = text.strip()
     low = raw.lower()
+
+    # v0.6.42 Policy instruction precedence guard.
+    # Natural owner rules such as "เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ"
+    # must be treated as language-policy updates BEFORE generic task-list commands
+    # inspect words like "เลยกำหนด".
+    state_rule = parse_owner_state_question_rule(raw)
+    if state_rule:
+        state_key, question, label = state_rule
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+            rules = dict(policy.get("state_questions") or {})
+            rules[state_key] = question
+            policy = patch_followup_policy(db, state_questions=rules)
+        await push_text(
+            user_id,
+            f"ตั้งกติกาการถามแล้วค่ะ\n• {label}: {question}\n\nมีผลกับข้อความติดตามรอบถัดไปทันทีค่ะ"
+        )
+        return
+
+    if low in ("ดูกติกาคำถามติดตาม", "ดูกติกาการถาม", "ดูคำถามตามสถานะ"):
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+        rules = policy.get("state_questions") or {}
+        if not rules:
+            await push_text(user_id, "ตอนนี้ยังไม่ได้กำหนดกติกาคำถามเฉพาะสถานะค่ะ")
+            return
+        lines = ["กติกาคำถามตามสถานะตอนนี้ค่ะ"]
+        for key, question in rules.items():
+            lines.append(f"• {STATE_QUESTION_LABELS.get(key, key)}: {question}")
+        await push_text(user_id, "\n".join(lines))
+        return
+
+    if low in ("ล้างกติกาคำถามติดตาม", "ล้างกติกาการถาม", "ล้างคำถามตามสถานะ"):
+        with SessionLocal() as db:
+            patch_followup_policy(db, state_questions={})
+        await push_text(user_id, "ล้างกติกาคำถามตามสถานะแล้วค่ะ จะกลับไปใช้คำถามมาตรฐานของระบบ")
+        return
 
     # v0.6.39 Owner Follow-up Diagnostics & Control Center -----------------
     if low.startswith("ทำไมไม่ตาม "):
@@ -2445,6 +2494,9 @@ async def handle_owner_command(user_id: str, text: str):
         "• เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์\n"
         "• ดูรูปแบบการติดตามปัจจุบัน\n"
         "• ตั้งโทนติดตาม: เป็นกันเอง กระชับ ไม่กดดัน\n"
+        "• เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ\n"
+        "• เวลางานติดปัญหา ให้ถามว่าติดตรงไหน\n"
+        "• ดูกติกาคำถามติดตาม / ล้างกติกาคำถามติดตาม\n"
         "• ห้ามใช้คำว่า \"ขออัปเดต\"\n"
         "• ทดลองข้อความติดตาม\n"
         "• คืนค่ารูปแบบติดตาม"

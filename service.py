@@ -1244,6 +1244,8 @@ DEFAULT_FOLLOWUP_POLICY = {
     "overdue_style": "ask_expected_completion",
     "waiting_style": "specific_dependency",
     "custom_instruction": "",
+    # Owner-editable state-specific questions. These affect wording only, never Task state.
+    "state_questions": {},
 }
 
 
@@ -1269,6 +1271,15 @@ def get_followup_policy(db: Session) -> dict:
     if not isinstance(policy.get("avoid_phrases"), list):
         policy["avoid_phrases"] = []
     policy["avoid_phrases"] = [str(x).strip() for x in policy["avoid_phrases"] if str(x).strip()][:30]
+    allowed_states = {"overdue", "blocked", "waiting_response", "waiting_document", "waiting_approval", "waiting_goods", "appointment", "in_progress", "general"}
+    raw_questions = policy.get("state_questions")
+    if not isinstance(raw_questions, dict):
+        raw_questions = {}
+    policy["state_questions"] = {
+        str(k): str(v).strip()[:240]
+        for k, v in raw_questions.items()
+        if str(k) in allowed_states and str(v).strip()
+    }
     return policy
 
 
@@ -1354,6 +1365,121 @@ def apply_followup_policy(db: Session, text: str) -> str:
         out = clipped.rstrip(" ,:;-_") + "…"
     return out
 
+STATE_QUESTION_LABELS = {
+    "overdue": "งานเลยกำหนด",
+    "blocked": "งานติดปัญหา",
+    "waiting_response": "งานรอการตอบกลับ",
+    "waiting_document": "งานรอเอกสาร",
+    "waiting_approval": "งานรออนุมัติ",
+    "waiting_goods": "งานรอของ/สินค้า",
+    "appointment": "งานถึงวันนัด",
+    "in_progress": "งานกำลังดำเนินการ",
+    "general": "งานทั่วไป",
+}
+
+_STATE_RULE_ALIASES = (
+    ("waiting_response", ("รอคนตอบ", "รอการตอบกลับ", "รอตอบกลับ", "รอเจ้าหน้าที่ตอบ", "รอเซลล์ตอบ")),
+    ("waiting_document", ("รอเอกสาร", "รอหนังสือ", "รอใบตรวจรับ")),
+    ("waiting_approval", ("รออนุมัติ", "รออนุญาต", "รอเซ็น", "รอลงนาม")),
+    ("waiting_goods", ("รอของ", "รอสินค้า", "รออุปกรณ์")),
+    ("appointment", ("ถึงวันนัด", "วันนัด", "ถึงวันที่นัด", "ถึงกำหนดนัด")),
+    ("overdue", ("เลยกำหนด", "เกินกำหนด")),
+    ("blocked", ("ติดปัญหา", "มีปัญหา", "ติดขัด", "แก้ไม่ได้")),
+    ("in_progress", ("กำลังดำเนินการ", "กำลังทำ", "อยู่ระหว่างดำเนินการ")),
+)
+
+
+def _normalize_owner_question_text(state_key: str, instruction: str) -> str:
+    """Turn a natural owner instruction into a short Thai question.
+
+    The owner may specify semantics ("ถามวันที่คาดว่าจะเสร็จ") instead of exact
+    copy. Common semantics are normalized; quoted/exact questions are preserved.
+    """
+    x = " ".join((instruction or "").strip().strip('"\'“”').split())
+    x = re.sub(r"^(?:ว่า|เรื่อง)\s*", "", x).strip()
+    low = x.lower()
+    if not x:
+        return ""
+    if state_key == "overdue" and any(k in low for k in ("วันที่คาดว่าจะเสร็จ", "คาดว่าจะเสร็จ", "เสร็จเมื่อไหร่", "เสร็จวันไหน", "เมื่อไหร่จะเสร็จ")):
+        return "ตอนนี้คาดว่าจะเรียบร้อยได้ประมาณเมื่อไหร่คะ"
+    if state_key == "blocked" and any(k in low for k in ("ติดตรงไหน", "ติดปัญหาตรงไหน", "ปัญหาคืออะไร", "ติดขัดตรงไหน")):
+        return "ตอนนี้ยังติดตรงส่วนไหนอยู่ไหมคะ"
+    if state_key == "waiting_response" and any(k in low for k in ("ตอบหรือยัง", "ตอบกลับหรือยัง", "ตอบมาไหม")):
+        return "ตอนนี้ทางนั้นตอบกลับมาแล้วหรือยังคะ"
+    if state_key == "waiting_document" and any(k in low for k in ("เอกสารได้หรือยัง", "เอกสารมาหรือยัง", "เอกสารกลับมาหรือยัง")):
+        return "ตอนนี้เอกสารที่รออยู่กลับมาแล้วหรือยังคะ"
+    if state_key == "waiting_approval" and any(k in low for k in ("อนุมัติหรือยัง", "ผ่านหรือยัง", "เซ็นหรือยัง")):
+        return "ตอนนี้ขั้นตอนอนุมัติ/ลงนามผ่านแล้วหรือยังคะ"
+    if state_key == "waiting_goods" and any(k in low for k in ("ของมาหรือยัง", "ของเข้าหรือยัง", "สินค้าเข้าหรือยัง")):
+        return "ตอนนี้ของที่รออยู่เข้ามาแล้วหรือยังคะ"
+    # If owner provided a real question, keep it nearly verbatim.
+    if x.endswith(("?", "ไหม", "ไหมคะ", "หรือยัง", "หรือยังคะ", "เมื่อไหร่", "เมื่อไหร่คะ", "ตรงไหน", "ตรงไหนคะ")):
+        if not x.endswith(("คะ", "ค่ะ", "ครับ", "?")):
+            x += "คะ"
+        return x
+    # Otherwise convert a short semantic phrase into a polite question.
+    if x.startswith("ถาม"):
+        x = x[3:].strip()
+    if not x:
+        return ""
+    if not x.endswith(("คะ", "ค่ะ", "ครับ", "?")):
+        x += "คะ"
+    return x
+
+
+def parse_owner_state_question_rule(text: str | None) -> tuple[str, str, str] | None:
+    """Parse e.g. 'เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ'."""
+    raw = " ".join((text or "").strip().split())
+    if not raw or "ให้ถาม" not in raw:
+        return None
+    before, instruction = raw.split("ให้ถาม", 1)
+    before = re.sub(r"^(?:เวลา|เมื่อ|ถ้า)\s*", "", before.strip(), flags=re.IGNORECASE)
+    before = re.sub(r"^งาน\s*", "", before.strip(), flags=re.IGNORECASE)
+    before_low = before.lower().strip(" :,-")
+    state_key = None
+    for key, aliases in _STATE_RULE_ALIASES:
+        if any(alias in before_low for alias in aliases):
+            state_key = key
+            break
+    if not state_key:
+        return None
+    question = _normalize_owner_question_text(state_key, instruction)
+    if not question:
+        return None
+    return state_key, question, STATE_QUESTION_LABELS[state_key]
+
+
+def _state_question_key(task: Task, memory: str = "") -> str:
+    combined = " ".join(filter(None, [memory, task.progress_summary, task.waiting_on, task.next_action])).lower()
+    # A concrete blocker is more actionable than a generic overdue state.
+    if any(k in combined for k in ("ติดปัญหา", "ติดขัด", "ยังแก้ไม่ได้", "แก้ไม่ได้", "มีปัญหา", "blocked")):
+        return "blocked"
+    if task.next_action and _appointment_like(task.next_action):
+        return "appointment"
+    waiting = (task.waiting_on or "").lower()
+    if waiting:
+        if any(k in waiting for k in ("เอกสาร", "ใบตรวจรับ", "หนังสือ", "datasheet", "data sheet")):
+            return "waiting_document"
+        if any(k in waiting for k in ("อนุมัติ", "อนุญาต", "เซ็น", "ลงนาม")):
+            return "waiting_approval"
+        if any(k in waiting for k in ("ของ", "สินค้า", "อุปกรณ์", "ตู้", "สาย", "fiber", "ไฟเบอร์")):
+            return "waiting_goods"
+        if any(k in waiting for k in ("ตอบ", "เซลล์", "sales", "เจ้าหน้าที่", "ผู้ขาย", "supplier", "futong")):
+            return "waiting_response"
+    if task.status == "OVERDUE":
+        return "overdue"
+    if task.status == "IN_PROGRESS":
+        return "in_progress"
+    return "general"
+
+
+def _policy_question(policy: dict | None, task: Task, fallback: str, memory: str = "") -> str:
+    questions = (policy or {}).get("state_questions") or {}
+    key = _state_question_key(task, memory)
+    value = str(questions.get(key) or "").strip()
+    return value or fallback
+
+
 def _waiting_question(waiting_on: str, reminder_count: int = 0) -> str:
     """Ask only about the unresolved dependency, using its actual business state."""
     w = _normalize_waiting_phrase(waiting_on)
@@ -1395,39 +1521,52 @@ def _waiting_question(waiting_on: str, reminder_count: int = 0) -> str:
     return "ตอนนี้สิ่งที่รออยู่ขยับไปถึงไหนแล้วคะ"
 
 
-def _progress_question(task: Task) -> str:
-    """Select a question style from task state, not from random sentence rotation."""
+def _progress_question(task: Task, policy: dict | None = None, memory: str = "") -> str:
+    """Select a state-driven question, honoring owner's runtime state rules."""
     rc = int(task.reminder_count or 0)
+    state_key = _state_question_key(task, memory)
+
     if task.waiting_on:
-        return _waiting_question(task.waiting_on, rc)
+        fallback = _waiting_question(task.waiting_on, rc)
+        return _policy_question(policy, task, fallback, memory)
     if task.next_action:
         action = _clip_message_piece(task.next_action, 86)
         if _appointment_like(action):
-            return "วันนี้เป็นช่วงที่นัดไว้ ตอนนี้ดำเนินการเป็นอย่างไรบ้างคะ"
+            fallback = "วันนี้เป็นช่วงที่นัดไว้ ตอนนี้ดำเนินการเป็นอย่างไรบ้างคะ"
+            return _policy_question(policy, task, fallback, memory)
         if any(k in action.lower() for k in ("ส่ง", "ส่งของ", "ส่งเอกสาร")):
-            return "ขั้นตอนที่ต้องส่งต่อ ตอนนี้ดำเนินการเรียบร้อยหรือยังคะ"
-        return f"ขั้นตอนถัดไปเรื่อง{action} ตอนนี้ไปถึงไหนแล้วคะ"
+            fallback = "ขั้นตอนที่ต้องส่งต่อ ตอนนี้ดำเนินการเรียบร้อยหรือยังคะ"
+            return _policy_question(policy, task, fallback, memory)
+        fallback = f"ขั้นตอนถัดไปเรื่อง{action} ตอนนี้ไปถึงไหนแล้วคะ"
+        return _policy_question(policy, task, fallback, memory)
+    if state_key == "blocked":
+        fallback = "ตอนนี้ยังติดตรงส่วนไหนอยู่ไหมคะ"
+        return _policy_question(policy, task, fallback, memory)
     if task.status == "OVERDUE":
-        return (
+        fallback = (
             "ตอนนี้คาดว่าจะเรียบร้อยได้ประมาณเมื่อไหร่คะ"
             if rc % 2 == 0 else
             "ตอนนี้ยังติดตรงส่วนไหนอยู่ไหมคะ และคาดว่าจะจบได้เมื่อไหร่คะ"
         )
+        return _policy_question(policy, task, fallback, memory)
     if task.status == "IN_PROGRESS":
-        return (
+        fallback = (
             "ตอนนี้เหลือขั้นตอนไหนอีกบ้างคะ"
             if rc % 2 == 0 else
             "จากที่ทำต่อมา ตอนนี้ไปถึงขั้นตอนไหนแล้วคะ"
         )
-    return (
+        return _policy_question(policy, task, fallback, memory)
+    fallback = (
         "ตอนนี้ไปถึงไหนแล้วคะ"
         if rc % 2 == 0 else
         "ตอนนี้มีอะไรขยับเพิ่มเติมแล้วบ้างคะ"
     )
+    return _policy_question(policy, task, fallback, memory)
 
 
 def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner_name: str) -> tuple[str, bool]:
     """State-driven follow-up text, finalized by the owner's live language policy."""
+    policy = get_followup_policy(db)
     structured_memory = bool((task.progress_summary or "").strip())
     memory = (task.progress_summary or "").strip()
     if not memory:
@@ -1443,7 +1582,7 @@ def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner
 
     if not memory:
         if task.status == "OVERDUE":
-            q = _progress_question(task)
+            q = _progress_question(task, policy, memory)
             return finish(f"{assignee_token}คะ เรื่อง{topic}เลยกำหนดแล้วค่ะ\n{q}")
         return finish(f"{assignee_token}คะ เรื่อง{topic} ตอนนี้ไปถึงไหนแล้วคะ")
 
@@ -1456,7 +1595,7 @@ def contextual_followup_text(db: Session, task: Task, assignee_token: str, owner
         print("completion-like stale snapshot suppressed:", task.task_code, repr(memory), "status=", task.status)
         memory = ""
 
-    question = _progress_question(task)
+    question = _progress_question(task, policy, memory)
     if task.next_action and _appointment_like(task.next_action):
         return finish(
             f"{assignee_token}คะ เรื่อง{topic} วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ\n"

@@ -1,4 +1,4 @@
-# LINE Follow-up Assistant v0.6.7
+# LINE Follow-up Assistant v0.6.42
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
@@ -414,3 +414,28 @@ Automated regression tests: `30 passed` ณ ตอน build รุ่นนี�
 - `เปิดงาน FU-260911-0013`
 
 ระบบจะคืนสถานะก่อนถูกปิดเมื่อหาได้จาก Timeline, ตั้ง `next_reminder_at` ใหม่ในเวลางาน, และบันทึก `OWNER_STATUS_CORRECTION` / `REMINDER_REACTIVATED`.
+
+
+## v0.6.42 – Natural Owner Policy Rule Routing
+
+แก้บั๊กคำสั่ง Owner Private ที่เป็นภาษาธรรมชาติ เช่น:
+- `เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ`
+- `เวลางานติดปัญหา ให้ถามว่าติดตรงไหน`
+
+ก่อนหน้านี้คำสั่งแรกถูกตีความเป็นคำสั่งดู “งานเลยกำหนด” และคำสั่งที่สองหลุดไปหน้า Help เพราะ parser ยังไม่รู้จัก policy rule แบบตามสถานะ
+
+รุ่นนี้เพิ่ม State Question Rules ซึ่งทำงานก่อน generic owner commands และมีผลกับ Reminder รอบถัดไปทันทีโดยไม่ต้อง Deploy ใหม่:
+- overdue
+- blocked
+- waiting_response
+- waiting_document
+- waiting_approval
+- waiting_goods
+- appointment
+- in_progress
+
+คำสั่งเพิ่มเติม:
+- `ดูกติกาคำถามติดตาม`
+- `ล้างกติกาคำถามติดตาม`
+
+กติกานี้มีผลเฉพาะ Message Generation ไม่แก้ Intent, Task Matching หรือ Task Status
