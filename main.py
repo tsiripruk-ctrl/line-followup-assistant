@@ -29,10 +29,11 @@ from service import (
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
+    normalize_followup_tone_instruction, infer_followup_tone,
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state
 )
 
-VERSION = "0.6.40"
+VERSION = "0.6.41"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -157,6 +158,10 @@ def health():
         "owner_status_correction": True,
         "owner_reopen_completed_task": True,
         "owner_last_task_context": True,
+        "custom_tone_instruction_preserved": True,
+        "natural_secretary_tone": True,
+        "owner_tone_typo_cleanup": True,
+        "multi_phrase_blacklist_command": True,
     }
 
 
@@ -1925,11 +1930,14 @@ def _owner_policy_summary(policy: dict) -> str:
         "soft": "นุ่มนวล",
         "direct": "ตรงประเด็น",
         "concise": "กระชับ",
+        "secretary_natural": "ธรรมชาติเหมือนเลขานุการ",
     }
+    custom = normalize_followup_tone_instruction(policy.get("custom_instruction"))
+    tone_text = custom or tone_map.get(policy.get("tone"), policy.get("tone"))
     avoid = policy.get("avoid_phrases") or []
     return (
         "รูปแบบการติดตามปัจจุบันค่ะ\n"
-        f"• โทน: {tone_map.get(policy.get('tone'), policy.get('tone'))}\n"
+        f"• โทน: {tone_text}\n"
         f"• ความยาว: ไม่เกิน {policy.get('max_lines', 2)} บรรทัด / {policy.get('max_chars', 200)} ตัวอักษร\n"
         f"• คำที่หลีกเลี่ยง: {', '.join(avoid) if avoid else 'ยังไม่ได้กำหนด'}"
     )
@@ -2179,19 +2187,12 @@ async def handle_owner_command(user_id: str, text: str):
         return
 
     if low.startswith("ตั้งโทนติดตาม:") or low.startswith("ปรับโทนติดตาม:"):
-        desc = raw.split(":", 1)[1].strip() if ":" in raw else ""
-        desc_low = desc.lower()
-        if "นุ่ม" in desc_low or "ไม่กดดัน" in desc_low:
-            tone = "soft"
-        elif "ตรง" in desc_low:
-            tone = "direct"
-        elif "สั้น" in desc_low or "กระชับ" in desc_low:
-            tone = "concise"
-        else:
-            tone = "friendly_professional"
-        changes = {"tone": tone, "custom_instruction": desc}
-        if "สั้น" in desc_low or "กระชับ" in desc_low:
-            changes.update({"max_lines": 2, "max_chars": 160})
+        raw_desc = raw.split(":", 1)[1].strip() if ":" in raw else ""
+        tone, desc, derived = infer_followup_tone(raw_desc)
+        if not desc:
+            await push_text(user_id, "พิมพ์โทนที่ต้องการหลังเครื่องหมาย : ได้เลยค่ะ")
+            return
+        changes = {"tone": tone, "custom_instruction": desc, **derived}
         with SessionLocal() as db:
             policy = patch_followup_policy(db, **changes)
         await push_text(user_id, "ปรับโทนการติดตามแล้วค่ะ\n" + _owner_policy_summary(policy))
@@ -2230,6 +2231,39 @@ async def handle_owner_command(user_id: str, text: str):
         with SessionLocal() as db:
             policy = patch_followup_policy(db, **changes)
         await push_text(user_id, "ปรับความยาวแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low.startswith("ห้ามใช้คำ:") or low.startswith("คำห้ามใช้:"):
+        body = raw.split(":", 1)[1] if ":" in raw else ""
+        phrases = []
+        for item in re.split(r"[\n,;]+", body):
+            phrase = re.sub(r"^[\s•\-–—]+", "", item).strip().strip('"\'“”')
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+        if not phrases:
+            await push_text(user_id, "ใส่คำหรือประโยคที่ไม่ต้องการใช้หลังเครื่องหมาย : ได้เลยค่ะ")
+            return
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+            avoid = list(policy.get("avoid_phrases") or [])
+            for phrase in phrases:
+                if phrase not in avoid:
+                    avoid.append(phrase)
+            policy = patch_followup_policy(db, avoid_phrases=avoid[:30])
+        await push_text(user_id, f"เพิ่มคำที่หลีกเลี่ยง {len(phrases)} รายการแล้วค่ะ\n" + _owner_policy_summary(policy))
+        return
+
+    if low in ("ดูคำห้ามใช้", "ดูคำที่ห้ามใช้"):
+        with SessionLocal() as db:
+            policy = get_followup_policy(db)
+        avoid = policy.get("avoid_phrases") or []
+        await push_text(user_id, "คำที่หลีกเลี่ยงตอนนี้ค่ะ\n" + ("\n".join(f"• {x}" for x in avoid) if avoid else "ยังไม่ได้กำหนดค่ะ"))
+        return
+
+    if low in ("ล้างคำห้ามใช้ทั้งหมด", "ล้างคำที่ห้ามใช้ทั้งหมด"):
+        with SessionLocal() as db:
+            policy = patch_followup_policy(db, avoid_phrases=[])
+        await push_text(user_id, "ล้างรายการคำที่หลีกเลี่ยงทั้งหมดแล้วค่ะ\n" + _owner_policy_summary(policy))
         return
 
     if low.startswith("ห้ามใช้คำว่า") or low.startswith("อย่าใช้คำว่า"):

@@ -1188,6 +1188,54 @@ def _appointment_like(value: str | None) -> bool:
 
 
 
+def normalize_followup_tone_instruction(value: str | None) -> str:
+    """Normalize an owner-entered tone instruction without changing its meaning.
+
+    Removes invisible characters and obvious accidental repeated-letter noise such as
+    ``sssธรรมชาติ`` while preserving legitimate English/Thai style instructions.
+    """
+    x = str(value or "")
+    x = x.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    # Remove obvious repeated-key noise (e.g. sss, aaa) when typed as a standalone
+    # token or directly before Thai text. Do not remove normal English words.
+    x = re.sub(r"(?<![A-Za-z])([A-Za-z])\1{1,5}(?=[ก-๙])", "", x)
+    x = re.sub(r"\b([A-Za-z])\1{1,5}\b", "", x)
+    x = re.sub(r"[ \t]+", " ", x)
+    x = re.sub(r" ?\n ?", " ", x)
+    # Repair common Thai spacing introduced by accidental keyboard noise removal.
+    x = re.sub(r"เป็น\s+ธรรมชาติ", "เป็นธรรมชาติ", x)
+    x = re.sub(r"เหมือน\s+เลขานุการ", "เหมือนเลขานุการ", x)
+    return x.strip(" :,-")
+
+
+def infer_followup_tone(value: str | None) -> tuple[str, str, dict]:
+    """Map a free-form owner instruction to a runtime tone without losing the text.
+
+    Returns (tone_code, cleaned_instruction, derived_policy_changes).
+    The original meaning is preserved in ``custom_instruction`` and remains visible
+    in owner diagnostics instead of being collapsed to a preset label.
+    """
+    desc = normalize_followup_tone_instruction(value)
+    low = desc.lower()
+    if any(k in low for k in ("เลขานุการ", "ธรรมชาติ", "เหมือนคน", "ไม่เหมือน bot", "ไม่เหมือนบอต")):
+        tone = "secretary_natural"
+    elif "นุ่ม" in low or "ไม่กดดัน" in low:
+        tone = "soft"
+    elif "ตรง" in low:
+        tone = "direct"
+    elif "สั้น" in low or "กระชับ" in low:
+        tone = "concise"
+    else:
+        tone = "friendly_professional"
+
+    changes: dict = {}
+    if "สั้น" in low or "กระชับ" in low:
+        changes.update({"max_lines": 2, "max_chars": 160})
+    if "ไม่เกิน 1 บรรทัด" in low or "หนึ่งบรรทัด" in low:
+        changes.update({"max_lines": 1, "max_chars": min(changes.get("max_chars", 200), 160)})
+    return tone, desc, changes
+
+
 DEFAULT_FOLLOWUP_POLICY = {
     "tone": "friendly_professional",
     "max_lines": 2,
@@ -1259,14 +1307,31 @@ def apply_followup_policy(db: Session, text: str) -> str:
     policy = get_followup_policy(db)
     out = str(text or "").strip()
     tone = str(policy.get("tone") or "friendly_professional")
+    instruction = normalize_followup_tone_instruction(policy.get("custom_instruction"))
+    instruction_low = instruction.lower()
 
-    if tone == "soft":
+    # Custom instructions are behavioral traits, not merely a display label.
+    # A natural-secretary request therefore affects the generated wording while
+    # keeping task matching/state transitions completely untouched.
+    natural_secretary = tone == "secretary_natural" or any(
+        k in instruction_low for k in ("เลขานุการ", "ธรรมชาติ", "เหมือนคน")
+    )
+    soft_trait = tone == "soft" or "นุ่ม" in instruction_low or "ไม่กดดัน" in instruction_low
+    direct_trait = tone == "direct" or "ตรงประเด็น" in instruction_low
+    concise_trait = tone == "concise" or "กระชับ" in instruction_low or "สั้น" in instruction_low
+
+    if natural_secretary:
+        # Remove UI/report-like labels and prefer conversational transitions.
+        out = out.replace("ล่าสุด: ", "ล่าสุด ")
+        out = out.replace("วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ", "วันนี้ถึงวันที่นัดไว้แล้วค่ะ")
+        out = out.replace("ตอนนี้สิ่งที่รออยู่ขยับไปถึงไหนแล้วคะ", "ตอนนี้เรื่องที่รออยู่ไปถึงไหนแล้วคะ")
+    if soft_trait:
         out = out.replace("เลยกำหนดแล้วค่ะ", "เห็นว่ากำหนดเดิมผ่านแล้วนะคะ")
         out = out.replace("ตอนนี้คาดว่าจะเรียบร้อยได้ประมาณเมื่อไหร่คะ", "พอจะประเมินได้ไหมคะว่าน่าจะเรียบร้อยประมาณเมื่อไหร่")
-    elif tone == "direct":
+    if direct_trait:
         out = out.replace("ล่าสุด: ", "")
         out = out.replace("วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ", "วันนี้ถึงวันที่นัดไว้แล้วค่ะ")
-    elif tone == "concise":
+    if concise_trait:
         out = out.replace(" วันนี้ถึงช่วงที่นัดไว้ตามอัปเดตล่าสุดแล้วค่ะ", " วันนี้ถึงวันที่นัดไว้แล้วค่ะ")
 
     for phrase in policy.get("avoid_phrases") or []:

@@ -403,7 +403,7 @@ Automated regression tests: `30 passed` ณ ตอน build รุ่นนี�
 การตั้งค่าถูกเก็บใน `owner_preferences` และมีผลกับ Reminder รอบถัดไปทันทีโดยไม่ต้อง Deploy ใหม่ ส่วนสถานะงาน, Task Matching, Completion Safety, Quiet-by-default, working hours 08:30–17:30 และ daily follow-up limits ยังคงทำงานตามเดิม
 
 
-## v0.6.40 – Owner Status Correction & Reopen Tracking
+## v0.6.41 – Owner Status Correction & Reopen Tracking
 
 เพิ่มคำสั่ง Owner Private สำหรับแก้สถานะงานที่ถูกปิดผิด และเปิดคิวติดตามต่อโดยไม่ลบประวัติเดิม
 
