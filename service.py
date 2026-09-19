@@ -6,7 +6,7 @@ from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, func, delete, or_
 from sqlalchemy.orm import Session
-from models import Message, Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
+from models import Message, Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference, ConversationState
 from config import settings
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
@@ -29,6 +29,63 @@ def local_now() -> datetime:
 
 
 
+
+
+# v0.6.46 short-lived conversation state --------------------------------------
+def save_conversation_state(
+    db: Session, group_id: str, user_key: str, state_type: str, payload: dict,
+    *, ttl_minutes: int = 10, commit: bool = True,
+) -> ConversationState:
+    """Upsert one short-lived state per user/group for clarification recovery."""
+    now = utcnow()
+    row = db.scalar(select(ConversationState).where(
+        ConversationState.group_id == group_id, ConversationState.user_key == user_key
+    ))
+    if row:
+        row.state_type = state_type
+        row.payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        row.expires_at = now + timedelta(minutes=max(1, int(ttl_minutes)))
+        row.updated_at = now
+    else:
+        row = ConversationState(
+            group_id=group_id, user_key=user_key, state_type=state_type,
+            payload_json=json.dumps(payload or {}, ensure_ascii=False),
+            expires_at=now + timedelta(minutes=max(1, int(ttl_minutes))),
+        )
+        db.add(row)
+    if commit:
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def get_conversation_state(db: Session, group_id: str, user_key: str) -> tuple[ConversationState | None, dict]:
+    """Return a live state and parsed payload; expired/corrupt states are discarded."""
+    row = db.scalar(select(ConversationState).where(
+        ConversationState.group_id == group_id, ConversationState.user_key == user_key
+    ))
+    if not row:
+        return None, {}
+    if row.expires_at and row.expires_at < utcnow():
+        db.delete(row)
+        db.commit()
+        return None, {}
+    try:
+        payload = json.loads(row.payload_json or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    return row, payload
+
+
+def clear_conversation_state(db: Session, group_id: str, user_key: str, *, commit: bool = True) -> int:
+    result = db.execute(delete(ConversationState).where(
+        ConversationState.group_id == group_id, ConversationState.user_key == user_key
+    ))
+    if commit:
+        db.commit()
+    return int(result.rowcount or 0)
 
 
 

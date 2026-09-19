@@ -27,6 +27,25 @@ QUESTION_PATTERNS = (
     "เป็นยังไง", "เป็นอย่างไร", "ถึงไหน", "อะไรบ้าง", "ได้หรือยัง", "ส่งหรือยัง",
     "ได้รับหรือยัง", "มีความคืบหน้า", "อัปเดตหน่อย", "ขออัปเดต", "ตามเรื่อง",
 )
+
+def has_question_signal(text: str | None) -> bool:
+    """Question detection that avoids false positives such as 'ไฟไหม้'."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if "?" in raw or "？" in raw:
+        return True
+    value = _compact(raw)
+    for term in QUESTION_PATTERNS:
+        compact_term = _compact(term)
+        if compact_term == "ไหม":
+            # Thai 'ไหม' question particle must not match the noun/verb 'ไหม้'.
+            if re.search(r"ไหม(?!้)", value):
+                return True
+            continue
+        if compact_term in value:
+            return True
+    return False
 NEGATION_PATTERNS = (
     "ยังไม่", "ไม่ได้", "ไม่เสร็จ", "ไม่เรียบร้อย", "ยังไม่ได้ดำเนินการ",
     "ยังไม่ได้ส่ง", "ยังไม่ได้รับ", "รออยู่", "รอดำเนินการ", "ติดปัญหา", "ยังแก้ไม่ได้",
@@ -110,6 +129,95 @@ def is_direct_task_request(text: str | None) -> bool:
 
 
 
+# v0.6.46 NEW TASK confirmation + structured request recovery ----------------
+NEW_TASK_CONFIRMATION_PATTERNS = (
+    "งานใหม่", "เป็นงานใหม่", "สร้างเป็นงานใหม่", "สร้างงานใหม่", "เรื่องใหม่",
+    "ใช่งานใหม่", "ใช่ งานใหม่", "เปิดงานใหม่", "อันนี้งานใหม่",
+)
+NEW_TASK_SHORT_CONFIRMATIONS = ("ใช่", "ใช่ค่ะ", "ใช่คะ", "ใช่ครับ", "สร้างเลย", "เปิดเลย", "ถูกต้อง", "อันนี้แหละ", "เรื่องนี้", "ใช่เรื่องนี้")
+NEW_TASK_NEGATIVE_CONFIRMATIONS = (
+    "ไม่ใช่", "ไม่ใช่งานใหม่", "ไม่ต้องสร้าง", "ไม่ต้องสร้างงาน", "แค่ถาม", "แค่แจ้ง",
+    "ไม่ต้องติดตาม", "ยกเลิก", "ยกเลิกการสร้าง",
+)
+
+STRUCTURED_ACTION_PATTERNS = (
+    "ให้ประสาน", "ต้องประสาน", "ต้องให้ประสาน", "ให้เข้าไป", "ต้องให้เข้าไป",
+    "ให้ดำเนินการ", "ต้องดำเนินการ", "ต้องให้ดำเนินการ", "ช่วยดำเนินการ",
+    "ให้แก้ไข", "ต้องแก้ไข", "ช่วยแก้ไข", "ให้ตรวจสอบ", "ต้องตรวจสอบ",
+    "ให้ติดตาม", "ต้องติดตาม", "ให้จัดการ", "ต้องจัดการ", "ให้ส่ง", "ต้องส่ง",
+    "ให้เตรียม", "ต้องเตรียม", "ให้นัด", "ต้องนัด", "ให้เช็ก", "ให้เช็ค",
+    "ช่วยประสาน", "ช่วยตรวจสอบ", "ช่วยติดตาม", "ช่วยจัดการ", "ช่วยส่ง", "ช่วยเตรียม",
+    "ฝากประสาน", "ฝากตรวจสอบ", "ฝากติดตาม", "ฝากจัดการ", "ฝากส่ง",
+)
+PROJECT_CONTEXT_PATTERNS = (
+    "โครงการ", "เทศบาล", "อบต", "อบจ", "หน่วยงาน", "บริษัท", "ไซต์", "หน้างาน",
+    "โรงพยาบาล", "โรงเรียน", "มหาวิทยาลัย", "สำนักงาน", "ศูนย์",
+)
+ISSUE_CONTEXT_PATTERNS = (
+    "ดับ", "เสีย", "ไฟไหม้", "ไหม้", "ชำรุด", "ปัญหา", "ใช้งานไม่ได้", "ขัดข้อง",
+    "ไม่ทำงาน", "ไม่ครบ", "ค้าง", "หลุด", "เสียหาย", "ผิดปกติ",
+)
+
+def _strip_polite_compact(value: str) -> str:
+    value = _compact(value)
+    return re.sub(r"(?:นะครับ|นะคะ|ครับผม|ครับ|ค่ะ|คะ)$", "", value)
+
+def is_new_task_confirmation(text: str | None, *, allow_short: bool = True) -> bool:
+    """Recognize explicit confirmation only inside an active clarification state."""
+    value = _strip_polite_compact(text or "")
+    if not value:
+        return False
+    normalized = {_compact(x) for x in NEW_TASK_CONFIRMATION_PATTERNS}
+    if value in normalized:
+        return True
+    if allow_short and value in {_compact(x) for x in NEW_TASK_SHORT_CONFIRMATIONS}:
+        return True
+    return False
+
+def is_new_task_negative_confirmation(text: str | None) -> bool:
+    value = _strip_polite_compact(text or "")
+    if not value:
+        return False
+    return value in {_compact(x) for x in NEW_TASK_NEGATIVE_CONFIRMATIONS}
+
+def is_standalone_new_task_command(text: str | None) -> bool:
+    """A bare request to start a new task; details must arrive in the next message."""
+    value = _strip_polite_compact(text or "")
+    return value in {_compact(x) for x in NEW_TASK_CONFIRMATION_PATTERNS}
+
+def structured_new_task_evidence(text: str | None, *, has_mention: bool = False) -> dict[str, bool]:
+    value = _compact(text)
+    raw = (text or "").strip()
+    return {
+        "mention": bool(has_mention or re.search(r"@[^\s]+", raw)),
+        "project": _has_any(value, tuple(_compact(x) for x in PROJECT_CONTEXT_PATTERNS)),
+        "issue": _has_any(value, tuple(_compact(x) for x in ISSUE_CONTEXT_PATTERNS)),
+        "action": _has_any(value, tuple(_compact(x) for x in STRUCTURED_ACTION_PATTERNS)),
+    }
+
+def is_structured_new_task_request(text: str | None, *, has_mention: bool = False) -> bool:
+    """Deterministic strong NEW_TASK signal: action request + at least one context clue.
+
+    Questions remain excluded here so status questions still route through the existing
+    question safety layer. Reported speech such as 'เขาให้...' is also excluded unless
+    the sentence contains an independent imperative signal like 'ต้อง...' or 'ช่วย...'.
+    """
+    raw = (text or "").strip()
+    value = _compact(raw)
+    if not value:
+        return False
+    if has_question_signal(raw):
+        return False
+    evidence = structured_new_task_evidence(raw, has_mention=has_mention)
+    if not evidence["action"]:
+        return False
+    # Guard common passive report framing from being treated as a fresh assignment.
+    if re.match(r"^(?:เขา|เค้า|เจ้าหน้าที่|ลูกค้า|เทศบาล).{0,16}(?:ให้|แจ้ง|บอก)", raw, flags=re.I):
+        if not _has_any(value, ("ต้อง", "ช่วย", "รบกวน", "ฝาก", "ขอให้")):
+            return False
+    return sum(bool(v) for v in evidence.values()) >= 2
+
+
 # v0.6.37: A direct @mention can introduce a brand-new work question even when
 # the sentence is grammatically a question (e.g. "ค่าซ่อมรถตีราคาครบแล้วถูกไหม").
 # This helper is intentionally conservative: it requires a recognizable work-topic
@@ -142,7 +250,7 @@ def is_directed_new_work_question(text: str | None) -> bool:
         return False
     if _has_any(value, DIRECTED_NEW_WORK_QUESTION_EXCLUSIONS):
         return False
-    has_question = ("?" in raw or "？" in raw or _has_any(value, QUESTION_PATTERNS))
+    has_question = has_question_signal(raw)
     if not has_question:
         return False
     return _has_any(value, tuple(_compact(x) for x in WORK_TOPIC_PATTERNS))
@@ -162,7 +270,7 @@ def classify_message_intent(text: str | None) -> IntentResult:
         return IntentResult("FOLLOW_UP", 0.99, "explicit_followup_pattern")
 
     # Hard safety: question intent always beats completion words.
-    if "?" in raw or "？" in raw or _has_any(value, QUESTION_PATTERNS):
+    if has_question_signal(raw):
         return IntentResult("STATUS_QUERY", 0.99, "question_pattern")
 
     if _has_any(value, CANCEL_PATTERNS):
@@ -223,7 +331,7 @@ def is_safe_quoted_completion(text: str | None) -> bool:
         return False
 
     # Hard safety rules always win, even inside an exact quote reply.
-    if "?" in raw or "？" in raw or _has_any(value, QUESTION_PATTERNS):
+    if has_question_signal(raw):
         return False
     if _has_any(value, NEGATION_PATTERNS):
         return False
