@@ -23,7 +23,7 @@ from service import (
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
     format_task, choose_status_target, STATUS_THAI, brief_counts,
     event_exists, record_event, search_open_tasks, smart_search_tasks, task_stats,
-    resolve_canonical_name, set_person_alias, list_people, record_task_event,
+    resolve_canonical_name, get_person_by_alias, set_person_alias, list_people, record_task_event,
     task_timeline, backfill_task_created_events, bind_person_identity, update_person_profile, merge_people, add_alias_to_person, delete_person_alias,
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
@@ -33,7 +33,7 @@ from service import (
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context
 )
 
-VERSION = "0.6.46"
+VERSION = "0.6.47"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -181,6 +181,9 @@ def health():
         "natural_mentioned_assignment_routing": True,
         "ฝากเรื่องงาน_new_task_signal": True,
         "natural_assignment_existing_task_first": True,
+        "mention_profile_failure_fallback": True,
+        "textual_registry_mention_fallback": True,
+        "emoji_display_name_mention_safe": True,
     }
 
 
@@ -1016,7 +1019,11 @@ def _mention_text(text: str, mentionee: dict) -> str | None:
 
 
 async def resolve_message_mentions(msg: dict, group_id: str) -> list[dict]:
-    """Return real user mentions, excluding @All and mentions to the bot itself."""
+    """Return real user mentions, excluding @All and mentions to the bot itself.
+
+    v0.6.47 safety: profile lookup is enrichment only. A temporary LINE profile
+    lookup failure must never erase an otherwise valid mention from the message.
+    """
     result = []
     mention = msg.get("mention") or {}
     text = msg.get("text", "")
@@ -1027,9 +1034,56 @@ async def resolve_message_mentions(msg: dict, group_id: str) -> list[dict]:
         visible = _mention_text(text, item)
         display = None
         if uid:
-            display = await get_member_profile(group_id, uid)
+            try:
+                display = await get_member_profile(group_id, uid)
+            except Exception as exc:
+                print("mention profile lookup failed; keep mention metadata:", repr(exc), "user_id=", uid)
+        # Keep the mention even when display-name enrichment failed. userId from
+        # LINE is the strongest identity; visible text is a best-effort label.
         result.append({"user_id": uid, "display_name": display or visible, "visible_name": visible})
     return result
+
+
+def _registry_textual_mention(text: str | None) -> dict | None:
+    """Resolve a leading textual @name through People Registry when LINE mention
+    metadata is absent. This is conservative: only an exact registered alias/name
+    is accepted, so free-form @text cannot silently assign the wrong person.
+
+    This protects natural assignment messages that were typed/copied as @Proud🤍
+    rather than inserted through LINE's native mention picker.
+    """
+    raw = (text or "").strip()
+    m = re.match(r"^@([^\s]+)", raw)
+    if not m:
+        return None
+    token = m.group(1).strip()
+    candidates = [token]
+    # Emoji/punctuation suffixes are common in LINE display names. Try a clean
+    # alphanumeric/Thai alias as a second exact lookup (e.g. Proud🤍 -> Proud).
+    cleaned = re.sub(r"[^0-9A-Za-zก-๙._-]+", "", token).strip("._-")
+    if cleaned and cleaned.lower() != token.lower():
+        candidates.append(cleaned)
+    try:
+        with SessionLocal() as db:
+            people = []
+            seen = set()
+            for name in candidates:
+                person = get_person_by_alias(db, name)
+                if person and person.active and person.id not in seen:
+                    people.append(person)
+                    seen.add(person.id)
+            if len(people) != 1:
+                return None
+            person = people[0]
+            return {
+                "user_id": person.line_user_id,
+                "display_name": person.call_name or person.display_name or person.canonical_name,
+                "visible_name": token,
+                "source": "people_registry_textual_at",
+            }
+    except Exception as exc:
+        print("textual mention registry fallback failed:", repr(exc))
+        return None
 
 
 def select_primary_mention(mentions: list[dict], extracted_assignee: str | None) -> dict | None:
@@ -1276,6 +1330,10 @@ async def _process_message(event: dict):
     # messages are handled against existing tasks and can never close or duplicate them.
     intent_result = classify_message_intent(text)
     primary_human_mention = select_primary_mention(mentions, None)
+    if not primary_human_mention:
+        primary_human_mention = _registry_textual_mention(text)
+        if primary_human_mention:
+            print("[MENTION_FALLBACK]", {"source": "people_registry_textual_at", "name": primary_human_mention.get("display_name")})
     mentioned_name = primary_human_mention.get("display_name") if primary_human_mention else None
     mentioned_user_id = primary_human_mention.get("user_id") if primary_human_mention else None
     natural_mentioned_assignment = bool(primary_human_mention) and is_natural_assignment_request(text)

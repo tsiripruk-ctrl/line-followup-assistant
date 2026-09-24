@@ -1,4 +1,13 @@
-# LINE Follow-up Assistant v0.6.46
+# LINE Follow-up Assistant v0.6.47
+
+## v0.6.47 — Mention Resilience & Natural Assignment Fallback
+
+- A valid LINE @mention is no longer discarded when member-profile enrichment temporarily fails.
+- If native LINE mention metadata is absent, a leading `@name` can fall back to an exact, unique People Registry alias/name.
+- Emoji display names such as `@Proud🤍` can fall back to the registered alias `Proud` without broad fuzzy matching.
+- Natural assignment wording remains existing-task-first to prevent duplicate FU creation.
+- Example covered: `@Proud🤍 มีเรื่องไหมอยากให้ช่วยดู พี่ฝากเรื่อง "งานคอมฯ ศูนย์ข้อมูลความสงบฯ ภ.จว.ระนอง" ว่าเรากู้ไฟแนนซ์มากี่บาท`
+
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
