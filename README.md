@@ -2,17 +2,13 @@
 
 Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
-## New in v0.6.46 — New Task Confirmation + Previous Message Recovery
+## New in v0.6.46 — Natural Mentioned Assignment Routing
 
-- Detects natural new assignments from action + project/problem/@mention context, including wording such as `ต้องให้ประสาน...`.
-- Fixes the Thai question false-positive where `ไฟไหม้` could be mistaken for the question particle `ไหม`.
-- Stores short-lived clarification context per LINE user/group.
-- When the assistant is waiting for clarification, `งานใหม่` / `ใช่` creates the task from the **previous original message**, not from the short confirmation text.
-- `ไม่ใช่งานใหม่` / `ไม่ต้องสร้าง` cancels the pending creation safely.
-- Standalone `งานใหม่` asks for details and treats the next message as a forced new task.
-- Adds the `conversation_states` table automatically on startup; existing data is preserved.
+- Natural wording such as `@ตี๋ ฝากเรื่องงาน อบต หนองชิ่ม ในความก้าวหน้าของงานหน่อยนะ` is treated as an actionable assignment when LINE supplies a real @mention.
+- Existing active tasks are still searched before creating a new FU, preventing duplicates.
+- Casual messages without a real @mention remain protected by Quiet-by-default / Passive Conversation Guard.
 
-## Previous: v0.6.45 — Quoted Human Message Context Safety
+## New in v0.6.45 — Quoted Human Message Context Safety
 
 - A quoted completion can no longer close a merely recent/unrelated task.
 - Quoted human messages resolve from exact `TaskEvent.message_id` first, then from the quoted message text with a strict unique topic match.

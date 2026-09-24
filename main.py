@@ -17,13 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
-from intent_engine import (
-    classify_message_intent, intent_to_status_signal, is_direct_task_request,
-    is_directed_new_work_question, parse_command_prefix, is_safe_quoted_completion,
-    should_clarify_unmatched_query, is_new_task_confirmation,
-    is_new_task_negative_confirmation, is_standalone_new_task_command,
-    is_structured_new_task_request,
-)
+from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, is_natural_assignment_request, parse_command_prefix, is_safe_quoted_completion, should_clarify_unmatched_query
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -36,8 +30,7 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
     normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
-    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context,
-    save_conversation_state, get_conversation_state, clear_conversation_state
+    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context
 )
 
 VERSION = "0.6.46"
@@ -185,10 +178,9 @@ def health():
         "quoted_event_message_id_resolution": True,
         "quoted_text_semantic_resolution": True,
         "unsafe_recent_quote_fallback_disabled": True,
-        "new_task_context_recovery": True,
-        "new_task_confirmation_override": True,
-        "structured_new_task_detection": True,
-        "pending_clarification_state": True,
+        "natural_mentioned_assignment_routing": True,
+        "ฝากเรื่องงาน_new_task_signal": True,
+        "natural_assignment_existing_task_first": True,
     }
 
 
@@ -1057,123 +1049,11 @@ def select_primary_mention(mentions: list[dict], extracted_assignee: str | None)
 
 
 
-# v0.6.46 conversation-state recovery for explicit NEW_TASK confirmation
-def conversation_user_key(user_id: str | None, display_name: str | None) -> str:
-    return (user_id or (f"name:{display_name}" if display_name else "anonymous")).strip()
-
-
-def build_pending_new_task_payload(
-    *, text: str, message_id: str, sender_name: str | None, sender_user_id: str | None,
-    mentions: list[dict] | None = None, candidate_intent: str = "NEW_TASK", reason: str = "clarification",
-) -> dict:
-    return {
-        "original_message": text,
-        "original_message_id": message_id,
-        "original_sender_name": sender_name,
-        "original_sender_user_id": sender_user_id,
-        "mentions": mentions or [],
-        "candidate_intent": candidate_intent,
-        "reason": reason,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-
-
-def _fallback_new_task_title(text: str) -> str:
-    cleaned = re.sub(r"@[^\s]+", " ", text or "")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return (cleaned or "งานติดตามจาก LINE")[:180]
-
-
-async def create_confirmed_new_task_from_state(
-    *, group_id: str, user_key: str, payload: dict, reply_token: str | None,
-    confirmation_message_id: str, confirmer_name: str | None, confirmer_user_id: str | None,
-    confirmation_text: str,
-) -> Task | None:
-    """Create from the original clarification message, never from the word 'งานใหม่'.
-
-    Explicit user confirmation intentionally bypasses normal intent classification and
-    duplicate auto-merge.  This is the recovery path requested by the user.
-    """
-    original_text = str(payload.get("original_message") or "").strip()
-    original_message_id = str(payload.get("original_message_id") or "").strip()
-    if not original_text or not original_message_id:
-        with SessionLocal() as db:
-            clear_conversation_state(db, group_id, user_key, commit=True)
-        return None
-
-    original_sender_name = payload.get("original_sender_name") or confirmer_name
-    original_sender_user_id = payload.get("original_sender_user_id") or confirmer_user_id
-    mentions = payload.get("mentions") if isinstance(payload.get("mentions"), list) else []
-
-    try:
-        extraction = await asyncio.to_thread(extract_task, original_text, original_sender_name)
-    except Exception as exc:
-        print("confirmed new-task extraction failed; using deterministic fallback:", repr(exc))
-        extraction = TaskExtraction(
-            is_task=True, confidence=1.0, title=_fallback_new_task_title(original_text),
-            status_signal="none", is_task_reply=False, related_task_hint=original_text,
-            reason="explicit new-task confirmation deterministic fallback",
-        )
-
-    if not extraction.is_task:
-        extraction = TaskExtraction(
-            is_task=True, confidence=1.0,
-            title=(getattr(extraction, "title", None) or _fallback_new_task_title(original_text)),
-            project=getattr(extraction, "project", None),
-            assignee_name=getattr(extraction, "assignee_name", None),
-            due_at_iso=getattr(extraction, "due_at_iso", None),
-            status_signal="none", is_task_reply=False, related_task_hint=original_text,
-            reason="explicit new-task confirmation overrides classifier",
-        )
-
-    primary_mention = select_primary_mention(mentions, extraction.assignee_name)
-    mention_name = primary_mention.get("display_name") if primary_mention else None
-    mention_user_id = primary_mention.get("user_id") if primary_mention else None
-
-    with SessionLocal() as db:
-        contextual_person = None if primary_mention else resolve_assignee_from_text(db, original_text)
-        assignee_override = mention_name
-        assignee_uid = mention_user_id
-        if contextual_person:
-            assignee_override = contextual_person.canonical_name
-            assignee_uid = contextual_person.line_user_id
-
-        task = create_task(
-            db, group_id, original_message_id, extraction, source_text=original_text,
-            actor_name=original_sender_name, actor_user_id=original_sender_user_id,
-            assignee_name_override=assignee_override, assignee_user_id=assignee_uid,
-        )
-        if len(mentions) > 1:
-            co_names = [m.get("display_name") or m.get("visible_name") or m.get("user_id") for m in mentions]
-            record_task_event(
-                db, task, "CO_ASSIGNEES_MENTIONED", actor_name=original_sender_name, actor_user_id=original_sender_user_id,
-                text="ผู้เกี่ยวข้อง: " + ", ".join([n for n in co_names if n]),
-                new_status=task.status, commit=False, message_id=original_message_id, confidence=1.0,
-            )
-        record_task_event(
-            db, task, "NEW_TASK_CONFIRMED", actor_name=confirmer_name, actor_user_id=confirmer_user_id,
-            text=confirmation_text, new_status=task.status, commit=False,
-            message_id=confirmation_message_id, confidence=1.0,
-        )
-        clear_conversation_state(db, group_id, user_key, commit=False)
-        db.commit()
-        db.refresh(task)
-
-    await safe_reply_or_push_task(
-        reply_token, group_id,
-        f"รับทราบค่ะ สร้างเป็นงานติดตามใหม่แล้วค่ะ: {task.title}",
-        task.id, message_kind="NEW_TASK_CONFIRMATION_REPLY", label="new task confirmation",
-    )
-    print("[NEW_TASK_RECOVERY]", {"task_id": task.task_code, "source_message_id": original_message_id})
-    return task
-
-
 async def handle_query_or_followup_intent(
     *, group_id: str, user_id: str | None, sender_name: str | None,
     reply_token: str | None, quoted_message_id: str | None,
     message_id: str, text: str, intent_result,
     mentioned_name: str | None = None, mentioned_user_id: str | None = None,
-    mentions: list[dict] | None = None,
     allow_new_task_if_unmatched: bool = False,
     clarify_if_unmatched: bool = False,
 ) -> str:
@@ -1243,25 +1123,12 @@ async def handle_query_or_followup_intent(
 
         if ambiguous:
             choices = "\n".join(f"{i}. {t.title}" for i, t in enumerate(ambiguous[:3], 1))
-            if allow_new_task_if_unmatched:
-                user_key = conversation_user_key(user_id, sender_name)
-                save_conversation_state(
-                    db, group_id, user_key, "PENDING_NEW_TASK_CONFIRMATION",
-                    build_pending_new_task_payload(
-                        text=text, message_id=message_id, sender_name=sender_name,
-                        sender_user_id=user_id, mentions=mentions or [], candidate_intent="NEW_TASK",
-                        reason="query_ambiguity",
-                    ),
-                    ttl_minutes=10, commit=True,
-                )
-                prompt = f"เรื่องนี้อาจตรงกับงานเดิมค่ะ\n{choices}\n\nถ้าเป็นงานใหม่ พิมพ์ ‘งานใหม่’ ได้เลยค่ะ"
-            else:
-                prompt = f"หมายถึงเรื่องไหนคะ\n{choices}"
             await safe_reply_or_push(
-                reply_token, group_id, prompt,
+                reply_token, group_id,
+                f"หมายถึงเรื่องไหนคะ\n{choices}",
                 label="ambiguous status query",
             )
-            print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE", "new_task_recovery": bool(allow_new_task_if_unmatched)})
+            print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE"})
             return "ambiguous"
 
         # v0.6.37: a direct @mention + work-topic question can be the first
@@ -1390,53 +1257,6 @@ async def _process_message(event: dict):
     if source_type != "group":
         return
 
-    # v0.6.46 CONVERSATION STATE / NEW-TASK RECOVERY
-    # Resolve short confirmations before running the normal classifier.  The word
-    # "งานใหม่" confirms the *previous* message when a clarification is pending; it
-    # must never become a task title by itself.
-    state_user_key = conversation_user_key(user_id, display_name)
-    force_new_task_from_state = False
-    with SessionLocal() as db:
-        conversation_state, conversation_payload = get_conversation_state(db, source_id, state_user_key)
-
-    if conversation_state and conversation_state.state_type == "PENDING_NEW_TASK_CONFIRMATION":
-        if is_new_task_confirmation(text, allow_short=True):
-            await create_confirmed_new_task_from_state(
-                group_id=source_id, user_key=state_user_key, payload=conversation_payload,
-                reply_token=reply_token, confirmation_message_id=msg["id"],
-                confirmer_name=display_name, confirmer_user_id=user_id, confirmation_text=text,
-            )
-            return
-        if is_new_task_negative_confirmation(text):
-            with SessionLocal() as db:
-                clear_conversation_state(db, source_id, state_user_key, commit=True)
-            await safe_reply_or_push(reply_token, source_id, "รับทราบค่ะ จะไม่สร้างเป็นงานใหม่ค่ะ", label="new task negative confirmation")
-            return
-
-    if conversation_state and conversation_state.state_type == "AWAITING_NEW_TASK_DETAILS":
-        if is_new_task_negative_confirmation(text):
-            with SessionLocal() as db:
-                clear_conversation_state(db, source_id, state_user_key, commit=True)
-            await safe_reply_or_push(reply_token, source_id, "รับทราบค่ะ ยกเลิกการสร้างงานใหม่แล้วค่ะ", label="cancel awaiting new task")
-            return
-        if is_standalone_new_task_command(text):
-            await safe_reply_or_push(reply_token, source_id, "ได้ค่ะ ส่งรายละเอียดงานที่ต้องการติดตามมาได้เลยค่ะ", label="await new task details repeat")
-            return
-        # The next substantive message is the payload of the requested new task.
-        force_new_task_from_state = True
-        with SessionLocal() as db:
-            clear_conversation_state(db, source_id, state_user_key, commit=True)
-
-    if not conversation_state and is_standalone_new_task_command(text):
-        with SessionLocal() as db:
-            save_conversation_state(
-                db, source_id, state_user_key, "AWAITING_NEW_TASK_DETAILS",
-                {"requested_at": datetime.utcnow().isoformat(), "request_message_id": msg["id"]},
-                ttl_minutes=10, commit=True,
-            )
-        await safe_reply_or_push(reply_token, source_id, "ได้ค่ะ ส่งรายละเอียดงานที่ต้องการติดตามมาได้เลยค่ะ", label="await new task details")
-        return
-
     # v0.6.26 TASK CREATION GUARD
     # Ordinary leave/attendance notices are informational and must not become FU
     # tasks. Run this before status parsing and before the LLM so a sentence such
@@ -1450,8 +1270,6 @@ async def _process_message(event: dict):
     # Prefixes such as "งานใหม่:" / "ติดตามงาน:" are hard routing signals and
     # must be evaluated before question words such as "หรือยัง".
     forced_command_intent, command_text, command_prefix = parse_command_prefix(text)
-    if force_new_task_from_state:
-        forced_command_intent, command_text, command_prefix = "NEW_TASK", text, "conversation_state"
 
     # v0.6.27 INTENT SAFETY LAYER
     # Classify intent before any state transition or task creation. Question/follow-up
@@ -1460,27 +1278,24 @@ async def _process_message(event: dict):
     primary_human_mention = select_primary_mention(mentions, None)
     mentioned_name = primary_human_mention.get("display_name") if primary_human_mention else None
     mentioned_user_id = primary_human_mention.get("user_id") if primary_human_mention else None
+    natural_mentioned_assignment = bool(primary_human_mention) and is_natural_assignment_request(text)
     direct_human_task_request = bool(primary_human_mention) and is_direct_task_request(text)
     directed_new_work_question = bool(primary_human_mention) and is_directed_new_work_question(text)
-    structured_new_task_request = is_structured_new_task_request(text, has_mention=bool(mentions))
     explicit_work_request = bool(
         forced_command_intent == "NEW_TASK" or direct_human_task_request or
-        directed_new_work_question or structured_new_task_request or has_explicit_work_request(text)
+        directed_new_work_question or has_explicit_work_request(text)
     )
     passive_conversation = looks_like_passive_conversation(text)
 
-    # v0.6.46 STRUCTURED NEW-TASK DETECTION / STATE OVERRIDE
-    if forced_command_intent == "NEW_TASK" and intent_result.intent != "NEW_TASK":
-        print("[INTENT_OVERRIDE]", {"from": intent_result.intent, "to": "NEW_TASK", "reason": "explicit_or_state_new_task"})
-        intent_result = type(intent_result)("NEW_TASK", 1.0, "explicit_or_state_new_task")
-    elif structured_new_task_request and intent_result.intent not in {"FOLLOW_UP", "STATUS_QUERY"}:
-        print("[INTENT_OVERRIDE]", {"from": intent_result.intent, "to": "NEW_TASK", "reason": "structured_action_context"})
-        intent_result = type(intent_result)("NEW_TASK", 0.99, "structured_action_context")
-
-    # v0.6.28 HUMAN-DIRECTED REQUEST GUARD
-    if direct_human_task_request and intent_result.intent == "STATUS_QUERY":
-        print("[INTENT_OVERRIDE]", {"from": "STATUS_QUERY", "to": "NEW_TASK", "reason": "explicit_human_action_request"})
-        intent_result = type(intent_result)("NEW_TASK", 0.98, "explicit_human_action_request")
+    # v0.6.28/v0.6.46 HUMAN-DIRECTED REQUEST GUARD
+    # A real @mention plus a natural assignment phrase such as "ฝากเรื่องงาน..."
+    # is an actionable request even if the sentence also contains progress/follow-up
+    # wording.  Duplicate prevention still runs before creation, so an existing
+    # matching task is updated rather than duplicated.
+    if direct_human_task_request and intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
+        reason = "natural_mentioned_assignment" if natural_mentioned_assignment else "explicit_human_action_request"
+        print("[INTENT_OVERRIDE]", {"from": intent_result.intent, "to": "NEW_TASK", "reason": reason})
+        intent_result = type(intent_result)("NEW_TASK", 0.98, reason)
 
     print("[INTENT]", {"message": text, "intent": intent_result.intent, "confidence": intent_result.confidence, "reason": intent_result.reason})
     if intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
@@ -1488,7 +1303,7 @@ async def _process_message(event: dict):
             group_id=source_id, user_id=user_id, sender_name=display_name,
             reply_token=reply_token, quoted_message_id=quoted_message_id,
             message_id=msg["id"], text=(command_text or text), intent_result=intent_result,
-            mentioned_name=mentioned_name, mentioned_user_id=mentioned_user_id, mentions=mentions,
+            mentioned_name=mentioned_name, mentioned_user_id=mentioned_user_id,
             allow_new_task_if_unmatched=(intent_result.intent == "STATUS_QUERY" and directed_new_work_question),
             clarify_if_unmatched=should_clarify_unmatched_query((command_text or text), intent_result.intent, forced_command_intent),
         )
@@ -1518,17 +1333,11 @@ async def _process_message(event: dict):
         try:
             extraction = await asyncio.to_thread(extract_task, (command_text or text), display_name)
         except Exception as exc:
-            # Explicit/structured new-task requests must survive an LLM outage.
+            # Do not kill the webhook worker silently if the LLM is temporarily
+            # unavailable. Non-obvious messages can wait for the next human message,
+            # while obvious status messages never reach this branch.
             print("extract_task failed:", repr(exc), "text=", repr(text))
-            if forced_command_intent == "NEW_TASK" or structured_new_task_request or direct_human_task_request:
-                extraction = TaskExtraction(
-                    is_task=True, confidence=1.0 if forced_command_intent == "NEW_TASK" else 0.98,
-                    title=_fallback_new_task_title(command_text or text), assignee_name=mentioned_name,
-                    status_signal="none", is_task_reply=False, related_task_hint=(command_text or text),
-                    reason="deterministic explicit new-task fallback after AI failure",
-                )
-            else:
-                return
+            return
 
     # v0.6.33: "งานใหม่:" is an explicit instruction from the user. Even when
     # the payload itself is phrased as a question (e.g. "ส่งมอบแล้วหรือยัง"),
@@ -1548,22 +1357,16 @@ async def _process_message(event: dict):
     # v0.6.28/v0.6.37: an actionable @mention, or an unmatched direct work
     # question to a mentioned person, remains a new task even if AI focuses on the
     # question clause and returns is_task=False.
-    if (
-        direct_human_task_request
-        or structured_new_task_request
-        or (directed_new_work_question and intent_result.intent == "NEW_TASK")
-    ) and not extraction.is_task:
-        fallback_title = _fallback_new_task_title(text)
-        if directed_new_work_question and not direct_human_task_request and not structured_new_task_request:
+    if (direct_human_task_request or (directed_new_work_question and intent_result.intent == "NEW_TASK")) and not extraction.is_task:
+        fallback_title = text[:180]
+        if directed_new_work_question and not direct_human_task_request:
             fallback_title = ("ตรวจสอบ " + re.sub(r"@\S+", "", text).strip())[:180]
         extraction = TaskExtraction(
-            is_task=True,
-            confidence=0.99 if structured_new_task_request else (0.98 if direct_human_task_request else 0.96),
-            title=fallback_title, assignee_name=mentioned_name, status_signal="none", is_task_reply=False,
+            is_task=True, confidence=0.98 if direct_human_task_request else 0.96, title=fallback_title,
+            assignee_name=mentioned_name, status_signal="none", is_task_reply=False,
             related_task_hint=text, reason=(
-                "structured new-task deterministic fallback" if structured_new_task_request
-                else ("explicit human action request fallback" if direct_human_task_request
-                      else "mentioned work question new-task fallback")
+                "explicit human action request fallback" if direct_human_task_request
+                else "mentioned work question new-task fallback"
             ),
         )
 
@@ -1735,13 +1538,8 @@ async def _process_message(event: dict):
                 existing, duplicate_confidence, ambiguous_dupes = find_existing_followup_task(
                     db, source_id, (command_text or text), sender_name=display_name,
                     assignee_name=assignee_override or extraction.assignee_name,
-                    assignee_user_id=assignee_uid,
-                    min_confidence=0.93 if structured_new_task_request else 0.80,
+                    assignee_user_id=assignee_uid, min_confidence=0.80,
                 )
-                # A strong structured assignment should not be blocked by a weak old-topic
-                # resemblance. Only very strong duplicate evidence may interrupt creation.
-                if structured_new_task_request and not existing and duplicate_confidence < 0.90:
-                    ambiguous_dupes = []
             if existing:
                 record_task_event(
                     db, existing, "FOLLOW_UP", actor_name=display_name, actor_user_id=user_id,
@@ -1758,21 +1556,12 @@ async def _process_message(event: dict):
                 return
             if ambiguous_dupes:
                 choices = "\n".join(f"{i}. {t.title}" for i, t in enumerate(ambiguous_dupes[:3], 1))
-                save_conversation_state(
-                    db, source_id, state_user_key, "PENDING_NEW_TASK_CONFIRMATION",
-                    build_pending_new_task_payload(
-                        text=(command_text or text), message_id=msg["id"], sender_name=display_name,
-                        sender_user_id=user_id, mentions=mentions, candidate_intent="NEW_TASK",
-                        reason="duplicate_ambiguity",
-                    ),
-                    ttl_minutes=10, commit=True,
-                )
                 await safe_reply_or_push(
                     reply_token, source_id,
-                    f"เรื่องนี้คล้ายกับงานที่กำลังติดตามอยู่ค่ะ\n{choices}\n\nถ้าเป็นงานใหม่ พิมพ์ ‘งานใหม่’ ได้เลยค่ะ",
+                    f"เรื่องนี้คล้ายกับงานที่กำลังติดตามอยู่ค่ะ หมายถึงเรื่องไหนคะ\n{choices}",
                     label="duplicate clarification",
                 )
-                print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE", "duplicate_prevented": True, "new_task_recovery": True})
+                print("[ACTION]", {"action": "ASK_CLARIFICATION", "status_change": "NONE", "duplicate_prevented": True})
                 return
 
             task = create_task(
@@ -1783,7 +1572,7 @@ async def _process_message(event: dict):
             # v0.6.33: preserve all explicit mentions for traceability. The current
             # schema still has one primary assignee, so additional mentions are recorded
             # in Timeline instead of being silently discarded.
-            if len(mentions) > 1:
+            if forced_command_intent == "NEW_TASK" and len(mentions) > 1:
                 co_names = [m.get("display_name") or m.get("visible_name") or m.get("user_id") for m in mentions]
                 record_task_event(
                     db, task, "CO_ASSIGNEES_MENTIONED", actor_name=display_name, actor_user_id=user_id,

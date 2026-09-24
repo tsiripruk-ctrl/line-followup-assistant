@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean, ForeignKey, UniqueConstraint
+from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 from db import Base
 
@@ -104,21 +104,6 @@ class SystemEvent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     event_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class ConversationState(Base):
-    """Short-lived per-user conversation context for clarification/recovery flows."""
-    __tablename__ = "conversation_states"
-    __table_args__ = (UniqueConstraint("group_id", "user_key", name="uq_conversation_state_group_user"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    group_id: Mapped[str] = mapped_column(String(128), index=True)
-    user_key: Mapped[str] = mapped_column(String(255), index=True)
-    state_type: Mapped[str] = mapped_column(String(64), index=True)
-    payload_json: Mapped[str] = mapped_column(Text, default="{}")
-    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class OwnerPreference(Base):
     """Persistent owner-controlled runtime preference.
