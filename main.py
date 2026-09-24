@@ -30,10 +30,11 @@ from service import (
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
     normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
-    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context
+    get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context,
+    get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.47"
+VERSION = "0.6.48"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -184,6 +185,11 @@ def health():
         "mention_profile_failure_fallback": True,
         "textual_registry_mention_fallback": True,
         "emoji_display_name_mention_safe": True,
+        "owner_forced_followup_control": True,
+        "forced_followup_interval_control": True,
+        "forced_followup_bypasses_daily_cap": True,
+        "forced_followup_respects_working_hours": True,
+        "forced_followup_manual_disable": True,
     }
 
 
@@ -490,6 +496,10 @@ def api_task_status(
         t.status = new_status
         if new_status in {"COMPLETED", "CANCELLED"}:
             t.next_reminder_at = None
+            disable_forced_followup(
+                db, t, actor_name=settings.owner_display_name,
+                reason=f"ปิดบังคับติดตามอัตโนมัติเมื่อ Dashboard เปลี่ยนสถานะเป็น {new_status}",
+            )
         elif t.next_reminder_at is None:
             t.next_reminder_at = datetime.utcnow() + timedelta(minutes=5)
         record_task_event(
@@ -1724,17 +1734,29 @@ async def handle_quoted_task_reply(
             if new_status:
                 target.status = new_status
                 commitment_at = extract_followup_commitment_at(text) if new_status != "COMPLETED" else None
+                forced_cfg = get_forced_followup_config(db, target)
                 if new_status == "COMPLETED":
                     target.next_reminder_at = None
                 elif commitment_at:
+                    # A concrete human checkpoint always wins, even in forced mode.
                     target.next_reminder_at = commitment_at
+                elif forced_cfg:
+                    target.next_reminder_at = schedule_next_followup(
+                        target, datetime.utcnow() + timedelta(hours=float(forced_cfg.get("interval_hours", 2) or 2))
+                    )
                 elif new_status == "WAITING":
                     target.next_reminder_at = datetime.utcnow() + timedelta(hours=24)
                 else:
                     target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
                 event_type = "QUOTED_STATUS_REPLY"
             else:
-                target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
+                forced_cfg = get_forced_followup_config(db, target)
+                if forced_cfg:
+                    target.next_reminder_at = schedule_next_followup(
+                        target, datetime.utcnow() + timedelta(hours=float(forced_cfg.get("interval_hours", 2) or 2))
+                    )
+                else:
+                    target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
                 event_type = "QUOTED_COMMENT_REPLY"
 
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender}: {text}").strip()
@@ -1782,6 +1804,12 @@ async def handle_quoted_task_reply(
 
             db.commit()
             db.refresh(target)
+            if target.status == "COMPLETED":
+                disable_forced_followup(
+                    db, target, actor_name=canonical_sender, actor_user_id=user_id,
+                    reason="ปิดบังคับติดตามอัตโนมัติเมื่องานเสร็จจาก quoted reply",
+                )
+                db.refresh(target)
             task_code, task_title, final_status = target.task_code, target.title, target.status
             print("quoted status update committed:", task_code, old_status, "->", final_status,
                   "sender=", canonical_sender, "text=", repr(text))
@@ -1927,14 +1955,21 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             target.status = new_status
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
             commitment_at = extract_followup_commitment_at(text) if new_status != "COMPLETED" else None
+            forced_cfg = get_forced_followup_config(db, target)
             if new_status == "COMPLETED":
                 target.next_reminder_at = None
             elif commitment_at:
                 # A human supplied a concrete future checkpoint (e.g. "นัดเซ็นวันศุกร์").
-                # Respect that checkpoint instead of asking again tomorrow.
+                # Respect that checkpoint even when forced follow-up is enabled.
                 target.next_reminder_at = commitment_at
+            elif forced_cfg:
+                # Owner explicitly requested persistent follow-up. Progress such as
+                # "ยังรอ" or "กำลังทำ" does not silently turn that mode off.
+                target.next_reminder_at = schedule_next_followup(
+                    target, datetime.utcnow() + timedelta(hours=float(forced_cfg.get("interval_hours", 2) or 2))
+                )
             elif new_status == "WAITING":
-                # External dependencies need breathing room; do not chase the assignee every few hours.
+                # External dependencies need breathing room in normal mode.
                 target.next_reminder_at = datetime.utcnow() + timedelta(hours=24)
             elif target.due_at and datetime.utcnow() > target.due_at:
                 target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
@@ -1975,6 +2010,12 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
                 print("[FOLLOW_UP_SCHEDULED]", target.task_code, local_commitment.isoformat(), "source=status_update")
             db.commit()
             db.refresh(target)
+            if target.status == "COMPLETED":
+                disable_forced_followup(
+                    db, target, actor_name=canonical_sender, actor_user_id=user_id,
+                    reason="ปิดบังคับติดตามอัตโนมัติเมื่องานเสร็จจากข้อความในกลุ่ม",
+                )
+                db.refresh(target)
             print("status update committed:", target.task_code, old_status, "->", new_status, repr(text))
 
             if old_status == new_status and new_status != "COMPLETED":
@@ -2013,9 +2054,14 @@ def followup_diagnostic(db, task: Task, now_utc: datetime | None = None) -> dict
     local_now = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
     active = task.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
     sent_today = followups_sent_today(db, task, now_utc) if active else 0
-    cap = settings.waiting_max_followups_per_day if task.status == "WAITING" else settings.max_followups_per_task_per_day
-    code = "READY"
-    reason = "งานถึงคิวติดตามแล้ว และจะถูกพิจารณาใน cron รอบถัดไปค่ะ"
+    forced_cfg = get_forced_followup_config(db, task) if active else None
+    cap = None if forced_cfg else (settings.waiting_max_followups_per_day if task.status == "WAITING" else settings.max_followups_per_task_per_day)
+    code = "FORCED_READY" if forced_cfg else "READY"
+    reason = (
+        f"เปิดบังคับติดตามอยู่ ทุก {forced_cfg.get('interval_hours', 2):g} ชั่วโมง และถึงคิวแล้วค่ะ"
+        if forced_cfg else
+        "งานถึงคิวติดตามแล้ว และจะถูกพิจารณาใน cron รอบถัดไปค่ะ"
+    )
 
     if not active:
         code = "CLOSED"
@@ -2025,17 +2071,24 @@ def followup_diagnostic(db, task: Task, now_utc: datetime | None = None) -> dict
         reason = "งานยังเปิดอยู่ แต่ไม่มีเวลาติดตามครั้งถัดไป จึงถือว่าหลุดจากคิวค่ะ"
     elif not in_followup_window(local_now):
         code = "OUTSIDE_WORKING_HOURS"
-        reason = "ขณะนี้อยู่นอกเวลาติดตาม 08:30–17:30 ระบบจะรอช่วงเวลางานค่ะ"
-    elif sent_today >= cap:
+        if forced_cfg:
+            reason = "เปิดบังคับติดตามอยู่ แต่ขณะนี้อยู่นอกเวลา 08:30–17:30 ระบบจะรอช่วงเวลางานค่ะ"
+        else:
+            reason = "ขณะนี้อยู่นอกเวลาติดตาม 08:30–17:30 ระบบจะรอช่วงเวลางานค่ะ"
+    elif not forced_cfg and sent_today >= cap:
         code = "WAITING_DAILY_LIMIT" if task.status == "WAITING" else "DAILY_LIMIT_REACHED"
         reason = f"วันนี้ติดตามงานนี้แล้ว {sent_today} ครั้ง ครบเพดาน {cap} ครั้ง/วันค่ะ"
     elif task.next_reminder_at > now_utc:
         schedule_ev = _latest_followup_schedule_event(db, task)
-        code = "FUTURE_COMMITMENT" if schedule_ev else "NOT_DUE_YET"
-        if schedule_ev:
-            reason = f"มีนัดติดตามครั้งถัดไป {_fmt_local_dt(task.next_reminder_at)} จึงยังไม่ควรถามก่อนเวลาค่ะ"
+        if forced_cfg:
+            code = "FORCED_WAITING_INTERVAL"
+            reason = f"เปิดบังคับติดตามอยู่ รอบถัดไป {_fmt_local_dt(task.next_reminder_at)} ค่ะ"
         else:
-            reason = f"ยังไม่ถึงเวลาติดตามครั้งถัดไป {_fmt_local_dt(task.next_reminder_at)} ค่ะ"
+            code = "FUTURE_COMMITMENT" if schedule_ev else "NOT_DUE_YET"
+            if schedule_ev:
+                reason = f"มีนัดติดตามครั้งถัดไป {_fmt_local_dt(task.next_reminder_at)} จึงยังไม่ควรถามก่อนเวลาค่ะ"
+            else:
+                reason = f"ยังไม่ถึงเวลาติดตามครั้งถัดไป {_fmt_local_dt(task.next_reminder_at)} ค่ะ"
 
     return {
         "code": code,
@@ -2044,18 +2097,27 @@ def followup_diagnostic(db, task: Task, now_utc: datetime | None = None) -> dict
         "daily_cap": cap,
         "next_reminder_at": task.next_reminder_at,
         "line_bound": bool(task.assignee_user_id),
+        "forced_followup": bool(forced_cfg),
+        "forced_interval_hours": forced_cfg.get("interval_hours") if forced_cfg else None,
     }
 
 
 def _diagnostic_text(task: Task, diag: dict) -> str:
+    daily_text = (
+        f"{diag['sent_today']} ครั้ง (ไม่จำกัดรายวัน: บังคับติดตาม)"
+        if diag.get("forced_followup") else
+        f"{diag['sent_today']}/{diag['daily_cap']} ครั้ง"
+    )
     lines = [
         f"{task.task_code} {task.title}",
         f"สถานะ: {STATUS_THAI.get(task.status, task.status)}",
         f"ผู้รับผิดชอบ: {task.assignee_name or 'ยังไม่ระบุ'}",
         f"ติดตามครั้งถัดไป: {_fmt_local_dt(task.next_reminder_at)}",
-        f"ติดตามวันนี้: {diag['sent_today']}/{diag['daily_cap']} ครั้ง",
+        f"ติดตามวันนี้: {daily_text}",
         f"เหตุผล: {diag['reason']}",
     ]
+    if diag.get("forced_followup"):
+        lines.append(f"โหมด: บังคับติดตามทุก {diag.get('forced_interval_hours', 2):g} ชั่วโมง")
     if task.assignee_name and not task.assignee_user_id:
         lines.append("หมายเหตุ: ยังไม่ผูก LINE ผู้รับผิดชอบ จึง Mention โดยตรงไม่ได้ค่ะ")
     return "\n".join(lines)
@@ -2117,6 +2179,12 @@ def _remember_owner_task_context(db, task: Task | None) -> None:
 
 
 def _owner_reactivate_task(db, task: Task, *, user_id: str, reason: str = "") -> tuple[str, datetime]:
+    # Reopening a closed task must not silently revive an old forced-follow-up mode.
+    # The owner can explicitly enable it again after the task is active.
+    disable_forced_followup(
+        db, task, actor_name=settings.owner_display_name, actor_user_id=user_id,
+        reason="ปิดบังคับติดตามเดิมก่อนเปิดงานกลับมาติดตาม",
+    )
     now = datetime.utcnow()
     next_at = schedule_next_followup(task, now + timedelta(minutes=1))
     new_status = owner_reopen_task_state(
@@ -2124,6 +2192,36 @@ def _owner_reactivate_task(db, task: Task, *, user_id: str, reason: str = "") ->
         actor_user_id=user_id, reason=reason, now_utc=now,
     )
     return new_status, task.next_reminder_at
+
+
+def _parse_forced_followup_interval_hours(raw: str, default: float = 2.0) -> float:
+    """Parse owner phrases such as 'ทุก 2 ชั่วโมง' or 'ทุก 1 ชม.'.
+
+    Forced group follow-up is intentionally clamped to 1-8 hours to avoid
+    accidental high-frequency spam.
+    """
+    x = raw or ""
+    m = re.search(r"ทุก\s*(\d+(?:\.\d+)?)\s*(?:ชั่วโมง|ชม\.?|hr|hours?)", x, flags=re.IGNORECASE)
+    if not m:
+        return float(default)
+    try:
+        value = float(m.group(1))
+    except Exception:
+        value = float(default)
+    return max(1.0, min(8.0, value))
+
+
+def _normal_followup_after_forced_off(task: Task, now_utc: datetime | None = None) -> datetime | None:
+    if task.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+        return None
+    now_utc = now_utc or datetime.utcnow()
+    if task.status == "WAITING":
+        delay = timedelta(hours=24)
+    elif task.status == "IN_PROGRESS":
+        delay = timedelta(hours=6)
+    else:
+        delay = timedelta(hours=settings.reminder_repeat_hours)
+    return schedule_next_followup(task, now_utc + delay)
 
 
 def _extract_fu_code(raw: str) -> str | None:
@@ -2170,6 +2268,93 @@ async def handle_owner_command(user_id: str, text: str):
         with SessionLocal() as db:
             patch_followup_policy(db, state_questions={})
         await push_text(user_id, "ล้างกติกาคำถามตามสถานะแล้วค่ะ จะกลับไปใช้คำถามมาตรฐานของระบบ")
+        return
+
+    # v0.6.48 Owner Forced Follow-up Control -------------------------------
+    if low in ("ดูงานบังคับติดตาม", "ดูบังคับติดตาม", "ตรวจบังคับติดตาม"):
+        with SessionLocal() as db:
+            rows = list_forced_followups(db)
+        active_rows = [(t, cfg) for t, cfg in rows if t.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}]
+        if not active_rows:
+            await push_text(user_id, "ตอนนี้ไม่มีงานที่เปิดบังคับติดตามอยู่ค่ะ")
+            return
+        lines = [f"งานที่เปิดบังคับติดตาม {len(active_rows)} รายการค่ะ", ""]
+        for task, cfg in active_rows[:15]:
+            lines.append(
+                f"• {task.task_code} {task.title}\n"
+                f"  ผู้รับผิดชอบ: {task.assignee_name or '-'} | ทุก {cfg.get('interval_hours', 2):g} ชั่วโมง\n"
+                f"  ครั้งถัดไป: {_fmt_local_dt(task.next_reminder_at)}"
+            )
+        lines.append("\nปิดได้ด้วย: ปิดบังคับติดตาม FU-xxxxxx-xxxx")
+        await push_text(user_id, "\n".join(lines))
+        return
+
+    if low.startswith("ปิดบังคับติดตาม") or low.startswith("หยุดบังคับติดตาม"):
+        code = _extract_fu_code(raw)
+        if not code:
+            await push_text(user_id, "ระบุเลขงานด้วยนะคะ เช่น ปิดบังคับติดตาม FU-260924-0012")
+            return
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            existed = disable_forced_followup(
+                db, task, actor_name=settings.owner_display_name, actor_user_id=user_id,
+                reason="เจ้าของปิดบังคับติดตามจาก LINE ส่วนตัว",
+            )
+            if task.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+                task.next_reminder_at = _normal_followup_after_forced_off(task)
+                db.commit()
+                when = _fmt_local_dt(task.next_reminder_at)
+            else:
+                when = "ไม่มีคิว เพราะงานปิดแล้ว"
+        if existed:
+            await push_text(
+                user_id,
+                f"ปิดบังคับติดตาม {code} แล้วค่ะ\nกลับไปใช้คิวติดตามปกติ\nครั้งถัดไป: {when}",
+            )
+        else:
+            await push_text(user_id, f"{code} ไม่ได้เปิดบังคับติดตามอยู่ค่ะ")
+        return
+
+    if low.startswith("บังคับติดตาม"):
+        code = _extract_fu_code(raw)
+        if not code:
+            await push_text(
+                user_id,
+                "ระบุเลขงานด้วยนะคะ เช่น\nบังคับติดตาม FU-260924-0012\nหรือ บังคับติดตาม FU-260924-0012 ทุก 2 ชั่วโมง",
+            )
+            return
+        interval_hours = _parse_forced_followup_interval_hours(raw, 2.0)
+        with SessionLocal() as db:
+            task = get_task_by_code(db, code)
+            if not task:
+                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
+                return
+            if task.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
+                await push_text(user_id, f"{code} ปิดอยู่ค่ะ ต้องเปิดงานกลับมาก่อนจึงจะบังคับติดตามได้")
+                return
+            cfg = enable_forced_followup(
+                db, task, interval_hours=interval_hours,
+                actor_name=settings.owner_display_name, actor_user_id=user_id,
+            )
+            task.next_reminder_at = schedule_next_followup(task, datetime.utcnow())
+            db.commit()
+            when = _fmt_local_dt(task.next_reminder_at)
+            _remember_owner_task_context(db, task)
+            task_title = task.title
+            task_assignee = task.assignee_name or "-"
+        await push_text(
+            user_id,
+            f"เปิดบังคับติดตาม {code} แล้วค่ะ\n"
+            f"{task_title}\n"
+            f"ผู้รับผิดชอบ: {task_assignee}\n"
+            f"ความถี่: ทุก {cfg.get('interval_hours', 2):g} ชั่วโมง\n"
+            f"เริ่มรอบถัดไป: {when}\n\n"
+            "โหมดนี้ข้ามเพดานติดตามรายวัน แต่ยังส่งเฉพาะช่วง 08:30–17:30 ค่ะ\n"
+            f"หยุดได้ด้วย: ปิดบังคับติดตาม {code}",
+        )
         return
 
     # v0.6.39 Owner Follow-up Diagnostics & Control Center -----------------
@@ -2301,7 +2486,7 @@ async def handle_owner_command(user_id: str, text: str):
             rows = []
             for task in active:
                 diag = followup_diagnostic(db, task, now)
-                if diag["code"] in {"READY", "MISSING_NEXT_REMINDER"} and diag["sent_today"] == 0:
+                if diag["code"] in {"READY", "FORCED_READY", "MISSING_NEXT_REMINDER"} and diag["sent_today"] == 0:
                     rows.append((task, diag))
         if not rows:
             await push_text(user_id, "ตอนนี้ไม่พบงานที่ควรตามแต่ยังไม่ได้ตามค่ะ")
@@ -2496,6 +2681,10 @@ async def handle_owner_command(user_id: str, text: str):
                 await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
                 return
             title = task.title
+            disable_forced_followup(
+                db, task, actor_name=settings.owner_display_name, actor_user_id=user_id,
+                reason="ปิดบังคับติดตามอัตโนมัติก่อนลบงาน",
+            )
             deleted = delete_task_by_code(db, code)
         if deleted:
             await push_text(user_id, f"ลบงาน {code} ออกจากระบบเรียบร้อยค่ะ\n{title}")
@@ -2512,6 +2701,10 @@ async def handle_owner_command(user_id: str, text: str):
             old_status = task.status
             task.status = "COMPLETED"
             task.next_reminder_at = None
+            disable_forced_followup(
+                db, task, actor_name=settings.owner_display_name, actor_user_id=user_id,
+                reason="ปิดบังคับติดตามอัตโนมัติเมื่อเจ้าของปิดงาน",
+            )
             record_task_event(
                 db, task, "OWNER_STATUS_CHANGE", actor_name=settings.owner_display_name, actor_user_id=user_id,
                 text="ปิดงานจาก LINE ส่วนตัว", old_status=old_status, new_status="COMPLETED", commit=False,
@@ -2635,6 +2828,9 @@ async def handle_owner_command(user_id: str, text: str):
         "• ตรวจคิวติดตาม / งานไหนหลุดจากคิวติดตาม\n"
         "• ซ่อมคิว FU-xxxxxx-xxxx / ซ่อมคิวติดตาม\n"
         "• เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์\n"
+        "• บังคับติดตาม FU-xxxxxx-xxxx ทุก 2 ชั่วโมง\n"
+        "• ปิดบังคับติดตาม FU-xxxxxx-xxxx\n"
+        "• ดูงานบังคับติดตาม\n"
         "• ดูรูปแบบการติดตามปัจจุบัน\n"
         "• ตั้งโทนติดตาม: เป็นกันเอง กระชับ ไม่กดดัน\n"
         "• เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ\n"
@@ -2723,7 +2919,7 @@ def followups_sent_today(db, task: Task, now_utc: datetime) -> int:
     start_utc, end_utc = _local_day_utc_bounds(now_utc)
     return int(db.scalar(select(func.count(TaskEvent.id)).where(
         TaskEvent.task_id == task.id,
-        TaskEvent.event_type == "REMINDER_SENT",
+        TaskEvent.event_type.in_(["REMINDER_SENT", "FORCED_REMINDER_SENT"]),
         TaskEvent.created_at >= start_utc,
         TaskEvent.created_at < end_utc,
     )) or 0)
@@ -2804,16 +3000,24 @@ def repair_missing_reminder_schedule(db, now_utc: datetime) -> int:
 
 
 async def reminder_scan(force: bool = False):
-    stats = {"due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0, "skipped_daily_cap": 0, "deferred_spread": 0, "repaired_schedule": 0}
+    stats = {
+        "due": 0, "sent": 0, "failed": 0, "skipped_quiet": 0,
+        "skipped_daily_cap": 0, "deferred_spread": 0, "repaired_schedule": 0,
+        "forced_active": 0, "forced_sent": 0,
+    }
     now = datetime.utcnow()
 
     # Self-heal legacy/open tasks that have no next reminder at all. Without
     # this, they are invisible to the due query and can remain unfollowed forever.
     with SessionLocal() as repair_db:
         stats["repaired_schedule"] = repair_missing_reminder_schedule(repair_db, now)
+        stats["forced_active"] = len([
+            1 for task, cfg in list_forced_followups(repair_db)
+            if task.status in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
+        ])
 
     # Group follow-up is strictly limited to the working window 08:30-17:30.
-    # Due reminders are preserved and delivered after the next window opens.
+    # Forced follow-up intentionally respects this same safety window.
     if not force and not in_followup_window():
         with SessionLocal() as db:
             stats["due"] = db.query(Task).filter(
@@ -2835,7 +3039,11 @@ async def reminder_scan(force: bool = False):
         group_sent_counts: dict[str, int] = {}
 
         for t in tasks:
+            forced_cfg = get_forced_followup_config(db, t)
+            task_forced = bool(forced_cfg)
+
             # Avoid a robotic burst of many reminders in the same cron tick.
+            # Forced mode bypasses only the per-task daily cap, not group burst control.
             if not force and stats["sent"] >= settings.max_followups_per_scan:
                 stats["deferred_spread"] += 1
                 continue
@@ -2845,11 +3053,10 @@ async def reminder_scan(force: bool = False):
                 stats["deferred_spread"] += 1
                 continue
 
-            # Daily cap: normal tasks max 2 follow-ups/day; WAITING max 1/day.
-            # This preserves daily follow-up while avoiding repetitive pressure.
+            # Normal tasks respect the daily cap. Owner-enabled forced tasks do not.
             sent_today = followups_sent_today(db, t, now)
             daily_cap = settings.waiting_max_followups_per_day if t.status == "WAITING" else settings.max_followups_per_task_per_day
-            if not force and sent_today >= daily_cap:
+            if not force and not task_forced and sent_today >= daily_cap:
                 t.next_reminder_at = schedule_next_followup(t, now, force_next_day=True)
                 db.commit()
                 stats["skipped_daily_cap"] += 1
@@ -2871,9 +3078,20 @@ async def reminder_scan(force: bool = False):
                 use_mention = bool(t.assignee_user_id)
                 greeting = "{assignee}คะ" if use_mention else (f"{assignee}คะ" if assignee != "ทีม" else "ทีมคะ")
                 topic = task_reference_label(db, t)
-                is_pre_due = bool(t.due_at and now < t.due_at)
 
-                if is_pre_due:
+                # Forced mode means "ask again on the forced interval" even when the
+                # formal due date is still in the future; it therefore does not use
+                # the one-off pre-due reminder path. Human future commitments can
+                # still move next_reminder_at later through normal status handling.
+                is_pre_due = bool(t.due_at and now < t.due_at and not task_forced)
+
+                if task_forced:
+                    body, _ = contextual_followup_text(
+                        db, t, greeting[:-2] if greeting.endswith("คะ") else greeting, settings.owner_display_name
+                    )
+                    interval_hours = float(forced_cfg.get("interval_hours", 2) or 2)
+                    t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=interval_hours))
+                elif is_pre_due:
                     due_text = format_due_local(t)
                     body = apply_followup_policy(db, (
                         f"{greeting} เรื่อง{topic}กำหนด {due_text} นะคะ\n"
@@ -2908,25 +3126,34 @@ async def reminder_scan(force: bool = False):
                         body = plain_body
                 else:
                     sent_message_id = await push_text(t.group_id, body)
+
+                message_kind = "FORCED_REMINDER" if task_forced else ("PRE_DUE" if is_pre_due else "REMINDER")
+                event_type = "FORCED_REMINDER_SENT" if task_forced else ("PRE_DUE_REMINDER_SENT" if is_pre_due else "REMINDER_SENT")
                 if sent_message_id:
                     db.add(OutboundTaskMessage(
                         line_message_id=sent_message_id, task_id=t.id, group_id=t.group_id,
-                        message_kind="PRE_DUE" if is_pre_due else "REMINDER",
+                        message_kind=message_kind,
                     ))
                 # Advance reminders are logged, but do not count toward escalation.
-                # `reminder_count` remains a count of actual follow-ups at/after due time.
+                # Forced reminders are actual follow-ups and do count.
                 if not is_pre_due:
                     t.reminder_count += 1
                 t.last_reminded_at = now
                 record_task_event(
-                    db, t, "PRE_DUE_REMINDER_SENT" if is_pre_due else "REMINDER_SENT",
+                    db, t, event_type,
                     actor_name="LINE Follow-up Assistant",
                     text=body, old_status=None, new_status=t.status, commit=False,
                 )
                 db.commit()
                 stats["sent"] += 1
+                if task_forced:
+                    stats["forced_sent"] += 1
                 group_sent_counts[t.group_id] = group_sent_counts.get(t.group_id, 0) + 1
-                print("reminder sent:", t.task_code, t.status, "pre_due=", is_pre_due, "count=", t.reminder_count)
+                print(
+                    "reminder sent:", t.task_code, t.status,
+                    "pre_due=", is_pre_due, "forced=", task_forced,
+                    "count=", t.reminder_count,
+                )
 
                 if settings.owner_escalation_alerts and settings.owner_line_user_id:
                     if became_overdue:

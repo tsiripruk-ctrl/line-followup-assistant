@@ -2396,6 +2396,124 @@ def set_runtime_preference(db: Session, key: str, value: str) -> str:
     return str(value)
 
 
+# v0.6.48 owner-controlled persistent/forced follow-up -----------------------
+FORCED_FOLLOWUP_PREF_KEY = "forced_followup_tasks_v1"
+
+
+def get_forced_followup_registry(db: Session) -> dict:
+    """Return the owner-controlled forced-follow-up registry.
+
+    It is stored in OwnerPreference rather than Task columns so v0.6.48 needs no
+    database migration. Keys are upper-case FU task codes.
+    """
+    raw = get_runtime_preference(db, FORCED_FOLLOWUP_PREF_KEY, "{}") or "{}"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        return {}
+    clean = {}
+    for code, cfg in data.items():
+        code = str(code or "").upper().strip()
+        if not code or not isinstance(cfg, dict):
+            continue
+        try:
+            hours = float(cfg.get("interval_hours", 2))
+        except Exception:
+            hours = 2.0
+        hours = max(1.0, min(8.0, hours))
+        clean[code] = {
+            "enabled": bool(cfg.get("enabled", True)),
+            "interval_hours": hours,
+            "enabled_at": str(cfg.get("enabled_at") or ""),
+            "actor_user_id": str(cfg.get("actor_user_id") or ""),
+        }
+    return clean
+
+
+def save_forced_followup_registry(db: Session, registry: dict) -> dict:
+    normalized = {}
+    for code, cfg in (registry or {}).items():
+        code = str(code or "").upper().strip()
+        if not code or not isinstance(cfg, dict):
+            continue
+        try:
+            hours = float(cfg.get("interval_hours", 2))
+        except Exception:
+            hours = 2.0
+        normalized[code] = {
+            "enabled": bool(cfg.get("enabled", True)),
+            "interval_hours": max(1.0, min(8.0, hours)),
+            "enabled_at": str(cfg.get("enabled_at") or ""),
+            "actor_user_id": str(cfg.get("actor_user_id") or ""),
+        }
+    set_runtime_preference(
+        db, FORCED_FOLLOWUP_PREF_KEY,
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True),
+    )
+    return normalized
+
+
+def get_forced_followup_config(db: Session, task_or_code) -> dict | None:
+    code = task_or_code.task_code if hasattr(task_or_code, "task_code") else str(task_or_code or "")
+    cfg = get_forced_followup_registry(db).get(str(code).upper().strip())
+    return cfg if cfg and cfg.get("enabled") else None
+
+
+def enable_forced_followup(
+    db: Session, task: Task, *, interval_hours: float = 2.0,
+    actor_name: str | None = None, actor_user_id: str | None = None,
+) -> dict:
+    hours = max(1.0, min(8.0, float(interval_hours or 2.0)))
+    registry = get_forced_followup_registry(db)
+    cfg = {
+        "enabled": True,
+        "interval_hours": hours,
+        "enabled_at": utcnow().isoformat(timespec="seconds"),
+        "actor_user_id": actor_user_id or "",
+    }
+    registry[task.task_code.upper()] = cfg
+    save_forced_followup_registry(db, registry)
+    record_task_event(
+        db, task, "FORCED_FOLLOWUP_ENABLED", actor_name=actor_name, actor_user_id=actor_user_id,
+        text=f"บังคับติดตามทุก {hours:g} ชั่วโมง", old_status=task.status, new_status=task.status, commit=True,
+    )
+    return cfg
+
+
+def disable_forced_followup(
+    db: Session, task: Task, *, actor_name: str | None = None,
+    actor_user_id: str | None = None, reason: str = "",
+) -> bool:
+    registry = get_forced_followup_registry(db)
+    code = task.task_code.upper()
+    existed = code in registry
+    if existed:
+        registry.pop(code, None)
+        save_forced_followup_registry(db, registry)
+        record_task_event(
+            db, task, "FORCED_FOLLOWUP_DISABLED", actor_name=actor_name, actor_user_id=actor_user_id,
+            text=reason or "ปิดบังคับติดตาม", old_status=task.status, new_status=task.status, commit=True,
+        )
+    return existed
+
+
+def list_forced_followups(db: Session) -> list[tuple[Task, dict]]:
+    registry = get_forced_followup_registry(db)
+    if not registry:
+        return []
+    tasks = list(db.scalars(select(Task).where(Task.task_code.in_(list(registry.keys())))).all())
+    by_code = {t.task_code.upper(): t for t in tasks}
+    rows = []
+    for code, cfg in registry.items():
+        task = by_code.get(code)
+        if task and cfg.get("enabled"):
+            rows.append((task, cfg))
+    rows.sort(key=lambda row: row[0].id, reverse=True)
+    return rows
+
+
 def owner_reopen_task_state(
     db: Session,
     task: Task,

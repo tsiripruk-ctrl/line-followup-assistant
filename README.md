@@ -1,4 +1,22 @@
-# LINE Follow-up Assistant v0.6.47
+# LINE Follow-up Assistant v0.6.48
+
+## v0.6.48 — Owner Forced Follow-up Control
+
+เพิ่มโหมด **บังคับติดตาม** สำหรับ Owner Private เพื่อสั่งให้เลขาฯ ถามงานเดิมซ้ำตามช่วงเวลาที่กำหนด โดยไม่ติดเพดานจำนวนครั้งต่อวันของ Reminder ปกติ แต่ยังคงเคารพเวลางาน 08:30–17:30 และการควบคุมไม่ให้ข้อความพุ่งออกพร้อมกันในกลุ่ม
+
+คำสั่งหลัก:
+- `บังคับติดตาม FU-260924-0012` — เปิดโหมดบังคับติดตาม ค่าเริ่มต้นทุก 2 ชั่วโมง
+- `บังคับติดตาม FU-260924-0012 ทุก 1 ชั่วโมง` — กำหนดความถี่เอง (รองรับ 1–8 ชั่วโมง)
+- `ปิดบังคับติดตาม FU-260924-0012` — ปิดโหมดบังคับ และกลับไปใช้คิว Reminder ปกติ
+- `ดูงานบังคับติดตาม` — ดูรายการที่กำลังเปิดโหมดนี้อยู่
+
+กติกาความปลอดภัย:
+- เปิด/ปิดได้จาก Owner Private เท่านั้น
+- บังคับติดตามจะข้าม daily cap ของ Task นั้น แต่ไม่ข้ามเวลา 08:30–17:30
+- ยังใช้ข้อความแบบ context-aware / natural secretary tone เดิม
+- ถ้างานถูกปิดเป็น COMPLETED/CANCELLED ระบบหยุดส่ง และล้าง forced mode เมื่อปิดผ่านเส้นทางที่รองรับ
+- ถ้าเปิดงานที่เคยปิดกลับมา forced mode เดิมจะไม่ฟื้นเอง ต้องสั่งเปิดใหม่
+- ไม่เพิ่มคอลัมน์ Task และไม่ต้องทำ Database Migration ใหม่; config เก็บใน `owner_preferences`
 
 ## v0.6.47 — Mention Resilience & Natural Assignment Fallback
 
@@ -9,7 +27,7 @@
 - Example covered: `@Proud🤍 มีเรื่องไหมอยากให้ช่วยดู พี่ฝากเรื่อง "งานคอมฯ ศูนย์ข้อมูลความสงบฯ ภ.จว.ระนอง" ว่าเรากู้ไฟแนนซ์มากี่บาท`
 
 
-Built directly on v0.6.4. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
+Built directly on v0.6.47. This release preserves PostgreSQL, Timeline, assignee normalization, LINE @mention assignment/follow-up, quoted-message matching, content-first safe task matching, reminders and daily briefs.
 
 ## New in v0.6.46 — Natural Mentioned Assignment Routing
 
