@@ -8,6 +8,7 @@ from sqlalchemy import select, func, delete, or_
 from sqlalchemy.orm import Session
 from models import Message, Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
 from config import settings
+from intent_engine import is_procurement_waiting_update
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
 STATUS_THAI = {
@@ -1331,6 +1332,11 @@ def derive_progress_snapshot(text: str | None, status: str | None = None) -> dic
     if status == "WAITING" and not waiting:
         waiting = summary if any(k in summary for k in ("รอ", "ยังไม่", "ติด")) else ""
 
+    if is_procurement_waiting_update(text):
+        compact = re.sub(r"\s+", "", text or "")
+        waiting = "รอรับอุปกรณ์ที่สั่งซื้อ"
+        handoff = re.search(r"ส่งให้(.+?)(?:ครับ|ค่ะ|นะครับ|นะคะ|[.!?]|$)", compact)
+        next_action = ("รับของแล้วส่งให้" + handoff.group(1)) if handoff else "รับอุปกรณ์ที่สั่งซื้อ"
     waiting = waiting.replace("คอนเฟิร์ม", "ยืนยัน").replace("เฟิร์ม", "ยืนยัน")
     if waiting and "ยืนยัน" in waiting and any(k in (text or "") for k in ("จัดส่ง", "ส่งสินค้า")):
         next_action = "ยืนยันวันจัดส่งสินค้า"

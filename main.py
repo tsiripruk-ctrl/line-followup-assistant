@@ -17,7 +17,7 @@ from config import settings
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
-from intent_engine import classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, is_natural_assignment_request, parse_command_prefix, is_safe_quoted_completion, should_clarify_unmatched_query
+from intent_engine import is_procurement_waiting_update, classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, is_natural_assignment_request, parse_command_prefix, is_safe_quoted_completion, should_clarify_unmatched_query
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -35,7 +35,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.49"
+VERSION = "0.6.50"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -134,6 +134,7 @@ def health():
         "milestone_completion_guard": True,
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
+        "quoted_progress_receipt": True, "procurement_waiting_update": True,
         "future_commitment_extraction": True, "task_context_isolation": True,
         "date_aware_followup": True, "future_commitment_memory": True,
         "weekday_followup_scheduling": True,
@@ -204,6 +205,8 @@ def infer_local_status_signal(text: str | None) -> str:
     result = classify_message_intent(text)
     compact = "".join((text or "").lower().split())
     if result.intent == "PROGRESS_UPDATE" and "รอ" in compact:
+        return "waiting"
+    if result.intent == "PROGRESS_UPDATE" and is_procurement_waiting_update(text):
         return "waiting"
     return intent_to_status_signal(result.intent)
 
@@ -960,6 +963,34 @@ async def acknowledge_task_reply(reply_token: str | None, group_id: str, status_
         print("task reply acknowledgement failed:", repr(exc))
 
 
+async def acknowledge_committed_quoted_update(reply_token: str | None, group_id: str, message_id: str):
+    """Confirm only a durable update, using the task actually changed by this message."""
+    with SessionLocal() as db:
+        tasks = list(db.scalars(select(Task).join(TaskEvent, TaskEvent.task_id == Task.id).where(
+            Task.group_id == group_id, TaskEvent.message_id == message_id,
+            TaskEvent.event_type.in_(["PROGRESS_UPDATE", "COMPLETION_CONFIRMATION"]),
+        )).unique().all())
+        if len(tasks) != 1:
+            return
+        task = tasks[0]
+        if task.status == "COMPLETED":
+            text = f"บันทึกแล้วค่ะ เรื่อง{task.title} เสร็จเรียบร้อยแล้ว"
+        else:
+            parts = [f"บันทึกอัปเดตเรื่อง{task.title}แล้วค่ะ"]
+            if task.progress_summary:
+                parts.append(task.progress_summary)
+            if task.waiting_on:
+                parts.append(f"ตอนนี้: {task.waiting_on}")
+            if task.next_action:
+                parts.append(f"ขั้นตอนถัดไป: {task.next_action}")
+            if task.next_reminder_at:
+                parts.append(f"จะติดตามต่อ {_fmt_local_dt(task.next_reminder_at)} ค่ะ")
+            text = "\n".join(parts)
+        task_id = task.id
+    await safe_reply_or_push_task(reply_token, group_id, text, task_id,
+                                 message_kind="PROGRESS_RECEIPT", label="quoted update receipt")
+
+
 async def safe_push_text(to: str | None, text: str, *, label: str = "notification") -> bool:
     """Best-effort LINE push that must never invalidate an already-committed task update."""
     if not to:
@@ -1247,6 +1278,10 @@ async def process_message(event: dict):
     except Exception as exc:
         print("process_message failed:", repr(exc), "source_type=", source_type, "text=", repr(text))
         if source_type == "group" and source_id and local_status != "none":
+            if msg.get("quotedMessageId"):
+                await safe_reply_or_push(reply_token, source_id,
+                    "ยังบันทึกอัปเดตนี้ไม่สำเร็จค่ะ กรุณาส่งตอบกลับงานเดิมอีกครั้งนะคะ",
+                    label="quoted update failed")
             # Never expose technical processing failure or a canned fallback in the work group.
             # Keep the group quiet; diagnostics go only to the owner.
             if settings.owner_status_updates and settings.owner_line_user_id:
@@ -1306,9 +1341,16 @@ async def _process_message(event: dict):
     # will now return an explicit acknowledgement rather than silence.
     try:
         with SessionLocal() as db:
-            if db.scalar(select(Message).where(Message.line_message_id == msg["id"])):
-                return
-            db.add(Message(
+            existing_message = db.scalar(select(Message).where(Message.line_message_id == msg["id"]))
+            if existing_message:
+                committed_quote = db.scalar(select(TaskEvent.id).where(
+                    TaskEvent.message_id == msg["id"],
+                    TaskEvent.event_type.in_(["PROGRESS_UPDATE", "COMPLETION_CONFIRMATION", "COMMENT"]),
+                ).limit(1))
+                if not quoted_message_id or committed_quote:
+                    return
+            if not existing_message:
+                db.add(Message(
                 line_message_id=msg["id"], source_type=source_type, source_id=source_id,
                 user_id=user_id, display_name=display_name, text=text
             ))
@@ -1403,6 +1445,12 @@ async def _process_message(event: dict):
             reason="deterministic local status path",
         )
         print("fast local status:", local_status, repr(text))
+    elif quoted_message_id:
+        # Exact reply resolution must not depend on an external extraction service.
+        extraction = TaskExtraction(
+            is_task=False, confidence=1.0, status_signal="none",
+            is_task_reply=True, related_task_hint=text, reason="quoted_local_context",
+        )
     else:
         try:
             extraction = await asyncio.to_thread(extract_task, (command_text or text), display_name)
@@ -1464,25 +1512,24 @@ async def _process_message(event: dict):
         changed = await handle_quoted_task_reply(
             source_id, user_id, display_name, quoted_message_id, extraction, text, msg["id"]
         )
-        # v0.6.45: a short completion reply to an unmapped quote must never fall
-        # through to recency/identity-based matching.  Silence is safer than closing
-        # a different task.  Exact task identity can be recovered only from the quoted
-        # message itself (outbound mapping, task event id, or quoted text).
-        if changed is None and is_safe_quoted_completion(text):
-            print("[UNRESOLVED_QUOTED_COMPLETION_BLOCKED]", {
-                "quoted_message_id": quoted_message_id, "sender": display_name, "text": text
-            })
+        if changed is None:
+            # An unmapped quote must never fall through to another task's recency.
+            if local_status != "none":
+                await safe_reply_or_push(
+                    reply_token, source_id,
+                    "ยังเชื่อมข้อความตอบกลับนี้กับงานเดิมไม่ได้ค่ะ ช่วยระบุชื่องาน หรือ Reply ข้อความติดตามล่าสุดของงานนั้นอีกครั้งนะคะ",
+                    label="unresolved quoted update",
+                )
+                if settings.owner_line_user_id:
+                    await safe_push_text(settings.owner_line_user_id,
+                        f"ยังไม่ได้บันทึกอัปเดตจาก {display_name or user_id}: {text}\nquotedMessageId: {quoted_message_id}",
+                        label="unresolved quote owner")
             return
-        if changed is not None:
-            # v0.6.35: acknowledgement must follow the *committed* quoted-reply result,
-            # not the original AI extraction. Short quote replies such as "เรียบร้อยแล้ว"
-            # can be safely promoted to completion inside handle_quoted_task_reply(),
-            # while extraction.status_signal may still be "none".
-            effective_ack_signal = "completed" if is_safe_quoted_completion(text) else extraction.status_signal
-            await acknowledge_task_reply(reply_token, source_id, effective_ack_signal)
-            if changed and settings.owner_status_updates and settings.owner_line_user_id:
+        if changed:
+            await acknowledge_committed_quoted_update(reply_token, source_id, msg["id"])
+            if settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(settings.owner_line_user_id, changed, label="quoted status owner")
-            return
+        return
 
     # Long replies can contain updates for several projects. Never feed the full
     # mixed message into a single-task matcher; split and attach only strong segments.
@@ -1703,6 +1750,8 @@ async def handle_quoted_task_reply(
         if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
             print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
             signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
+    if safety_intent.intent == "PROGRESS_UPDATE" and is_procurement_waiting_update(text):
+        signal = "waiting"
     new_status = mapping.get(signal)
 
     # Phase 1: resolve exact quoted task and commit the operational update only.
@@ -1759,13 +1808,6 @@ async def handle_quoted_task_reply(
                     target.next_reminder_at = datetime.utcnow() + timedelta(hours=6)
                 event_type = "QUOTED_STATUS_REPLY"
             else:
-                forced_cfg = get_forced_followup_config(db, target)
-                if forced_cfg:
-                    target.next_reminder_at = schedule_next_followup(
-                        target, datetime.utcnow() + timedelta(hours=float(forced_cfg.get("interval_hours", 2) or 2))
-                    )
-                else:
-                    target.next_reminder_at = datetime.utcnow() + timedelta(hours=settings.reminder_repeat_hours)
                 event_type = "QUOTED_COMMENT_REPLY"
 
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender}: {text}").strip()
@@ -1782,8 +1824,8 @@ async def handle_quoted_task_reply(
                     message_id=message_id, confidence=float(getattr(extraction, "confidence", 0.0) or 0.0),
                 )
 
-            # Memory is useful but cannot be allowed to abort the status update.
-            try:
+            if new_status:
+                # Snapshot and status are committed together before any receipt.
                 memory = summarize_progress_update(text)
                 if memory:
                     record_task_event(
@@ -1796,9 +1838,7 @@ async def handle_quoted_task_reply(
                     message_id=message_id, confidence=float(getattr(extraction, "confidence", 0.0) or 0.0),
                     commit=False,
                 )
-            except Exception as memory_exc:
-                print("quoted reply memory skipped:", type(memory_exc).__name__, repr(memory_exc))
-
+    
             if new_status != "COMPLETED":
                 commitment_at = extract_followup_commitment_at(text)
                 if commitment_at:

@@ -1,0 +1,9 @@
+{
+  "version": "0.6.50",
+  "base": "0.6.49",
+  "tests_passed": 134,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false
+}

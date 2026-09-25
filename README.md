@@ -1,4 +1,8 @@
-# LINE Follow-up Assistant v0.6.49
+# LINE Follow-up Assistant v0.6.50
+
+## v0.6.50 — รับ Reply และยืนยันการบันทึกความคืบหน้า
+
+แก้กรณีสั่งซื้ออุปกรณ์แล้วรอรับของเพื่อส่งต่อ โดยตอบรับจากข้อมูลที่บันทึกสำเร็จ พร้อมสิ่งที่รอ ขั้นตอนถัดไป และรอบติดตาม ดู [release notes](RELEASE_v0.6.50.md)
 
 ## v0.6.49 — Future Commitment Extraction & Task Context Isolation
 
