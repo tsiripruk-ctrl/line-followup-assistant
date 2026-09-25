@@ -1,0 +1,11 @@
+{
+  "version": "0.6.49",
+  "source_archive": "line-followup-assistant-v0.6.48.zip",
+  "source_sha256": "e02a0f8360b25aa9db5333b4ccca862dbac23457d4346780e3dda9224459fa93",
+  "compile": "PASS",
+  "regression_tests": 125,
+  "subtests": 14,
+  "health_http": 200,
+  "live_line_tested": false,
+  "production_postgresql_tested": false
+}

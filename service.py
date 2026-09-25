@@ -226,7 +226,10 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
             if year >= 2400:
                 year -= 543
             elif year < 100:
-                year += 2000
+                # Thai short BE years 40..99; 00..39 retain short CE convention.
+                year += 2500 if year >= 40 else 2000
+                if year >= 2400:
+                    year -= 543
         else:
             year = local.year
         try:
@@ -235,7 +238,7 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
                 candidate = datetime(year + 1, month, day).date()
             target_date = candidate
         except ValueError:
-            pass
+            return None
 
     if target_date is None:
         return None
@@ -261,6 +264,8 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
             hour=settings.followup_start_hour, minute=settings.followup_start_minute
         )
 
+    if target_local <= local:
+        return None
     return target_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 def task_code(task_id: int) -> str:
@@ -974,6 +979,8 @@ def recent_reminder_context_target(
     This gives the bot conversational continuity while preventing one employee's
     unrelated update from contaminating another open task.
     """
+    if explicit_task_scope(db, text) is not None:
+        return None  # Explicit identity must use the full resolver, not recency.
     if not group_id:
         return None
     cutoff = datetime.utcnow() - timedelta(minutes=max_minutes)
@@ -1035,6 +1042,66 @@ def recent_reminder_context_target(
     return scored[0][1]
 
 
+def explicit_task_scope(db: Session, text: str | None) -> list[Task] | None:
+    """Return a hard identity scope from stable metadata, never mutable history.
+
+    None means no explicit identity; [] means an explicit unknown FU code.
+    Match the longest known project/title phrase to avoid substring collisions.
+    """
+    raw = text or ""
+    codes = re.findall(r"FU-\d{6}-\d{4,}", raw, re.I)
+    all_tasks = list(db.scalars(select(Task)).all())
+    if codes:
+        return [t for t in all_tasks if t.task_code.upper() in {c.upper() for c in codes}]
+    named_project = re.search(r"โครงการ\s*([^\s,?]+)", raw)
+    if named_project:
+        subject = re.split(r"วันนี้|พรุ่งนี้|ถึงไหน|ตอนนี้", named_project.group(1))[0]
+        subject_key = _match_text(subject).replace(" ", "")
+        if subject_key:
+            return [t for t in all_tasks if subject_key in
+                    _match_text(" ".join([t.title or "", t.project or ""])).replace(" ", "")]
+    compact = _match_text(raw).replace(" ", "")
+    generic_labels = {"จัดส่งสินค้า", "สินค้า", "เอกสาร", "ติดตามงาน"}
+    generic_labels.update(term for terms in TOPIC_ANCHOR_TERMS.values() for term in terms)
+    matches = []
+    query_core = _semantic_core(raw)
+    for t in all_tasks:
+        stable = _match_text(" ".join([t.title or "", t.project or ""])).replace(" ", "")
+        if len(query_core) >= 5 and query_core in stable and not _is_generic_status_only(raw):
+            matches.append((len(query_core), query_core, t))
+        labels = [t.project or "", t.title or ""]
+        labels += (t.title or "").split()
+        for label in labels:
+            key = _match_text(label).replace(" ", "")
+            if (len(key) >= 5 and key in compact and label.lower() not in generic_labels
+                    and not _is_generic_status_only(label)):
+                matches.append((len(key), key, t))
+    if not matches:
+        return None
+    longest = max(n for n, _, _ in matches)
+    keys = {key for n, key, _ in matches if n == longest}
+    return [t for t in all_tasks if any(
+        key in _match_text(" ".join([t.title or "", t.project or ""])).replace(" ", "")
+        for key in keys)]
+
+
+def pending_commitment_at(db: Session, task: Task) -> datetime | None:
+    value = get_runtime_preference(db, "commitment:" + task.task_code)
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def remember_commitment(db: Session, task: Task, value: datetime | None) -> None:
+    key = "commitment:" + task.task_code
+    row = db.scalar(select(OwnerPreference).where(OwnerPreference.key == key))
+    if row is None:
+        row = OwnerPreference(key=key, value="")
+        db.add(row)
+    row.value = value.isoformat() if value else ""
+
+
 def rank_status_targets_with_history(db: Session, tasks: list[Task], sender_name: str | None, assignee_name: str | None, hint: str | None, sender_user_id: str | None = None) -> list[dict]:
     """Rank tasks using title/project plus recent task-event text.
 
@@ -1042,6 +1109,9 @@ def rank_status_targets_with_history(db: Session, tasks: list[Task], sender_name
     exists in the original CREATED event, e.g. task title "ต่อประกันรถ" while the
     original assignment mentioned "ชำระ/จ่ายค่าประกันรถ".
     """
+    scope = explicit_task_scope(db, hint)
+    if scope is not None:
+        tasks = [t for t in tasks if t in scope]
     sender = normalize_name(sender_name)
     extracted_assignee = normalize_name(assignee_name)
     rows = []
@@ -1092,6 +1162,11 @@ def choose_status_target_with_history(db: Session, tasks: list[Task], sender_nam
     """Safer resolver that also considers the task's original conversation history."""
     if not tasks:
         return None
+    scope = explicit_task_scope(db, hint)
+    if scope is not None:
+        tasks = [t for t in tasks if t in scope]
+        if len(tasks) == 1:
+            return tasks[0]
     rows = rank_status_targets_with_history(db, tasks, sender_name, assignee_name, hint, sender_user_id)
 
     # Business-first deterministic resolver for short operational updates. It runs
@@ -1256,6 +1331,11 @@ def derive_progress_snapshot(text: str | None, status: str | None = None) -> dic
     if status == "WAITING" and not waiting:
         waiting = summary if any(k in summary for k in ("รอ", "ยังไม่", "ติด")) else ""
 
+    waiting = waiting.replace("คอนเฟิร์ม", "ยืนยัน").replace("เฟิร์ม", "ยืนยัน")
+    if waiting and "ยืนยัน" in waiting and any(k in (text or "") for k in ("จัดส่ง", "ส่งสินค้า")):
+        next_action = "ยืนยันวันจัดส่งสินค้า"
+    elif not next_action and re.search(r"(?:วันที่|ประมาณ).*?\d{1,2}[/\-]\d{1,2}", text or ""):
+        next_action = _progress_clause(text, ("วันที่", "ประมาณ"))
     return {"summary": summary, "waiting_on": waiting, "next_action": next_action}
 
 
@@ -1278,6 +1358,19 @@ def update_task_progress_snapshot(
     snap = derive_progress_snapshot(text, task.status)
     if not snap["summary"]:
         return snap
+    commitment = extract_followup_commitment_at(text)
+    if task.status == "COMPLETED":
+        remember_commitment(db, task, None)
+    elif commitment:
+        remember_commitment(db, task, commitment)
+    else:
+        commitment = pending_commitment_at(db, task)
+    if task.status != "COMPLETED" and commitment and commitment > utcnow():
+        task.next_reminder_at = max(task.next_reminder_at or commitment, commitment)
+    if commitment and commitment > utcnow() and _is_generic_status_only(text):
+        snap["summary"] = task.progress_summary or snap["summary"]
+        snap["waiting_on"] = task.waiting_on or snap["waiting_on"]
+        snap["next_action"] = task.next_action or snap["next_action"]
     task.progress_summary = snap["summary"]
     task.waiting_on = snap["waiting_on"] or None
     task.next_action = snap["next_action"] or None
@@ -1632,6 +1725,9 @@ def _waiting_question(waiting_on: str, reminder_count: int = 0) -> str:
     if not w:
         return "ตอนนี้สิ่งที่รออยู่ขยับไปถึงไหนแล้วคะ"
 
+    confirmation = re.search(r"รอ\s*(.+?)\s*ยืนยัน", waiting_on)
+    if confirmation:
+        return f"ตอนนี้{confirmation.group(1)}ยืนยันแล้วหรือยังคะ"
     # Extract the party being waited on instead of echoing a whole progress sentence.
     party = ""
     m = re.search(r"(?:ทาง)?\s*(เซลล์|sales|เจ้าหน้าที่|ผู้ขาย|supplier|futong)[^,.;]*?(?:ยังไม่ตอบรับ|ยังไม่ตอบ|ตอบกลับ|ตอบรับ|ตอบ)", low)
@@ -2259,7 +2355,7 @@ def _smart_search_terms(query: str) -> list[str]:
         {"เทศบาล", "เทศบาลเมือง", "เทศบาลตำบล"},
     ]
     for group in groups:
-        if q in group or any(token in q.split() for token in group):
+        if q in group:
             terms.update(group)
     # harmless spacing/punctuation variants
     terms.add(q.replace(" ", ""))
@@ -2273,6 +2369,9 @@ def smart_search_tasks(db: Session, query: str, limit: int = 50) -> list[Task]:
     evidence is required; this function deliberately does not use fuzzy similarity to
     avoid cross-project contamination.
     """
+    scope = explicit_task_scope(db, query)
+    if scope is not None:
+        return sorted(scope, key=lambda t: (t.updated_at, t.id), reverse=True)[:limit]
     terms = _smart_search_terms(query)
     if not terms:
         return []
@@ -2312,6 +2411,12 @@ def find_existing_followup_task(
     tasks = open_tasks(db, group_id)
     if not tasks:
         return None, 0.0, []
+    scope = explicit_task_scope(db, text)
+    if scope is not None:
+        tasks = [t for t in tasks if t in scope]
+        if len(tasks) == 1:
+            return tasks[0], 1.0, []
+        return None, 0.0, tasks[:3]
     match_text = text or ""
     # Assignee names in a follow-up request are routing metadata, not task subject.
     # Remove the explicit assignee from the semantic text before comparing subjects.

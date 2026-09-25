@@ -1,4 +1,8 @@
-# LINE Follow-up Assistant v0.6.48
+# LINE Follow-up Assistant v0.6.49
+
+## v0.6.49 — Future Commitment Extraction & Task Context Isolation
+
+แก้ปีไทยสองหลัก บันทึกวันนัดและสิ่งที่รอยืนยัน ป้องกันเตือนก่อนนัด และจำกัดบริบทตาม FU/โครงการก่อนค้นหาหรืออัปเดต ดูรายละเอียดและขั้นตอนทดสอบใน [RELEASE_v0.6.49.md](RELEASE_v0.6.49.md)
 
 ## v0.6.48 — Owner Forced Follow-up Control
 

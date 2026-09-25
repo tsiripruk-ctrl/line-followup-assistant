@@ -212,6 +212,9 @@ def classify_message_intent(text: str | None) -> IntentResult:
             return IntentResult("PROGRESS_UPDATE", 0.98, "negated_or_waiting_progress")
         return IntentResult("NOT_COMPLETED", 0.99, "negation_pattern")
 
+    if re.search(r"(?:คาดว่า|ประมาณ|จะจัดส่ง|จะส่ง).*?\d{1,2}[/\-]\d{1,2}", raw) or re.search(r"รอ.+?(?:เฟิร์ม|ยืนยัน)", raw):
+        return IntentResult("PROGRESS_UPDATE", 0.98, "future_commitment_or_confirmation")
+
     # Milestones are progress even if they contain "แล้ว" or "เรียบร้อย".
     if _has_any(value, MILESTONE_PATTERNS):
         return IntentResult("PROGRESS_UPDATE", 0.96, "milestone_not_whole_task")

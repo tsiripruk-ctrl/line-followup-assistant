@@ -28,13 +28,14 @@ from service import (
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
+    explicit_task_scope, pending_commitment_at, remember_commitment,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
     normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context,
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.48"
+VERSION = "0.6.49"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -133,6 +134,7 @@ def health():
         "milestone_completion_guard": True,
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
+        "future_commitment_extraction": True, "task_context_isolation": True,
         "date_aware_followup": True, "future_commitment_memory": True,
         "weekday_followup_scheduling": True,
         "task_event_message_trace": True,
@@ -449,6 +451,7 @@ def _task_dict(t: Task):
         "progress_summary": t.progress_summary,
         "waiting_on": t.waiting_on,
         "next_action": t.next_action,
+        "next_followup_at": t.next_reminder_at.isoformat() + "Z" if t.next_reminder_at else None,
         "last_progress_at": (
             t.last_progress_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone)).strftime("%d/%m/%Y %H:%M")
             if t.last_progress_at else None
@@ -1136,6 +1139,9 @@ async def handle_query_or_followup_intent(
             if link:
                 target = db.get(Task, link.task_id)
 
+        scope = explicit_task_scope(db, text)
+        if target and scope is not None and target not in scope:
+            target = None
         # 2) Explicit FU id in text.
         if not target:
             m = re.search(r"FU-\d{6}-\d{4}", text or "", flags=re.I)
@@ -1509,13 +1515,13 @@ async def _process_message(event: dict):
                     db, open_tasks(db, source_id),
                     resolve_canonical_name(db, display_name) or display_name,
                     resolve_canonical_name(db, extraction.assignee_name) or extraction.assignee_name,
-                    extraction.related_task_hint or text,
+                    text if explicit_task_scope(db, text) is not None else (extraction.related_task_hint or text),
                     user_id,
                 )[:3]
             candidate_lines = []
             for row in candidates:
                 # Only show plausible alternatives; never imply that one was updated.
-                if row["content"] >= 0.20 or row["identity"] > 0:
+                if row["content"] >= 0.35:
                     t = row["task"]
                     candidate_lines.append(f"• {t.task_code} {t.title}")
             candidate_text = ""
@@ -1536,7 +1542,7 @@ async def _process_message(event: dict):
         with SessionLocal() as db:
             tasks = open_tasks(db, source_id)
             canonical_sender = resolve_canonical_name(db, display_name) or display_name
-            match_hint = extraction.related_task_hint or text
+            match_hint = text if explicit_task_scope(db, text) is not None else (extraction.related_task_hint or text)
             target = recent_reminder_context_target(db, source_id, user_id, canonical_sender, match_hint)
             if not target:
                 target = choose_status_target_with_history(db, tasks, canonical_sender, extraction.assignee_name, match_hint, user_id)
@@ -1722,6 +1728,9 @@ async def handle_quoted_task_reply(
                     "text": text,
                 })
                 return None
+            scope = explicit_task_scope(db, text)
+            if scope is not None and target not in scope:
+                return ""  # Conflicting quote/topic: do not mutate either task.
             if target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
                 return ""
 
@@ -1878,7 +1887,7 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
             extracted_name = getattr(extraction, "assignee_name", None)
             canonical_extracted = resolve_canonical_name(db, extracted_name) or extracted_name
-            match_hint = getattr(extraction, "related_task_hint", None) or text
+            match_hint = text if explicit_task_scope(db, text) is not None else (getattr(extraction, "related_task_hint", None) or text)
             # Conversation continuity: people frequently answer the most recent reminder
             # without using LINE quote/reply. Prefer that recent context only when the
             # sender/topic evidence is safe; otherwise fall back to normal matching.
@@ -2340,6 +2349,9 @@ async def handle_owner_command(user_id: str, text: str):
                 actor_name=settings.owner_display_name, actor_user_id=user_id,
             )
             task.next_reminder_at = schedule_next_followup(task, datetime.utcnow())
+            commitment = pending_commitment_at(db, task)
+            if commitment and commitment > task.next_reminder_at:
+                task.next_reminder_at = commitment
             db.commit()
             when = _fmt_local_dt(task.next_reminder_at)
             _remember_owner_task_context(db, task)
@@ -2539,6 +2551,7 @@ async def handle_owner_command(user_id: str, text: str):
                 await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
                 return
             task.next_reminder_at = new_time
+            remember_commitment(db, task, new_time)
             record_task_event(
                 db, task, "OWNER_FOLLOWUP_RESCHEDULED", actor_name=settings.owner_display_name,
                 actor_user_id=user_id, text=f"เลื่อนติดตาม: {when_text}", commit=False,
@@ -2758,6 +2771,13 @@ async def handle_owner_command(user_id: str, text: str):
         with SessionLocal() as db:
             tasks = smart_search_tasks(db, query)
         await send_smart_search_results(user_id, query, tasks)
+        return
+
+    # Resolve named task context before broad date/status/list commands.
+    with SessionLocal() as db:
+        scope = explicit_task_scope(db, raw)
+    if scope is not None:
+        await send_smart_search_results(user_id, raw, scope)
         return
 
     if "สรุปเช้า" in low or "brief เช้า" in low:
@@ -3039,6 +3059,11 @@ async def reminder_scan(force: bool = False):
         group_sent_counts: dict[str, int] = {}
 
         for t in tasks:
+            commitment = pending_commitment_at(db, t)
+            if commitment and commitment > now:
+                t.next_reminder_at = commitment
+                db.commit()
+                continue
             forced_cfg = get_forced_followup_config(db, t)
             task_forced = bool(forced_cfg)
 

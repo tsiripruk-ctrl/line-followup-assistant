@@ -1,0 +1,3 @@
+pytest==9.1.1
+pytest-subtests==0.15.0
+tzdata>=2026.1
