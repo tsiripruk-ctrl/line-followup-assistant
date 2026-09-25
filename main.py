@@ -14,6 +14,8 @@ from apscheduler.triggers.cron import CronTrigger
 from db import Base, engine, SessionLocal, ensure_people_registry_schema, ensure_task_event_schema, ensure_task_progress_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, TaskEvent
 from config import settings
+from learning import personalize_followup_at, prune_learning_samples
+from private_commands import execute_private_command, is_management_command
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
@@ -35,7 +37,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.50"
+VERSION = "0.6.51"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -134,6 +136,8 @@ def health():
         "milestone_completion_guard": True,
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
+        "individual_work_response_learning": True, "private_assignee_reassignment": True,
+        "private_manager_permissions": True, "personalized_followup_schedule": True,
         "quoted_progress_receipt": True, "procurement_waiting_update": True,
         "future_commitment_extraction": True, "task_context_isolation": True,
         "date_aware_followup": True, "future_commitment_memory": True,
@@ -1362,11 +1366,19 @@ async def _process_message(event: dict):
         await push_text(user_id, f"เชื่อมต่อสำเร็จค่ะ\nLINE User ID ของคุณคือ:\n{user_id}\n\nให้นำค่านี้ไปใส่ใน Render ที่ OWNER_LINE_USER_ID แล้ว Deploy ใหม่ค่ะ")
         return
 
+    if source_type == "user" and is_management_command(text):
+        await handle_private_management(user_id, text)
+        return
+
     if source_type == "user" and user_id == settings.owner_line_user_id:
         await handle_owner_command(user_id, text)
         return
 
     if source_type != "group":
+        return
+
+    # Management and personal learning reports are private-only, including for the owner.
+    if is_management_command(text):
         return
 
     # v0.6.26 TASK CREATION GUARD
@@ -2278,9 +2290,29 @@ def _extract_fu_code(raw: str) -> str | None:
     return m.group(0).upper() if m else None
 
 
+async def handle_private_management(user_id: str, text: str):
+    with SessionLocal() as db:
+        try:
+            response = execute_private_command(db, user_id, text)
+            db.commit()
+        except (PermissionError, ValueError) as exc:
+            db.rollback()
+            response = str(exc)
+        except Exception as exc:
+            db.rollback()
+            print("private management failed:", type(exc).__name__)
+            response = "ยังบันทึกคำสั่งนี้ไม่สำเร็จค่ะ กรุณาลองอีกครั้ง"
+    if response:
+        await safe_push_text(user_id, response, label="private management")
+
+
 async def handle_owner_command(user_id: str, text: str):
     raw = text.strip()
     low = raw.lower()
+
+    if is_management_command(raw):
+        await handle_private_management(user_id, raw)
+        return
 
     # v0.6.42 Policy instruction precedence guard.
     # Natural owner rules such as "เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ"
@@ -3070,6 +3102,8 @@ async def reminder_scan(force: bool = False):
     # Self-heal legacy/open tasks that have no next reminder at all. Without
     # this, they are invisible to the due query and can remain unfollowed forever.
     with SessionLocal() as repair_db:
+        stats["expired_learning_samples"] = prune_learning_samples(repair_db, now=now)
+        repair_db.commit()
         stats["repaired_schedule"] = repair_missing_reminder_schedule(repair_db, now)
         stats["forced_active"] = len([
             1 for task, cfg in list_forced_followups(repair_db)
@@ -3180,6 +3214,8 @@ async def reminder_scan(force: bool = False):
                         db, t, greeting[:-2] if greeting.endswith("คะ") else greeting, settings.owner_display_name
                     )
                     t.next_reminder_at = schedule_next_followup(t, now + timedelta(hours=settings.reminder_repeat_hours))
+
+                t.next_reminder_at = personalize_followup_at(db, t, t.next_reminder_at, now=now)
 
                 if use_mention:
                     try:

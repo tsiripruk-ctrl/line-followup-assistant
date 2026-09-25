@@ -8,6 +8,7 @@ from sqlalchemy import select, func, delete, or_
 from sqlalchemy.orm import Session
 from models import Message, Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
 from config import settings
+from learning import observe_update, personalize_followup_at
 from intent_engine import is_procurement_waiting_update
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
@@ -1387,6 +1388,9 @@ def update_task_progress_snapshot(
         text=snap["summary"], old_status=task.status, new_status=task.status,
         message_id=message_id, confidence=confidence, commit=False,
     )
+    observe_update(db, task, actor_user_id, message_id, text,
+                   has_date=bool(extract_followup_commitment_at(text)), now=utcnow())
+    task.next_reminder_at = personalize_followup_at(db, task, task.next_reminder_at, now=utcnow())
     if commit:
         db.commit()
         db.refresh(task)

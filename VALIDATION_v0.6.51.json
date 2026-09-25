@@ -1,0 +1,13 @@
+{
+  "version": "0.6.51",
+  "base_archive": "line-followup-assistant-v0.6.50.zip",
+  "base_sha256": "ac5d13d3b696e0e2f236cebdaefc8eedadc734e89561b470f0da936474d24746",
+  "tests_passed": 176,
+  "new_tests": 42,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false,
+  "line_sends": "mocked",
+  "database": "SQLite"
+}
