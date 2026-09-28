@@ -8,8 +8,9 @@ from sqlalchemy import select, func, delete, or_
 from sqlalchemy.orm import Session
 from models import Message, Task, TaskEvent, Person, PersonAlias, SystemEvent, OutboundTaskMessage, OwnerPreference
 from config import settings
+from followup_policy import load_policy, normalize_task
 from learning import observe_update, personalize_followup_at
-from intent_engine import is_procurement_waiting_update
+from intent_engine import is_procurement_waiting_update, is_goods_waiting_update
 
 OPEN_STATUSES = {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}
 STATUS_THAI = {
@@ -182,14 +183,16 @@ THAI_WEEKDAY_INDEX = {
     "ศุกร์": 4, "เสาร์": 5, "อาทิตย์": 6,
 }
 
-def extract_followup_commitment_at(text: str | None, *, now_local: datetime | None = None) -> datetime | None:
+def extract_followup_commitment_at(text: str | None, *, now_local: datetime | None = None, clamp_to_work_window: bool = True) -> datetime | None:
     """Extract an explicit future follow-up commitment from a Thai progress update.
 
     Returns a naive UTC datetime suitable for ``Task.next_reminder_at``.
     This is deliberately conservative: it only reacts to explicit day/date language
     such as ``วันศุกร์``, ``ศุกร์นี้``, ``พรุ่งนี้`` or a numeric Thai date.
     The reminder is scheduled for the configured start of the workday (08:30 by default)
-    unless an explicit HH:MM time is present.
+    unless an explicit HH:MM time is present. Production callers pass
+    clamp_to_work_window=False: the persisted global calendar normalizes the queue
+    while retaining the original human appointment as its lower bound.
     """
     if not text:
         return None
@@ -259,9 +262,9 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
     start_minutes = settings.followup_start_hour * 60 + settings.followup_start_minute
     end_minutes = settings.followup_end_hour * 60 + settings.followup_end_minute
     target_minutes = target_local.hour * 60 + target_local.minute
-    if target_minutes < start_minutes:
+    if clamp_to_work_window and target_minutes < start_minutes:
         target_local = target_local.replace(hour=settings.followup_start_hour, minute=settings.followup_start_minute)
-    elif target_minutes >= end_minutes:
+    elif clamp_to_work_window and target_minutes >= end_minutes:
         target_local = (target_local + timedelta(days=1)).replace(
             hour=settings.followup_start_hour, minute=settings.followup_start_minute
         )
@@ -1338,6 +1341,10 @@ def derive_progress_snapshot(text: str | None, status: str | None = None) -> dic
         waiting = "รอรับอุปกรณ์ที่สั่งซื้อ"
         handoff = re.search(r"ส่งให้(.+?)(?:ครับ|ค่ะ|นะครับ|นะคะ|[.!?]|$)", compact)
         next_action = ("รับของแล้วส่งให้" + handoff.group(1)) if handoff else "รับอุปกรณ์ที่สั่งซื้อ"
+    if is_goods_waiting_update(text):
+        waiting = "รอรับอุปกรณ์" if "อุปกรณ์" in (text or "") else "รอรับสินค้า/ของ"
+        handoff = re.search(r"ส่ง(?:ไป)?ให้(.+?)(?:ไม่ได้|ยังไม่ได้|ครับ|ค่ะ|$)", re.sub(r"\s+", "", text or ""))
+        next_action = "รับของแล้วส่งให้" + handoff.group(1) if handoff else "รับของที่รออยู่"
     waiting = waiting.replace("คอนเฟิร์ม", "ยืนยัน").replace("เฟิร์ม", "ยืนยัน")
     if waiting and "ยืนยัน" in waiting and any(k in (text or "") for k in ("จัดส่ง", "ส่งสินค้า")):
         next_action = "ยืนยันวันจัดส่งสินค้า"
@@ -1365,7 +1372,7 @@ def update_task_progress_snapshot(
     snap = derive_progress_snapshot(text, task.status)
     if not snap["summary"]:
         return snap
-    commitment = extract_followup_commitment_at(text)
+    commitment = extract_followup_commitment_at(text, clamp_to_work_window=False)
     if task.status == "COMPLETED":
         remember_commitment(db, task, None)
     elif commitment:
@@ -1389,8 +1396,9 @@ def update_task_progress_snapshot(
         message_id=message_id, confidence=confidence, commit=False,
     )
     observe_update(db, task, actor_user_id, message_id, text,
-                   has_date=bool(extract_followup_commitment_at(text)), now=utcnow())
+                   has_date=bool(extract_followup_commitment_at(text, clamp_to_work_window=False)), now=utcnow())
     task.next_reminder_at = personalize_followup_at(db, task, task.next_reminder_at, now=utcnow())
+    normalize_task(db, task, load_policy(db))
     if commit:
         db.commit()
         db.refresh(task)

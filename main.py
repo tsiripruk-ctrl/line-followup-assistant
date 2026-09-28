@@ -14,12 +14,13 @@ from apscheduler.triggers.cron import CronTrigger
 from db import Base, engine, SessionLocal, ensure_people_registry_schema, ensure_task_event_schema, ensure_task_progress_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, TaskEvent
 from config import settings
+import followup_policy as calendar
 from learning import personalize_followup_at, prune_learning_samples
 from private_commands import execute_private_command, is_management_command
 from line_api import verify_signature, get_member_profile, push_text, reply_text, push_text_mention
 from ai import extract_task, TaskExtraction
 from intent_guard import classify_precreation_guard, has_explicit_work_request, looks_like_passive_conversation
-from intent_engine import is_procurement_waiting_update, classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, is_natural_assignment_request, parse_command_prefix, is_safe_quoted_completion, should_clarify_unmatched_query
+from intent_engine import is_goods_waiting_update, is_procurement_waiting_update, classify_message_intent, intent_to_status_signal, is_direct_task_request, is_directed_new_work_question, is_natural_assignment_request, parse_command_prefix, is_safe_quoted_completion, should_clarify_unmatched_query
 from service import (
     create_task, open_tasks, completed_tasks, get_task_by_code, tasks_due_today,
     tasks_due_tomorrow, overdue_tasks, waiting_tasks, completed_today,
@@ -37,7 +38,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.51"
+VERSION = "0.6.52"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -49,6 +50,8 @@ async def startup():
     ensure_task_event_schema()
     ensure_task_progress_schema()
     with SessionLocal() as db:
+        calendar.repair_calendar(db)
+        db.commit()
         imported = backfill_task_created_events(db)
         if imported:
             print(f"v0.5 timeline backfill: {imported} tasks")
@@ -117,7 +120,7 @@ def health():
         "project_optional_for_new_task_question": True,
         "existing_task_first_for_directed_question": True,
         "mixed_progress_waiting_resolution": True,
-        "working_hours_followup": True, "followup_window": "08:30-17:30",
+        "working_hours_followup": True, "followup_window": "runtime_calendar", "followup_window_default": "Mon-Fri 08:30-17:30",
         "daily_followup_limits": True, "staggered_group_followups": True,
         "task_context_integrity_guard": True, "cross_topic_memory_guard": True,
         "source_truth_reminders": True, "identity_only_substantive_match_disabled": True,
@@ -136,6 +139,8 @@ def health():
         "milestone_completion_guard": True,
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
+        "strict_global_followup_calendar": True, "weekend_followup_control": True,
+        "goods_waiting_update": True, "calendar_queue_repair": True,
         "individual_work_response_learning": True, "private_assignee_reassignment": True,
         "private_manager_permissions": True, "personalized_followup_schedule": True,
         "quoted_progress_receipt": True, "procurement_waiting_update": True,
@@ -210,7 +215,7 @@ def infer_local_status_signal(text: str | None) -> str:
     compact = "".join((text or "").lower().split())
     if result.intent == "PROGRESS_UPDATE" and "รอ" in compact:
         return "waiting"
-    if result.intent == "PROGRESS_UPDATE" and is_procurement_waiting_update(text):
+    if result.intent == "PROGRESS_UPDATE" and (is_procurement_waiting_update(text) or is_goods_waiting_update(text)):
         return "waiting"
     return intent_to_status_signal(result.intent)
 
@@ -1762,7 +1767,7 @@ async def handle_quoted_task_reply(
         if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
             print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
             signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
-    if safety_intent.intent == "PROGRESS_UPDATE" and is_procurement_waiting_update(text):
+    if safety_intent.intent == "PROGRESS_UPDATE" and (is_procurement_waiting_update(text) or is_goods_waiting_update(text)):
         signal = "waiting"
     new_status = mapping.get(signal)
 
@@ -1803,7 +1808,7 @@ async def handle_quoted_task_reply(
             # on People Registry writes or alias uniqueness.
             if new_status:
                 target.status = new_status
-                commitment_at = extract_followup_commitment_at(text) if new_status != "COMPLETED" else None
+                commitment_at = extract_followup_commitment_at(text, clamp_to_work_window=False) if new_status != "COMPLETED" else None
                 forced_cfg = get_forced_followup_config(db, target)
                 if new_status == "COMPLETED":
                     target.next_reminder_at = None
@@ -1852,7 +1857,7 @@ async def handle_quoted_task_reply(
                 )
     
             if new_status != "COMPLETED":
-                commitment_at = extract_followup_commitment_at(text)
+                commitment_at = extract_followup_commitment_at(text, clamp_to_work_window=False)
                 if commitment_at:
                     local_commitment = commitment_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
                     record_task_event(
@@ -2008,6 +2013,8 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
                 if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
                     print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
                     signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
+            if safety_intent.intent == "PROGRESS_UPDATE" and (is_procurement_waiting_update(text) or is_goods_waiting_update(text)):
+                signal = "waiting"
             new_status = mapping.get(signal)
             if not new_status:
                 return None
@@ -2015,7 +2022,7 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             old_status = target.status
             target.status = new_status
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
-            commitment_at = extract_followup_commitment_at(text) if new_status != "COMPLETED" else None
+            commitment_at = extract_followup_commitment_at(text, clamp_to_work_window=False) if new_status != "COMPLETED" else None
             forced_cfg = get_forced_followup_config(db, target)
             if new_status == "COMPLETED":
                 target.next_reminder_at = None
@@ -2133,9 +2140,9 @@ def followup_diagnostic(db, task: Task, now_utc: datetime | None = None) -> dict
     elif not in_followup_window(local_now):
         code = "OUTSIDE_WORKING_HOURS"
         if forced_cfg:
-            reason = "เปิดบังคับติดตามอยู่ แต่ขณะนี้อยู่นอกเวลา 08:30–17:30 ระบบจะรอช่วงเวลางานค่ะ"
+            reason = "เปิดบังคับติดตามอยู่ แต่ขณะนี้อยู่นอกวันหรือเวลาติดตามส่วนกลาง ระบบจะรอช่วงเวลางานค่ะ"
         else:
-            reason = "ขณะนี้อยู่นอกเวลาติดตาม 08:30–17:30 ระบบจะรอช่วงเวลางานค่ะ"
+            reason = "ขณะนี้อยู่นอกวันหรือเวลาติดตามส่วนกลาง ระบบจะรอช่วงเวลางานค่ะ"
     elif not forced_cfg and sent_today >= cap:
         code = "WAITING_DAILY_LIMIT" if task.status == "WAITING" else "DAILY_LIMIT_REACHED"
         reason = f"วันนี้ติดตามงานนี้แล้ว {sent_today} ครั้ง ครบเพดาน {cap} ครั้ง/วันค่ะ"
@@ -2436,7 +2443,7 @@ async def handle_owner_command(user_id: str, text: str):
             f"ผู้รับผิดชอบ: {task_assignee}\n"
             f"ความถี่: ทุก {cfg.get('interval_hours', 2):g} ชั่วโมง\n"
             f"เริ่มรอบถัดไป: {when}\n\n"
-            "โหมดนี้ข้ามเพดานติดตามรายวัน แต่ยังส่งเฉพาะช่วง 08:30–17:30 ค่ะ\n"
+            "โหมดนี้ข้ามเพดานติดตามรายวัน แต่ยังส่งเฉพาะวันและเวลาติดตามส่วนกลาง ค่ะ\n"
             f"หยุดได้ด้วย: ปิดบังคับติดตาม {code}",
         )
         return
@@ -2613,7 +2620,7 @@ async def handle_owner_command(user_id: str, text: str):
             await push_text(user_id, "รูปแบบ: เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์ หรือ พรุ่งนี้ 14:00 ค่ะ")
             return
         code, when_text = m.group(1).upper(), m.group(2).strip()
-        new_time = extract_followup_commitment_at(when_text)
+        new_time = extract_followup_commitment_at(when_text, clamp_to_work_window=False)
         if not new_time:
             await push_text(user_id, "ยังอ่านวัน/เวลาที่ต้องการไม่ได้ค่ะ เช่น วันศุกร์, พรุ่งนี้ 14:00, 20/09/2569")
             return
@@ -2629,6 +2636,7 @@ async def handle_owner_command(user_id: str, text: str):
                 actor_user_id=user_id, text=f"เลื่อนติดตาม: {when_text}", commit=False,
             )
             db.commit()
+            new_time = task.next_reminder_at
         await push_text(user_id, f"เลื่อนติดตาม {code} แล้วค่ะ\nครั้งถัดไป: {_fmt_local_dt(new_time)}")
         return
 
@@ -2974,20 +2982,15 @@ def _local_minutes(dt: datetime) -> int:
 
 
 def in_followup_window(local_dt: datetime | None = None) -> bool:
-    """True only during the configured daily working window.
+    with SessionLocal() as db:
+        policy = calendar.load_policy(db)
+    at = local_dt or calendar.utcnow()
+    return calendar.allowed(policy, at)
 
-    The end time is exclusive: at 17:30 group follow-up stops. Owner daily brief
-    may still be sent by its dedicated 17:30 job.
-    """
-    local_dt = local_dt or datetime.now(ZoneInfo(settings.timezone))
-    start = settings.followup_start_hour * 60 + settings.followup_start_minute
-    end = settings.followup_end_hour * 60 + settings.followup_end_minute
-    current = _local_minutes(local_dt)
-    if start == end:
-        return True
-    if start < end:
-        return start <= current < end
-    return current >= start or current < end
+
+def reminder_send_allowed(db):
+    # Fresh policy query in this transaction, without a nested SQLite connection.
+    return calendar.allowed(calendar.load_policy(db), calendar.utcnow())
 
 
 def in_quiet_hours() -> bool:
@@ -3023,33 +3026,12 @@ def _task_stagger_minutes(task: Task, max_minutes: int = 45) -> int:
 
 
 def next_work_window_utc(base_utc: datetime, task: Task | None = None, *, next_day: bool = False) -> datetime:
-    """Clamp a UTC-naive reminder time into 08:30-17:30 local working hours."""
-    tz = ZoneInfo(settings.timezone)
-    local = base_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
-    start_min = settings.followup_start_hour * 60 + settings.followup_start_minute
-    end_min = settings.followup_end_hour * 60 + settings.followup_end_minute
-    current = _local_minutes(local)
-    stagger = _task_stagger_minutes(task) if task else 0
-
+    with SessionLocal() as db:
+        policy = calendar.load_policy(db)
     if next_day:
-        local = (local + timedelta(days=1)).replace(
-            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
-        ) + timedelta(minutes=stagger)
-    elif current < start_min:
-        local = local.replace(
-            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
-        ) + timedelta(minutes=stagger)
-    elif current >= end_min:
-        local = (local + timedelta(days=1)).replace(
-            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
-        ) + timedelta(minutes=stagger)
-
-    # A large stagger must never push a message past the work window.
-    if _local_minutes(local) >= end_min:
-        local = (local + timedelta(days=1)).replace(
-            hour=settings.followup_start_hour, minute=settings.followup_start_minute, second=0, microsecond=0
-        )
-    return local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        local = base_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
+        base_utc = (local + timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return calendar.next_allowed(policy, base_utc)
 
 
 def schedule_next_followup(task: Task, candidate_utc: datetime, *, force_next_day: bool = False) -> datetime:
@@ -3102,6 +3084,8 @@ async def reminder_scan(force: bool = False):
     # Self-heal legacy/open tasks that have no next reminder at all. Without
     # this, they are invisible to the due query and can remain unfollowed forever.
     with SessionLocal() as repair_db:
+        stats["calendar_repaired"] = calendar.repair_calendar(repair_db)
+        repair_db.commit()
         stats["expired_learning_samples"] = prune_learning_samples(repair_db, now=now)
         repair_db.commit()
         stats["repaired_schedule"] = repair_missing_reminder_schedule(repair_db, now)
@@ -3112,7 +3096,7 @@ async def reminder_scan(force: bool = False):
 
     # Group follow-up is strictly limited to the working window 08:30-17:30.
     # Forced follow-up intentionally respects this same safety window.
-    if not force and not in_followup_window():
+    if not in_followup_window():
         with SessionLocal() as db:
             stats["due"] = db.query(Task).filter(
                 Task.status.in_(["OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"]),
@@ -3217,11 +3201,19 @@ async def reminder_scan(force: bool = False):
 
                 t.next_reminder_at = personalize_followup_at(db, t, t.next_reminder_at, now=now)
 
+                if not reminder_send_allowed(db):
+                    db.rollback()
+                    stats["skipped_quiet"] += 1
+                    continue
                 if use_mention:
                     try:
                         sent_message_id = await push_text_mention(t.group_id, body, t.assignee_user_id)
                     except Exception as mention_exc:
                         print("mention reminder failed; fallback plain text:", t.task_code, repr(mention_exc))
+                        if not reminder_send_allowed(db):
+                            db.rollback()
+                            stats["skipped_quiet"] += 1
+                            continue
                         plain_body = body.replace("{assignee}", assignee)
                         sent_message_id = await push_text(t.group_id, plain_body)
                         body = plain_body
@@ -3256,7 +3248,7 @@ async def reminder_scan(force: bool = False):
                     "count=", t.reminder_count,
                 )
 
-                if settings.owner_escalation_alerts and settings.owner_line_user_id:
+                if settings.owner_escalation_alerts and settings.owner_line_user_id and reminder_send_allowed(db):
                     if became_overdue:
                         await push_text(
                             settings.owner_line_user_id,

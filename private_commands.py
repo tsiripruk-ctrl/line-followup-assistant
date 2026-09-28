@@ -2,11 +2,12 @@
 import re
 from sqlalchemy import select
 from models import Person, Task
+from followup_policy import load_policy, change_policy, describe
 from learning import (can_manage, is_owner, manager_ids, resolve_person, set_manager,
                       person_profile, set_learning_enabled, global_enabled, clear_learning,
                       set_preferred_window, reassign_task)
 
-PREFIXES = ('ดูรูปแบบการตอบของ', 'ดูข้อมูลการเรียนรู้', 'เปิดการเรียนรู้', 'ปิดการเรียนรู้',
+PREFIXES = ('ตั้งเวลาติดตามทั้งหมด', 'ห้ามติดตามวันเสาร์และวันอาทิตย์', 'อนุญาตติดตามวันเสาร์และวันอาทิตย์', 'ดูเวลาติดตามทั้งหมด', 'ดูรูปแบบการตอบของ', 'ดูข้อมูลการเรียนรู้', 'เปิดการเรียนรู้', 'ปิดการเรียนรู้',
             'หยุดเรียนรู้', 'เริ่มเรียนรู้', 'ล้างข้อมูลการเรียนรู้ของ', 'ตั้งเวลาติดตาม',
             'ล้างเวลาติดตาม', 'เพิ่มผู้จัดการ', 'ลบผู้จัดการ', 'ดูรายชื่อผู้จัดการ',
             'เปลี่ยนผู้รับผิดชอบ', 'คำสั่งเรียนรู้', 'ข้อความแจ้งการเรียนรู้')
@@ -63,6 +64,20 @@ def execute_private_command(db, uid, text):
         return None
     if not can_manage(db, uid):
         raise PermissionError('คำสั่งนี้ใช้ในแชตส่วนตัวได้เฉพาะเจ้าของระบบหรือผู้จัดการที่ได้รับสิทธิ์ค่ะ')
+    if raw == 'ดูเวลาติดตามทั้งหมด':
+        return describe(load_policy(db))
+    if raw in ('ห้ามติดตามวันเสาร์และวันอาทิตย์','อนุญาตติดตามวันเสาร์และวันอาทิตย์'):
+        policy,count=change_policy(db,uid,weekends=raw.startswith('อนุญาต'))
+        return describe(policy)+f'\nปรับคิวเดิมที่ผิดกติกา {count} งานแล้วค่ะ'
+    if raw.startswith('ตั้งเวลาติดตามทั้งหมด'):
+        match=re.fullmatch(r'ตั้งเวลาติดตามทั้งหมด\s+(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})',raw)
+        if not match:
+            raise ValueError('รูปแบบ: ตั้งเวลาติดตามทั้งหมด 08:30-17:30')
+        h1,m1,h2,m2=map(int,match.groups())
+        if h1>23 or h2>23 or m1>59 or m2>59:
+            raise ValueError('เวลาไม่ถูกต้องค่ะ ใช้เวลา 00:00–23:59')
+        policy,count=change_policy(db,uid,start=h1*60+m1,end=h2*60+m2)
+        return describe(policy)+f'\nปรับคิวเดิมที่ผิดกติกา {count} งานแล้วค่ะ'
     if raw == 'คำสั่งเรียนรู้':
         return ('คำสั่งส่วนตัว\nดูรูปแบบการตอบของ ตี๋\nดูข้อมูลการเรียนรู้\nหยุดเรียนรู้ ตี๋\nเริ่มเรียนรู้ ตี๋\nล้างข้อมูลการเรียนรู้ของ ตี๋\n'
                 'ตั้งเวลาติดตาม ตี๋ 14:00-16:00\nล้างเวลาติดตาม ตี๋\nเปลี่ยนผู้รับผิดชอบ FU-xxxxxx-xxxx เป็น ตี๋\n'

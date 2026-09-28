@@ -185,6 +185,12 @@ def is_directed_new_work_question(text: str | None) -> bool:
         return False
     return _has_any(value, tuple(_compact(x) for x in WORK_TOPIC_PATTERNS))
 
+def is_goods_waiting_update(text: str | None) -> bool:
+    value = _compact(text)
+    return bool(re.search(r"(?:อุปกรณ์|สินค้า|ของ)(?:ยัง)?(?:ไม่ถึง|ไม่มา|ยังไม่ได้รับ)", value)
+                or re.search(r"ยังไม่ได้รับ(?:ของ|สินค้า|อุปกรณ์)", value))
+
+
 def is_procurement_waiting_update(text: str | None) -> bool:
     """A completed purchasing step with goods still outstanding is not completion."""
     value = _compact(text)
@@ -212,7 +218,7 @@ def classify_message_intent(text: str | None) -> IntentResult:
     if _has_any(value, CANCEL_PATTERNS):
         return IntentResult("CANCEL_REQUEST", 0.98, "cancel_pattern")
 
-    if is_procurement_waiting_update(raw):
+    if is_procurement_waiting_update(raw) or is_goods_waiting_update(raw):
         return IntentResult("PROGRESS_UPDATE", 0.99, "purchased_waiting_for_goods")
 
     # Hard safety: negation/waiting beats any completion keyword in the same sentence.

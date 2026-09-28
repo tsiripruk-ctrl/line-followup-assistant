@@ -1,0 +1,11 @@
+{
+  "version": "0.6.52",
+  "base_archive": "line-followup-assistant-v0.6.51.zip",
+  "base_sha256": "96f6866971b3648abe283ba85b05fe2fefcb88f4f852c69119a7f052388a1fbc",
+  "tests_passed": 219,
+  "new_tests": 43,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false
+}
