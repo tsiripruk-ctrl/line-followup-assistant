@@ -1,4 +1,5 @@
 import re
+from progress_facts import is_partial_milestone, quantity_only, normalize_language
 from dataclasses import dataclass
 from typing import Literal
 
@@ -175,7 +176,7 @@ def is_directed_new_work_question(text: str | None) -> bool:
     first; only an unmatched question may fall through to NEW_TASK creation.
     """
     raw = (text or "").strip()
-    value = _compact(raw)
+    value = _compact(normalize_language(raw))
     if not value:
         return False
     if _has_any(value, DIRECTED_NEW_WORK_QUESTION_EXCLUSIONS):
@@ -205,6 +206,11 @@ def classify_message_intent(text: str | None) -> IntentResult:
     value = _compact(raw)
     if not value:
         return IntentResult("OTHER", 1.0, "empty")
+    if re.fullmatch(r'(?:รับทราบ|ทราบ|โอเค|โอเคร)(?:ครับ|ค่ะ|คะ)?(?:พี่)?', value):
+        return IntentResult("OTHER", 1.0, "acknowledgement_only")
+
+    if re.search(r'(?:วันนี้|พรุ่งนี้)(?:จะ)?ติดตามพัสดุให้(?:ครับ|ค่ะ|คะ)', value):
+        return IntentResult("PROGRESS_UPDATE", 0.96, "self_reported_followup_step")
 
     # Explicit follow-up requests beat generic question-pattern words such as
     # "ตามเรื่อง" / "ขออัปเดต". They still never complete a task.
@@ -227,8 +233,13 @@ def classify_message_intent(text: str | None) -> IntentResult:
             return IntentResult("PROGRESS_UPDATE", 0.98, "negated_or_waiting_progress")
         return IntentResult("NOT_COMPLETED", 0.99, "negation_pattern")
 
-    if re.search(r"(?:คาดว่า|ประมาณ|จะจัดส่ง|จะส่ง).*?\d{1,2}[/\-]\d{1,2}", raw) or re.search(r"รอ.+?(?:เฟิร์ม|ยืนยัน)", raw):
+    if re.search(r"(?:คาดว่า|ประมาณ|จะจัดส่ง|จะส่ง).*?\d{1,2}[/\-]\d{1,2}", raw) or re.search(r"รอ.+?(?:เฟิร์ม|เฟิม|ยืนยัน)", raw):
         return IntentResult("PROGRESS_UPDATE", 0.98, "future_commitment_or_confirmation")
+
+    if is_partial_milestone(raw) or quantity_only(raw):
+        return IntentResult("PROGRESS_UPDATE", 0.96, "contextual_milestone_or_quantity")
+    if any(term in value for term in ("จะดำเนินการเช็ค", "จะดำเนินการเช็ก", "การไฟฟ้าปิดระบบ")):
+        return IntentResult("PROGRESS_UPDATE", 0.96, "operational_checkpoint")
 
     # Milestones are progress even if they contain "แล้ว" or "เรียบร้อย".
     if _has_any(value, MILESTONE_PATTERNS):
@@ -283,7 +294,7 @@ def is_safe_quoted_completion(text: str | None) -> bool:
         return False
     if _has_any(value, NEGATION_PATTERNS):
         return False
-    if _has_any(value, MILESTONE_PATTERNS):
+    if _has_any(value, MILESTONE_PATTERNS) or is_partial_milestone(raw):
         return False
 
     # Accept common short whole-task confirmations, including polite suffixes.

@@ -1,7 +1,7 @@
 import random
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException, Header, Query
@@ -31,14 +31,14 @@ from service import (
     resolve_assignee_from_text, rank_status_targets, rank_status_targets_with_history, choose_status_target_with_history,
     contextual_followup_text, summarize_progress_update, update_task_progress_snapshot, task_progress_context, task_reference_label, recent_reminder_context_target, delete_task_by_code,
     find_existing_followup_task, find_task_for_explicit_query, extract_followup_commitment_at,
-    explicit_task_scope, pending_commitment_at, remember_commitment,
+    explicit_task_scope, pending_commitment_at, remember_commitment, ignore_old_progress, message_commitment,
     get_followup_policy, save_followup_policy, patch_followup_policy, reset_followup_policy, apply_followup_policy,
     normalize_followup_tone_instruction, infer_followup_tone, parse_owner_state_question_rule, STATE_QUESTION_LABELS,
     get_runtime_preference, set_runtime_preference, owner_reopen_task_state, link_outbound_task_message, resolve_quoted_task_context,
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.52"
+VERSION = "0.6.53"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -140,6 +140,7 @@ def health():
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
         "strict_global_followup_calendar": True, "weekend_followup_control": True,
+        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "chat_regression_cases": True,
         "goods_waiting_update": True, "calendar_queue_repair": True,
         "individual_work_response_learning": True, "private_assignee_reassignment": True,
         "private_manager_permissions": True, "personalized_followup_schedule": True,
@@ -213,7 +214,7 @@ def infer_local_status_signal(text: str | None) -> str:
     """
     result = classify_message_intent(text)
     compact = "".join((text or "").lower().split())
-    if result.intent == "PROGRESS_UPDATE" and "รอ" in compact:
+    if result.intent == "PROGRESS_UPDATE" and "รอ" in compact.replace("เรียบร้อย", ""):
         return "waiting"
     if result.intent == "PROGRESS_UPDATE" and (is_procurement_waiting_update(text) or is_goods_waiting_update(text)):
         return "waiting"
@@ -286,7 +287,11 @@ async def handle_multi_topic_update(
         canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
         used_task_ids: set[int] = set()
         for seg in segments:
-            rows = rank_status_targets(tasks, canonical_sender, None, seg, user_id)
+            scope = explicit_task_scope(db, seg)
+            if scope is not None and len({t.project or t.id for t in scope}) > 1:
+                unmatched.append(seg)
+                continue
+            rows = rank_status_targets_with_history(db, tasks, canonical_sender, None, seg, user_id)
             best = rows[0] if rows else None
             second = rows[1] if len(rows) > 1 else None
             # Strong content only. Identity must not rescue a weak topic match here.
@@ -1361,7 +1366,8 @@ async def _process_message(event: dict):
             if not existing_message:
                 db.add(Message(
                 line_message_id=msg["id"], source_type=source_type, source_id=source_id,
-                user_id=user_id, display_name=display_name, text=text
+                user_id=user_id, display_name=display_name, text=text,
+                created_at=datetime.fromtimestamp(event["timestamp"] / 1000, timezone.utc).replace(tzinfo=None) if isinstance(event.get("timestamp"), (int, float)) else datetime.utcnow()
             ))
             db.commit()
     except Exception as exc:
@@ -1557,6 +1563,8 @@ async def _process_message(event: dict):
     if extraction.status_signal != "none":
         changed = await try_update_task_from_status(source_id, user_id, display_name, extraction, text, msg["id"])
         if changed is not None:
+            if changed == "":
+                return
             await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(settings.owner_line_user_id, changed, label="status owner")
@@ -1764,7 +1772,7 @@ async def handle_quoted_task_reply(
         print("[QUOTED_COMPLETION_OVERRIDE]", {"intent": safety_intent.intent, "text": text})
     elif signal == "completed":
         unsafe_intents = {"STATUS_QUERY", "FOLLOW_UP", "NOT_COMPLETED", "PROGRESS_UPDATE"}
-        if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
+        if safety_intent.intent in unsafe_intents or safety_intent.reason == "acknowledgement_only" or extraction_confidence < 0.90:
             print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
             signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
     if safety_intent.intent == "PROGRESS_UPDATE" and (is_procurement_waiting_update(text) or is_goods_waiting_update(text)):
@@ -1795,11 +1803,13 @@ async def handle_quoted_task_reply(
                 })
                 return None
             scope = explicit_task_scope(db, text)
-            if scope is not None and target not in scope:
+            if scope is not None and (target not in scope or len({t.project or t.id for t in scope}) > 1):
                 return ""  # Conflicting quote/topic: do not mutate either task.
             if target.status not in {"OPEN", "IN_PROGRESS", "WAITING", "OVERDUE"}:
                 return ""
 
+            if ignore_old_progress(db, target, message_id):
+                return ""
             task_id = target.id
             old_status = target.status
             canonical_sender = resolve_canonical_name(db, sender_name) or sender_name or "-"
@@ -1808,7 +1818,7 @@ async def handle_quoted_task_reply(
             # on People Registry writes or alias uniqueness.
             if new_status:
                 target.status = new_status
-                commitment_at = extract_followup_commitment_at(text, clamp_to_work_window=False) if new_status != "COMPLETED" else None
+                commitment_at = message_commitment(db, text, message_id) if new_status != "COMPLETED" else None
                 forced_cfg = get_forced_followup_config(db, target)
                 if new_status == "COMPLETED":
                     target.next_reminder_at = None
@@ -1857,7 +1867,7 @@ async def handle_quoted_task_reply(
                 )
     
             if new_status != "COMPLETED":
-                commitment_at = extract_followup_commitment_at(text, clamp_to_work_window=False)
+                commitment_at = message_commitment(db, text, message_id)
                 if commitment_at:
                     local_commitment = commitment_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
                     record_task_event(
@@ -1941,6 +1951,9 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
     with SessionLocal() as db:
         try:
             tasks = open_tasks(db, group_id)
+            explicit_scope = explicit_task_scope(db, text)
+            if explicit_scope is not None and len({t.project or t.id for t in explicit_scope}) > 1:
+                return None
             canonical_sender = resolve_canonical_name(db, sender_name) or sender_name
             extracted_name = getattr(extraction, "assignee_name", None)
             canonical_extracted = resolve_canonical_name(db, extracted_name) or extracted_name
@@ -2010,7 +2023,7 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             extraction_confidence = float(getattr(extraction, "confidence", 0.0) or 0.0)
             if signal == "completed":
                 unsafe_intents = {"STATUS_QUERY", "FOLLOW_UP", "NOT_COMPLETED", "PROGRESS_UPDATE"}
-                if safety_intent.intent in unsafe_intents or extraction_confidence < 0.90:
+                if safety_intent.intent in unsafe_intents or safety_intent.reason == "acknowledgement_only" or extraction_confidence < 0.90:
                     print("[COMPLETION_BLOCKED]", {"intent": safety_intent.intent, "intent_confidence": safety_intent.confidence, "extraction_confidence": extraction_confidence, "text": text})
                     signal = "in_progress" if safety_intent.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"} else "none"
             if safety_intent.intent == "PROGRESS_UPDATE" and (is_procurement_waiting_update(text) or is_goods_waiting_update(text)):
@@ -2019,10 +2032,12 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             if not new_status:
                 return None
 
+            if ignore_old_progress(db, target, message_id):
+                return ""
             old_status = target.status
             target.status = new_status
             target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
-            commitment_at = extract_followup_commitment_at(text, clamp_to_work_window=False) if new_status != "COMPLETED" else None
+            commitment_at = message_commitment(db, text, message_id) if new_status != "COMPLETED" else None
             forced_cfg = get_forced_followup_config(db, target)
             if new_status == "COMPLETED":
                 target.next_reminder_at = None

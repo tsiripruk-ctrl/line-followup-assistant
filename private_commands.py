@@ -7,7 +7,7 @@ from learning import (can_manage, is_owner, manager_ids, resolve_person, set_man
                       person_profile, set_learning_enabled, global_enabled, clear_learning,
                       set_preferred_window, reassign_task)
 
-PREFIXES = ('ตั้งเวลาติดตามทั้งหมด', 'ห้ามติดตามวันเสาร์และวันอาทิตย์', 'อนุญาตติดตามวันเสาร์และวันอาทิตย์', 'ดูเวลาติดตามทั้งหมด', 'ดูรูปแบบการตอบของ', 'ดูข้อมูลการเรียนรู้', 'เปิดการเรียนรู้', 'ปิดการเรียนรู้',
+PREFIXES = ('แก้ความเข้าใจ ', 'ย้อนการแก้ความเข้าใจ ', 'ดูที่มา ', 'ตั้งเวลาติดตามทั้งหมด', 'ห้ามติดตามวันเสาร์และวันอาทิตย์', 'อนุญาตติดตามวันเสาร์และวันอาทิตย์', 'ดูเวลาติดตามทั้งหมด', 'ดูรูปแบบการตอบของ', 'ดูข้อมูลการเรียนรู้', 'เปิดการเรียนรู้', 'ปิดการเรียนรู้',
             'หยุดเรียนรู้', 'เริ่มเรียนรู้', 'ล้างข้อมูลการเรียนรู้ของ', 'ตั้งเวลาติดตาม',
             'ล้างเวลาติดตาม', 'เพิ่มผู้จัดการ', 'ลบผู้จัดการ', 'ดูรายชื่อผู้จัดการ',
             'เปลี่ยนผู้รับผิดชอบ', 'คำสั่งเรียนรู้', 'ข้อความแจ้งการเรียนรู้')
@@ -64,6 +64,35 @@ def execute_private_command(db, uid, text):
         return None
     if not can_manage(db, uid):
         raise PermissionError('คำสั่งนี้ใช้ในแชตส่วนตัวได้เฉพาะเจ้าของระบบหรือผู้จัดการที่ได้รับสิทธิ์ค่ะ')
+    if raw.startswith(('แก้ความเข้าใจ ', 'ย้อนการแก้ความเข้าใจ ', 'ดูที่มา ')):
+        import json
+        from models import TaskEvent
+        from progress_corrections import correct, undo
+        match = re.fullmatch(r'(แก้ความเข้าใจ|ย้อนการแก้ความเข้าใจ|ดูที่มา)\s+(FU-\d{6}-\d{4,})(?:\s+(.+))?', raw, re.I | re.S)
+        if not match:
+            raise ValueError('รูปแบบ: แก้ความเข้าใจ FU-xxxxxx-xxxx อุปกรณ์ยังไม่ถึง ยังส่งไปให้เกมไม่ได้ครับ')
+        action, code, payload = match.groups()
+        task = db.scalar(select(Task).where(Task.task_code == code.upper()))
+        if not task:
+            raise ValueError('ไม่พบรหัสงานค่ะ')
+        if action == 'แก้ความเข้าใจ':
+            if not payload or len(payload) > 2000:
+                raise ValueError('ระบุข้อความอัปเดตไม่เกิน 2000 ตัวอักษรค่ะ')
+            correct(db, task, uid, payload)
+            return f'แก้ความเข้าใจแล้วค่ะ\n{task.task_code} {task.title}\n{task.progress_summary}\nรอ: {task.waiting_on or "-"}\nขั้นต่อไป: {task.next_action or "-"}'
+        if payload:
+            raise ValueError('คำสั่งนี้ใช้เฉพาะรหัสงานค่ะ')
+        if action == 'ย้อนการแก้ความเข้าใจ':
+            undo(db, task, uid)
+            return f'ย้อนการแก้ความเข้าใจ {task.task_code} แล้วค่ะ'
+        row = db.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id, TaskEvent.event_type.in_(['PROGRESS_FACTS', 'MANAGER_PROGRESS_CORRECTION_UNDONE'])).order_by(TaskEvent.id.desc()).limit(1))
+        if not row:
+            return 'ยังไม่มีข้อมูลที่มารูปแบบใหม่ค่ะ เริ่มเก็บเมื่อได้รับอัปเดตหลังติดตั้ง v0.6.53'
+        if row.event_type == 'MANAGER_PROGRESS_CORRECTION_UNDONE':
+            return f'{task.task_code}: ย้อนการแก้ไขแล้วค่ะ ดูประวัติงานประกอบ ข้อความแก้ไขล่าสุดไม่ใช่สถานะปัจจุบัน'
+        facts = json.loads(row.text)
+        certainty = {'reported':'รายงานจากผู้ตอบ', 'estimated':'ประมาณการ', 'awaiting_confirmation':'รอยืนยัน'}[facts['certainty']]
+        return f'{task.task_code} {task.title}\nระดับข้อมูล: {certainty}\nผู้รายงาน: {row.actor_name or row.actor_user_id or "ไม่ระบุ"}\nบันทึก: {row.created_at.isoformat()} UTC\nข้อความต้นทาง: {facts["source_text"]}'
     if raw == 'ดูเวลาติดตามทั้งหมด':
         return describe(load_policy(db))
     if raw in ('ห้ามติดตามวันเสาร์และวันอาทิตย์','อนุญาตติดตามวันเสาร์และวันอาทิตย์'):
@@ -79,7 +108,7 @@ def execute_private_command(db, uid, text):
         policy,count=change_policy(db,uid,start=h1*60+m1,end=h2*60+m2)
         return describe(policy)+f'\nปรับคิวเดิมที่ผิดกติกา {count} งานแล้วค่ะ'
     if raw == 'คำสั่งเรียนรู้':
-        return ('คำสั่งส่วนตัว\nดูรูปแบบการตอบของ ตี๋\nดูข้อมูลการเรียนรู้\nหยุดเรียนรู้ ตี๋\nเริ่มเรียนรู้ ตี๋\nล้างข้อมูลการเรียนรู้ของ ตี๋\n'
+        return ('คำสั่งส่วนตัว\nแก้ความเข้าใจ FU-xxxxxx-xxxx ข้อความอัปเดต\nย้อนการแก้ความเข้าใจ FU-xxxxxx-xxxx\nดูที่มา FU-xxxxxx-xxxx\nดูรูปแบบการตอบของ ตี๋\nดูข้อมูลการเรียนรู้\nหยุดเรียนรู้ ตี๋\nเริ่มเรียนรู้ ตี๋\nล้างข้อมูลการเรียนรู้ของ ตี๋\n'
                 'ตั้งเวลาติดตาม ตี๋ 14:00-16:00\nล้างเวลาติดตาม ตี๋\nเปลี่ยนผู้รับผิดชอบ FU-xxxxxx-xxxx เป็น ตี๋\n'
                 'ดูรายชื่อผู้จัดการ\nเจ้าของระบบเท่านั้น: เพิ่มผู้จัดการ ชื่อ / ลบผู้จัดการ ชื่อ / เปิดการเรียนรู้ / ปิดการเรียนรู้')
     if raw == 'ข้อความแจ้งการเรียนรู้':

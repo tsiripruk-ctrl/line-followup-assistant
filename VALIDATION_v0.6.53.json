@@ -1,0 +1,14 @@
+{
+  "version": "0.6.53",
+  "base_archive": "line-followup-assistant-v0.6.52.zip",
+  "base_sha256": "2e400ce7a0d9384e1f017c16973de1e3756bda92603fccbbc554b84be58e4468",
+  "base_python_files_verified": true,
+  "tests_passed": 245,
+  "new_tests": 26,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false,
+  "historical_chat_imported": false,
+  "model_trained": false
+}

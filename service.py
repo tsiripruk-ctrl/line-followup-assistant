@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import re
 import json
+from progress_facts import normalize_language, quantity_only, extract_facts
 from difflib import SequenceMatcher
 from dateutil import parser as dtparser
 from zoneinfo import ZoneInfo
@@ -196,7 +197,9 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
     """
     if not text:
         return None
-    x = " ".join(str(text).replace("\n", " ").split())
+    if extract_facts(text)['date_scope'] == 'component':
+        return None
+    x = " ".join(normalize_language(str(text)).replace("\n", " ").split())
     local = now_local or local_now()
     if local.tzinfo is None:
         local = local.replace(tzinfo=ZoneInfo(settings.timezone))
@@ -493,7 +496,7 @@ def _match_text(value: str | None) -> str:
     """Normalize Thai/English task text for conservative task matching."""
     if not value:
         return ""
-    x = value.lower().strip()
+    x = normalize_language(value).lower().strip()
     x = re.sub(r"[^0-9a-zA-Zก-๙]+", " ", x)
     return " ".join(x.split())
 
@@ -1058,6 +1061,12 @@ def explicit_task_scope(db: Session, text: str | None) -> list[Task] | None:
     all_tasks = list(db.scalars(select(Task)).all())
     if codes:
         return [t for t in all_tasks if t.task_code.upper() in {c.upper() for c in codes}]
+    compact_raw = _match_text(raw).replace(" ", "")
+    projects = {t.project for t in all_tasks if t.project and len(t.project) >= 4
+                and _match_text(t.project).replace(" ", "") in compact_raw}
+    independent = {a for a in projects if not any(a != b and a in b for b in projects)}
+    if independent:
+        return [t for t in all_tasks if t.project in independent]
     named_project = re.search(r"โครงการ\s*([^\s,?]+)", raw)
     if named_project:
         subject = re.split(r"วันนี้|พรุ่งนี้|ถึงไหน|ตอนนี้", named_project.group(1))[0]
@@ -1345,12 +1354,53 @@ def derive_progress_snapshot(text: str | None, status: str | None = None) -> dic
         waiting = "รอรับอุปกรณ์" if "อุปกรณ์" in (text or "") else "รอรับสินค้า/ของ"
         handoff = re.search(r"ส่ง(?:ไป)?ให้(.+?)(?:ไม่ได้|ยังไม่ได้|ครับ|ค่ะ|$)", re.sub(r"\s+", "", text or ""))
         next_action = "รับของแล้วส่งให้" + handoff.group(1) if handoff else "รับของที่รออยู่"
-    waiting = waiting.replace("คอนเฟิร์ม", "ยืนยัน").replace("เฟิร์ม", "ยืนยัน")
+    waiting = waiting.replace("คอนเฟิร์ม", "ยืนยัน").replace("เฟิร์ม", "ยืนยัน").replace("เฟิม", "ยืนยัน")
     if waiting and "ยืนยัน" in waiting and any(k in (text or "") for k in ("จัดส่ง", "ส่งสินค้า")):
         next_action = "ยืนยันวันจัดส่งสินค้า"
     elif not next_action and re.search(r"(?:วันที่|ประมาณ).*?\d{1,2}[/\-]\d{1,2}", text or ""):
         next_action = _progress_clause(text, ("วันที่", "ประมาณ"))
+    if "การไฟฟ้าปิดระบบ" in (text or ""):
+        waiting = "รอการไฟฟ้าเปิดระบบให้บริการ"
+        next_action = "ตรวจสอบการเปิดระบบก่อนดำเนินการเรื่องมิเตอร์"
+    if "นัดส่งเรียบร้อย" in (text or "") or "นัดส่งแล้ว" in (text or ""):
+        next_action = "จัดส่งตามวันนัด"
+    if any(k in (text or "") for k in ("นำรถเข้าซ่อม", "นำรถเข้าช่อม")):
+        waiting = "รออู่ซ่อมรถ"
+        next_action = "ตรวจสอบผลซ่อมและกำหนดรับรถ"
+    if "จะดำเนินการเช็ค" in (text or "") or "จะดำเนินการเช็ก" in (text or ""):
+        next_action = "ตรวจสอบกล้องที่ยังไม่ได้ตรวจตามวันที่แจ้ง"
     return {"summary": summary, "waiting_on": waiting, "next_action": next_action}
+
+
+def progress_source_time(db, message_id):
+    message = db.scalar(select(Message).where(Message.line_message_id == message_id)) if message_id else None
+    return message.created_at if message else utcnow()
+
+
+def ignore_old_progress(db, task, message_id):
+    """Ignore duplicate or older source events before changing status or queue."""
+    if not message_id:
+        return False
+    message = db.scalar(select(Message).where(Message.line_message_id == message_id))
+    latest = db.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id,
+        TaskEvent.event_type.in_(['PROGRESS_FACTS', 'MANAGER_PROGRESS_CORRECTION', 'MANAGER_PROGRESS_CORRECTION_UNDONE']))
+        .order_by(TaskEvent.id.desc()).limit(1))
+    if not latest:
+        return False
+    if latest.message_id == message_id:
+        return True
+    if not message:
+        return False
+    data = json.loads(latest.text)
+    source_at = data.get('source_at') if latest.event_type == 'PROGRESS_FACTS' else None
+    previous_time = datetime.fromisoformat(source_at) if source_at else latest.created_at
+    return message.created_at < previous_time
+
+
+def message_commitment(db, text, message_id):
+    source_time = progress_source_time(db, message_id)
+    return extract_followup_commitment_at(text,
+        now_local=source_time.replace(tzinfo=timezone.utc), clamp_to_work_window=False)
 
 
 def update_task_progress_snapshot(
@@ -1369,14 +1419,17 @@ def update_task_progress_snapshot(
     Important: callers must resolve the task first. This function never searches for
     a task and therefore cannot mix context between tasks by itself.
     """
+    if ignore_old_progress(db, task, message_id):
+        return {'summary': task.progress_summary or '', 'waiting_on': task.waiting_on or '', 'next_action': task.next_action or ''}
     snap = derive_progress_snapshot(text, task.status)
     if not snap["summary"]:
         return snap
-    commitment = extract_followup_commitment_at(text, clamp_to_work_window=False)
+    commitment = message_commitment(db, text, message_id) if message_id else extract_followup_commitment_at(text, clamp_to_work_window=False)
     if task.status == "COMPLETED":
         remember_commitment(db, task, None)
     elif commitment:
         remember_commitment(db, task, commitment)
+        task.next_reminder_at = commitment
     else:
         commitment = pending_commitment_at(db, task)
     if task.status != "COMPLETED" and commitment and commitment > utcnow():
@@ -1385,6 +1438,18 @@ def update_task_progress_snapshot(
         snap["summary"] = task.progress_summary or snap["summary"]
         snap["waiting_on"] = task.waiting_on or snap["waiting_on"]
         snap["next_action"] = task.next_action or snap["next_action"]
+    if quantity_only(text):
+        # Exact task linkage is required by callers. Counts supplement, not replace, stage.
+        snap["summary"] = ((task.progress_summary or "") + " | " + snap["summary"]).strip(" |")[-600:]
+        snap["waiting_on"] = task.waiting_on or ""
+        snap["next_action"] = task.next_action or ""
+    facts = extract_facts(text)
+    facts.update(source_text=text, actor_user_id=actor_user_id, message_id=message_id,
+                 source_at=progress_source_time(db, message_id).isoformat(),
+                 recorded_at=utcnow().isoformat(), commitment_at=commitment.isoformat() if commitment else None)
+    record_task_event(db, task, "PROGRESS_FACTS", text=json.dumps(facts, ensure_ascii=False),
+                      actor_name=actor_name, actor_user_id=actor_user_id, message_id=message_id,
+                      confidence=confidence, commit=False)
     task.progress_summary = snap["summary"]
     task.waiting_on = snap["waiting_on"] or None
     task.next_action = snap["next_action"] or None
@@ -1746,6 +1811,10 @@ def _waiting_question(waiting_on: str, reminder_count: int = 0) -> str:
     confirmation = re.search(r"รอ\s*(.+?)\s*ยืนยัน", waiting_on)
     if confirmation:
         return f"ตอนนี้{confirmation.group(1)}ยืนยันแล้วหรือยังคะ"
+    if "การไฟฟ้าเปิดระบบ" in waiting_on:
+        return "ตอนนี้การไฟฟ้าเปิดระบบให้ดำเนินการได้แล้วหรือยังคะ"
+    if "อู่ซ่อมรถ" in waiting_on:
+        return "ทางอู่แจ้งผลซ่อมหรือกำหนดรับรถแล้วหรือยังคะ"
     # Extract the party being waited on instead of echoing a whole progress sentence.
     party = ""
     m = re.search(r"(?:ทาง)?\s*(เซลล์|sales|เจ้าหน้าที่|ผู้ขาย|supplier|futong)[^,.;]*?(?:ยังไม่ตอบรับ|ยังไม่ตอบ|ตอบกลับ|ตอบรับ|ตอบ)", low)
