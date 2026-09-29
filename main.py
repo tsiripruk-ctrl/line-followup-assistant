@@ -38,7 +38,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.54"
+VERSION = "0.6.54.1"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -140,7 +140,7 @@ def health():
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
         "strict_global_followup_calendar": True, "weekend_followup_control": True,
-        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "coordination_checkpoint_guard": True, "rag_review_linking": True, "rag_advisory_only": True, "rag_enabled": settings.rag_enabled, "chat_regression_cases": True,
+        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "coordination_checkpoint_guard": True, "reschedule_group_notice": True, "rag_review_linking": True, "rag_advisory_only": True, "rag_enabled": settings.rag_enabled, "chat_regression_cases": True,
         "goods_waiting_update": True, "calendar_queue_repair": True,
         "individual_work_response_learning": True, "private_assignee_reassignment": True,
         "private_manager_permissions": True, "personalized_followup_schedule": True,
@@ -1396,6 +1396,12 @@ async def _process_message(event: dict):
 
     if source_type == "user" and settings.owner_line_user_id.strip().upper() == "TEMP":
         await push_text(user_id, f"เชื่อมต่อสำเร็จค่ะ\nLINE User ID ของคุณคือ:\n{user_id}\n\nให้นำค่านี้ไปใส่ใน Render ที่ OWNER_LINE_USER_ID แล้ว Deploy ใหม่ค่ะ")
+        return
+
+    if text.strip().startswith("เลื่อนติดตาม "):
+        if source_type == "user":
+            from schedule_notice import reschedule
+            await reschedule(SessionLocal, push_text, user_id, text)
         return
 
     if source_type == "user" and is_management_command(text):
@@ -2660,29 +2666,8 @@ async def handle_owner_command(user_id: str, text: str):
         return
 
     if low.startswith("เลื่อนติดตาม "):
-        m = re.match(r"^เลื่อนติดตาม\s+(FU-\d{6}-\d{4,})\s+(.+)$", raw, flags=re.IGNORECASE)
-        if not m:
-            await push_text(user_id, "รูปแบบ: เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์ หรือ พรุ่งนี้ 14:00 ค่ะ")
-            return
-        code, when_text = m.group(1).upper(), m.group(2).strip()
-        new_time = extract_followup_commitment_at(when_text, clamp_to_work_window=False)
-        if not new_time:
-            await push_text(user_id, "ยังอ่านวัน/เวลาที่ต้องการไม่ได้ค่ะ เช่น วันศุกร์, พรุ่งนี้ 14:00, 20/09/2569")
-            return
-        with SessionLocal() as db:
-            task = get_task_by_code(db, code)
-            if not task:
-                await push_text(user_id, f"ไม่พบงาน {code} ค่ะ")
-                return
-            task.next_reminder_at = new_time
-            remember_commitment(db, task, new_time)
-            record_task_event(
-                db, task, "OWNER_FOLLOWUP_RESCHEDULED", actor_name=settings.owner_display_name,
-                actor_user_id=user_id, text=f"เลื่อนติดตาม: {when_text}", commit=False,
-            )
-            db.commit()
-            new_time = task.next_reminder_at
-        await push_text(user_id, f"เลื่อนติดตาม {code} แล้วค่ะ\nครั้งถัดไป: {_fmt_local_dt(new_time)}")
+        from schedule_notice import reschedule
+        await reschedule(SessionLocal, push_text, user_id, raw)
         return
 
     if low in ("ดูรูปแบบการติดตามปัจจุบัน", "ดูโทนติดตาม", "ตั้งค่าการติดตาม"):
@@ -2972,7 +2957,7 @@ async def handle_owner_command(user_id: str, text: str):
         "• ติดตามต่อ FU-xxxxxx-xxxx เพราะยังไม่เสร็จ / งานนี้ยังไม่เสร็จ\n"
         "• ตรวจคิวติดตาม / งานไหนหลุดจากคิวติดตาม\n"
         "• ซ่อมคิว FU-xxxxxx-xxxx / ซ่อมคิวติดตาม\n"
-        "• เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์\n"
+        "• เลื่อนติดตาม FU-xxxxxx-xxxx วันศุกร์ (เติม แจ้งกลุ่ม เพื่อแจ้งทีมด้วย)\n"
         "• บังคับติดตาม FU-xxxxxx-xxxx ทุก 2 ชั่วโมง\n"
         "• ปิดบังคับติดตาม FU-xxxxxx-xxxx\n"
         "• ดูงานบังคับติดตาม\n"
