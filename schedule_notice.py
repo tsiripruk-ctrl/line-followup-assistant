@@ -51,8 +51,9 @@ async def reschedule(factory, push, uid, raw):
         task_id,group_id,title=task.id,task.group_id,task.title
     outcome=''
     if public:
-        title=' '.join((title or '').split())[:500]
-        notice=f'แจ้งวันติดตามใหม่ค่ะ\n{code} — {title}\nเลขาจะติดตามอีกครั้งวันที่ {local_time(actual)} ค่ะ'
+        title=re.sub(r'FU-\d{6}-\d{4,}', '', title or '', flags=re.I)
+        title=' '.join(title.split()).strip(' —-:')[:500] or 'งานที่นัดติดตาม'
+        notice=f'แจ้งวันติดตามใหม่ค่ะ\nเรื่อง {title}\nเลขาจะติดตามอีกครั้งวันที่ {local_time(actual)} ค่ะ'
         if actual!=requested:
             notice+=f'\nจากวันที่ขอ {local_time(requested)} ปรับตามวันและเวลาทำการที่กำหนดค่ะ'
         notice+='\nจะไม่ส่งเตือนติดตามก่อนวันนัดนี้ค่ะ'
