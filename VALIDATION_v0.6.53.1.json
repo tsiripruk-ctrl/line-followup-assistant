@@ -1,0 +1,9 @@
+{
+  "version": "0.6.53.1",
+  "tests_passed": 252,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false,
+  "base_sha256": "670ab4eb9c8ea31cf233b37e1957c3f5ed10b2af1ef45540403a9af02b5d09c2"
+}

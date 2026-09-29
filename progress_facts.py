@@ -8,6 +8,10 @@ def normalize_language(text):
 
 def is_partial_milestone(text):
     value = re.sub(r'\s+', '', normalize_language(text))
+    if re.search(r'(?:ประสานงาน|ประสางาน)(?:เสร็จ)?(?:เรียบร้อย|แล้ว)', value):
+        return True
+    if re.search(r'(?:อัปเดต|อัพเดท|อัพเดต|อัปเดท|ตรวจ|เช็ก|เช็ค)(?:ต่อ|อีกครั้ง|อีกที)?(?:ใน)?(?:พรุ่งนี้|วันถัดไป|วันจันทร์|วันอังคาร|วันพุธ|วันพฤหัส|วันศุกร์|วันเสาร์|วันอาทิตย์)', value):
+        return True
     return any(term in value for term in (
         'นัดส่งเรียบร้อย', 'นัดส่งแล้ว', 'นำรถเข้าซ่อม', 'นำรถเข้าช่อม',
         'เสร็จแล้วจะไป', 'เสร็จแล้วจะส่ง', 'แล้วจะจัดส่ง',
