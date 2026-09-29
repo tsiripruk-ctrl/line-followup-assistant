@@ -14,6 +14,12 @@ class Settings(BaseSettings):
 
     auto_create_confidence: float = 0.86
 
+    # RAG is advisory: only a manager can apply a newly proposed link.
+    rag_enabled: bool = True
+    rag_embeddings_enabled: bool = True
+    rag_embedding_model: str = "text-embedding-3-small"
+    rag_max_tasks: int = 200
+
     # Reminder policy
     reminder_check_seconds: int = 60
     remind_before_due_hours: int = 3

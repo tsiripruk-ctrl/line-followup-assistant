@@ -1,5 +1,6 @@
 """Private commands. Return response text; the caller sends only to the requesting user."""
 import re
+import rag_commands
 from sqlalchemy import select
 from models import Person, Task
 from followup_policy import load_policy, change_policy, describe
@@ -15,7 +16,7 @@ PREFIXES = ('แก้ความเข้าใจ ', 'ย้อนการ�
 
 def is_management_command(text):
     raw = (text or '').strip()
-    return raw.startswith(PREFIXES) or 'สะดวกให้ติดตามช่วง' in raw
+    return raw.startswith(PREFIXES + rag_commands.PREFIXES) or 'สะดวกให้ติดตามช่วง' in raw
 
 
 def _person(db, name):
@@ -64,6 +65,8 @@ def execute_private_command(db, uid, text):
         return None
     if not can_manage(db, uid):
         raise PermissionError('คำสั่งนี้ใช้ในแชตส่วนตัวได้เฉพาะเจ้าของระบบหรือผู้จัดการที่ได้รับสิทธิ์ค่ะ')
+    if raw.startswith(rag_commands.PREFIXES):
+        return rag_commands.execute(db, uid, raw)
     if raw.startswith(('แก้ความเข้าใจ ', 'ย้อนการแก้ความเข้าใจ ', 'ดูที่มา ')):
         import json
         from models import TaskEvent
@@ -108,7 +111,7 @@ def execute_private_command(db, uid, text):
         policy,count=change_policy(db,uid,start=h1*60+m1,end=h2*60+m2)
         return describe(policy)+f'\nปรับคิวเดิมที่ผิดกติกา {count} งานแล้วค่ะ'
     if raw == 'คำสั่งเรียนรู้':
-        return ('คำสั่งส่วนตัว\nแก้ความเข้าใจ FU-xxxxxx-xxxx ข้อความอัปเดต\nย้อนการแก้ความเข้าใจ FU-xxxxxx-xxxx\nดูที่มา FU-xxxxxx-xxxx\nดูรูปแบบการตอบของ ตี๋\nดูข้อมูลการเรียนรู้\nหยุดเรียนรู้ ตี๋\nเริ่มเรียนรู้ ตี๋\nล้างข้อมูลการเรียนรู้ของ ตี๋\n'
+        return ('คำสั่งส่วนตัว\nดูข้อความรอเชื่อม\nดูข้อความรอเชื่อม U-000001\nเชื่อม U-000001 กับ FU-xxxxxx-xxxx\nย้อนการเชื่อม U-000001\nแก้ความเข้าใจ FU-xxxxxx-xxxx ข้อความอัปเดต\nย้อนการแก้ความเข้าใจ FU-xxxxxx-xxxx\nดูที่มา FU-xxxxxx-xxxx\nดูรูปแบบการตอบของ ตี๋\nดูข้อมูลการเรียนรู้\nหยุดเรียนรู้ ตี๋\nเริ่มเรียนรู้ ตี๋\nล้างข้อมูลการเรียนรู้ของ ตี๋\n'
                 'ตั้งเวลาติดตาม ตี๋ 14:00-16:00\nล้างเวลาติดตาม ตี๋\nเปลี่ยนผู้รับผิดชอบ FU-xxxxxx-xxxx เป็น ตี๋\n'
                 'ดูรายชื่อผู้จัดการ\nเจ้าของระบบเท่านั้น: เพิ่มผู้จัดการ ชื่อ / ลบผู้จัดการ ชื่อ / เปิดการเรียนรู้ / ปิดการเรียนรู้')
     if raw == 'ข้อความแจ้งการเรียนรู้':

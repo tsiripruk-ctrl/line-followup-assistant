@@ -38,7 +38,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.53.1"
+VERSION = "0.6.54"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -140,7 +140,7 @@ def health():
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
         "strict_global_followup_calendar": True, "weekend_followup_control": True,
-        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "coordination_checkpoint_guard": True, "chat_regression_cases": True,
+        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "coordination_checkpoint_guard": True, "rag_review_linking": True, "rag_advisory_only": True, "rag_enabled": settings.rag_enabled, "chat_regression_cases": True,
         "goods_waiting_update": True, "calendar_queue_repair": True,
         "individual_work_response_learning": True, "private_assignee_reassignment": True,
         "private_manager_permissions": True, "personalized_followup_schedule": True,
@@ -1272,6 +1272,27 @@ async def handle_query_or_followup_intent(
         print("[GENERAL_CHAT_GUARD]", {"action": "SILENT_UNMATCHED_QUERY", "text": text})
         return "handled_silent"
 
+async def queue_rag_review(message_id):
+    if not settings.rag_enabled:
+        return False
+    from rag import build_review, save_review
+    try:
+        response = await asyncio.to_thread(build_review, SessionLocal, message_id)
+    except Exception:
+        # Retrieval is optional. Persist the source and keep manual linking available.
+        with SessionLocal() as db:
+            try:
+                code, _ = save_review(db, message_id)
+                db.commit()
+                response = f'ข้อความรอเชื่อม {code} ค่ะ การค้นหาไม่สำเร็จ แต่เก็บข้อความไว้แล้ว\nดูข้อความรอเชื่อม {code}'
+            except Exception:
+                db.rollback()
+                return False
+    if settings.owner_line_user_id and settings.owner_status_updates:
+        await safe_push_text(settings.owner_line_user_id, response, label="RAG review")
+    return True
+
+
 async def process_message(event: dict):
     """Process one LINE message without allowing an obvious status update to fail silently.
 
@@ -1482,6 +1503,8 @@ async def _process_message(event: dict):
             # unavailable. Non-obvious messages can wait for the next human message,
             # while obvious status messages never reach this branch.
             print("extract_task failed:", repr(exc), "text=", repr(text))
+            if explicit_work_request or local_status != "none":
+                await queue_rag_review(msg["id"])
             return
 
     # v0.6.33: "งานใหม่:" is an explicit instruction from the user. Even when
@@ -1520,6 +1543,9 @@ async def _process_message(event: dict):
     # update merely because the LLM recognized operational nouns/verbs. Exact
     # quoted replies are handled below and remain authoritative.
     if not quoted_message_id and passive_conversation and not explicit_work_request:
+        if local_status != "none" and intent_result.intent in {"PROGRESS_UPDATE", "NOT_COMPLETED"}:
+            if await queue_rag_review(msg["id"]):
+                return
         extraction = TaskExtraction(
             is_task=False, confidence=max(float(getattr(extraction, "confidence", 0.0) or 0.0), 0.99),
             status_signal="none", is_task_reply=False, related_task_hint=None,
@@ -1580,6 +1606,8 @@ async def _process_message(event: dict):
         # into the work group. The original human message is already visible; silently
         # retain it in Message history and send diagnostics only to the owner.
         print("unmatched status kept silent in group:", repr(text))
+        if await queue_rag_review(msg["id"]):
+            return
 
         if settings.owner_status_updates and settings.owner_line_user_id:
             with SessionLocal() as db:
@@ -1641,6 +1669,8 @@ async def _process_message(event: dict):
             # Ambiguous operational chatter stays silent in the group. The message is
             # already persisted and can inform future context; diagnostics are private.
             print("unmatched comment kept silent in group:", repr(text))
+            if await queue_rag_review(msg["id"]):
+                return
             if settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(
                     settings.owner_line_user_id,
