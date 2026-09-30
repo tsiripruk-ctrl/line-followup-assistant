@@ -38,7 +38,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.54.2"
+VERSION = "0.6.54.3"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -140,7 +140,7 @@ def health():
         "human_directed_request_guard": True, "mentioned_assignee_query_routing": True,
         "unrelated_status_response_guard": True,
         "strict_global_followup_calendar": True, "weekend_followup_control": True,
-        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "coordination_checkpoint_guard": True, "reschedule_group_notice": True, "rag_review_linking": True, "rag_advisory_only": True, "rag_enabled": settings.rag_enabled, "chat_regression_cases": True,
+        "manager_progress_correction": True, "progress_fact_provenance": True, "partial_milestone_guard": True, "coordination_checkpoint_guard": True, "thai_month_commitment": True, "reschedule_group_notice": True, "rag_review_linking": True, "rag_advisory_only": True, "rag_enabled": settings.rag_enabled, "chat_regression_cases": True,
         "goods_waiting_update": True, "calendar_queue_repair": True,
         "individual_work_response_learning": True, "private_assignee_reassignment": True,
         "private_manager_permissions": True, "personalized_followup_schedule": True,

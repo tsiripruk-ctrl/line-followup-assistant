@@ -189,7 +189,8 @@ def is_directed_new_work_question(text: str | None) -> bool:
 def is_goods_waiting_update(text: str | None) -> bool:
     value = _compact(text)
     return bool(re.search(r"(?:อุปกรณ์|สินค้า|ของ)(?:ยัง)?(?:ไม่ถึง|ไม่มา|ยังไม่ได้รับ)", value)
-                or re.search(r"ยังไม่ได้รับ(?:ของ|สินค้า|อุปกรณ์)", value))
+                or re.search(r"ยังไม่ได้รับ(?:ของ|สินค้า|อุปกรณ์)", value)
+                or re.search(r"(?:ของ|สินค้า|อุปกรณ์)(?:จะ|คาดว่าจะ)(?:ได้|มา|ถึง|ได้รับ)(?:ครบ)?", value))
 
 
 def is_procurement_waiting_update(text: str | None) -> bool:

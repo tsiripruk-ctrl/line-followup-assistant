@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import re
 import json
+from thai_dates import normalize_month_date
 from progress_facts import normalize_language, quantity_only, extract_facts
 from difflib import SequenceMatcher
 from dateutil import parser as dtparser
@@ -199,7 +200,7 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
         return None
     if extract_facts(text)['date_scope'] == 'component':
         return None
-    x = " ".join(normalize_language(str(text)).replace("\n", " ").split())
+    x = " ".join(normalize_month_date(normalize_language(str(text))).replace("\n", " ").split())
     local = now_local or local_now()
     if local.tzinfo is None:
         local = local.replace(tzinfo=ZoneInfo(settings.timezone))
@@ -1354,6 +1355,9 @@ def derive_progress_snapshot(text: str | None, status: str | None = None) -> dic
         waiting = "รอรับอุปกรณ์" if "อุปกรณ์" in (text or "") else "รอรับสินค้า/ของ"
         handoff = re.search(r"ส่ง(?:ไป)?ให้(.+?)(?:ไม่ได้|ยังไม่ได้|ครับ|ค่ะ|$)", re.sub(r"\s+", "", text or ""))
         next_action = "รับของแล้วส่งให้" + handoff.group(1) if handoff else "รับของที่รออยู่"
+    if re.search(r"(?:ของ|สินค้า|อุปกรณ์)(?:จะ|คาดว่าจะ)(?:ได้|มา|ถึง|ได้รับ)(?:ครบ)?", re.sub(r"\s+", "", text or "")):
+        waiting = "รอรับอุปกรณ์ให้ครบ" if "อุปกรณ์" in (text or "") else "รอรับของให้ครบ"
+        next_action = "รับของให้ครบแล้วจัดส่งต่อ" if any(k in (text or "") for k in ("จัดส่ง", "ส่งต่อ")) else "รับของตามวันที่แจ้ง"
     waiting = waiting.replace("คอนเฟิร์ม", "ยืนยัน").replace("เฟิร์ม", "ยืนยัน").replace("เฟิม", "ยืนยัน")
     if waiting and "ยืนยัน" in waiting and any(k in (text or "") for k in ("จัดส่ง", "ส่งสินค้า")):
         next_action = "ยืนยันวันจัดส่งสินค้า"
