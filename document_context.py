@@ -27,7 +27,7 @@ def document_question(text):
     if any(w in text for w in ('งานค้าง', 'ผู้รับผิดชอบ', 'ความคืบหน้า', 'สถานะงาน')):
         return False
     return (category_for_question(text) is not None and
-            (any(w in text for w in ('เท่าไหร่', 'เท่าไร', 'เมื่อไหร่', 'กี่', 'อะไร', 'ไหน', 'ขอดู', 'ช่วยดู')) or len(text) < 30))
+            (any(w in text for w in ('เท่าไหร่', 'เท่าไร', 'เมื่อไหร่', 'กี่', 'อะไร', 'ไหน', 'ขอดู', 'ช่วยดู', 'อย่างไร', 'ยังไง', 'หรือไม่', 'ไหม')) or len(text) < 30))
 
 
 def context_answer(db, uid, text):
