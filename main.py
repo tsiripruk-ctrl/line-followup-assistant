@@ -41,7 +41,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.55.1"
+VERSION = "0.6.55.2"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -95,6 +95,7 @@ def health():
     return {
         "ok": True, "service": "line-followup-assistant", "version": VERSION,
         "document_library_enabled": settings.document_library_enabled,
+        "document_vision_diagnostics": True,
         "document_upload_without_command": True, "document_project_confirmation": True,
         "document_quick_replies": True,
         "document_import_review": True, "document_source_citations": True,

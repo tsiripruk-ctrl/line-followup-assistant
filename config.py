@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     line_channel_access_token: str = ""
     openai_api_key: str = ""
     openai_model: str = "gpt-5.6-luna"
+    openai_vision_model: str = ""  # Optional OCR override; blank uses OPENAI_MODEL.
 
     owner_line_user_id: str = ""
     owner_display_name: str = "พี่ต้อง"

@@ -1,0 +1,12 @@
+{
+  "version": "0.6.55.2",
+  "tests_passed": 386,
+  "new_tests": 11,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false,
+  "base_python_verified": true,
+  "actual_error_subcode_known": false,
+  "base_sha256": "3ab77c5b4d9e2e755f890625727ddbff54f672cc02011adad27cfd92ef82beab"
+}
