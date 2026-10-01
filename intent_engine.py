@@ -82,6 +82,9 @@ def parse_command_prefix(text: str | None):
     """
     raw = (text or "").strip()
     lowered = raw.lower()
+    spaced = re.match(r'^(งานใหม่|มอบหมายงาน)\s+(.+)$', raw, re.S)
+    if spaced:
+        return 'NEW_TASK', spaced.group(2).strip(), spaced.group(1)
     for intent, prefixes in COMMAND_PREFIXES:
         for prefix in prefixes:
             if lowered.startswith(prefix.lower()):

@@ -41,7 +41,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.55.2"
+VERSION = "0.6.55.3"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -96,6 +96,8 @@ def health():
         "ok": True, "service": "line-followup-assistant", "version": VERSION,
         "document_library_enabled": settings.document_library_enabled,
         "document_vision_diagnostics": True,
+        "offline_explicit_new_task": True, "spaced_new_task_prefix": True,
+        "project_code_context_isolation": True,
         "document_upload_without_command": True, "document_project_confirmation": True,
         "document_quick_replies": True,
         "document_import_review": True, "document_source_citations": True,
@@ -1462,10 +1464,22 @@ async def _process_message(event: dict):
         primary_human_mention = _registry_textual_mention(text)
         if primary_human_mention:
             print("[MENTION_FALLBACK]", {"source": "people_registry_textual_at", "name": primary_human_mention.get("display_name")})
+    named_assignment = False
+    if not primary_human_mention:
+        # A registered leading name + an imperative document action can assign
+        # work without LINE @ metadata. Never treat the delivery recipient as assignee.
+        head = re.match(r'^([^\s@]+)\s+(?:ช่วย|ฝาก|ให้|รบกวน)?(?:ส่ง|จัดส่ง|จัดทำ|เตรียม)\s*(?:เอกสาร|ใบเสนอราคา)', text)
+        if head and not any(w in text for w in ('แล้ว', 'หรือยัง', 'ไหม', 'มั้ย', 'ยังไม่', 'กำลัง')):
+            with SessionLocal() as db:
+                person = get_person_by_alias(db, head.group(1))
+                if person and person.active and person.line_user_id:
+                    primary_human_mention = {'display_name': person.canonical_name, 'user_id': person.line_user_id}
+                    mentions.append(primary_human_mention)
+                    named_assignment = True
     mentioned_name = primary_human_mention.get("display_name") if primary_human_mention else None
     mentioned_user_id = primary_human_mention.get("user_id") if primary_human_mention else None
     natural_mentioned_assignment = bool(primary_human_mention) and is_natural_assignment_request(text)
-    direct_human_task_request = bool(primary_human_mention) and is_direct_task_request(text)
+    direct_human_task_request = named_assignment or (bool(primary_human_mention) and is_direct_task_request(text))
     directed_new_work_question = bool(primary_human_mention) and is_directed_new_work_question(text)
     explicit_work_request = bool(
         forced_command_intent == "NEW_TASK" or direct_human_task_request or
@@ -1505,7 +1519,14 @@ async def _process_message(event: dict):
     # Detect obvious Thai status updates *before* calling the LLM. This is important
     # because a slow/failed OpenAI request previously caused messages such as
     # "จ่ายค่าประกันเรียบร้อย" to disappear silently before the local fallback ran.
-    if local_status != "none":
+    if forced_command_intent == 'NEW_TASK' or named_assignment:
+        body = command_text or text
+        project_code = re.search(r'(?:งาน|โครงการ)\s+([A-Z][A-Z0-9_-]{1,30})\b', body)
+        extraction = TaskExtraction(is_task=True, confidence=1.0, title=body[:500],
+            project=project_code.group(1) if project_code else None,
+            assignee_name=mentioned_name, status_signal='none', is_task_reply=False,
+            related_task_hint=body, reason='deterministic explicit assignment')
+    elif local_status != "none":
         extraction = TaskExtraction(
             is_task=False,
             confidence=1.0,

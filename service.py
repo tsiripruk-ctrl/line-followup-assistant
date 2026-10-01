@@ -1062,6 +1062,11 @@ def explicit_task_scope(db: Session, text: str | None) -> list[Task] | None:
     all_tasks = list(db.scalars(select(Task)).all())
     if codes:
         return [t for t in all_tasks if t.task_code.upper() in {c.upper() for c in codes}]
+    project_codes = set(re.findall(r'(?:งาน|โครงการ)\s+([A-Z][A-Z0-9_-]{1,30})\b', raw))
+    if project_codes:
+        return [t for t in all_tasks if any(re.search(r'(?<![A-Za-z0-9_-])' + re.escape(code) +
+                r'(?![A-Za-z0-9_-])', ' '.join([t.title or '', t.project or '']), re.I)
+                for code in project_codes)]
     compact_raw = _match_text(raw).replace(" ", "")
     projects = {t.project for t in all_tasks if t.project and len(t.project) >= 4
                 and _match_text(t.project).replace(" ", "") in compact_raw}
