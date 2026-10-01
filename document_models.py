@@ -58,3 +58,19 @@ class DocumentProjectReview(Base):
     proposed_project: Mapped[str | None] = mapped_column(String(255), nullable=True)
     candidates: Mapped[str] = mapped_column(Text, default='[]')
     evidence: Mapped[str] = mapped_column(Text, default='')
+
+
+class DocumentAnalysis(Base):
+    __tablename__ = 'document_analyses'
+    document_id: Mapped[int] = mapped_column(ForeignKey('knowledge_documents.id', ondelete='CASCADE'), primary_key=True)
+    digest: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DocumentChatContext(Base):
+    __tablename__ = 'document_chat_contexts'
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    document_id: Mapped[int | None] = mapped_column(ForeignKey('knowledge_documents.id'), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    ambiguous: Mapped[bool] = mapped_column(default=False)

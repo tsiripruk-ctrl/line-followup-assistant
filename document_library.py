@@ -11,11 +11,13 @@ from config import settings
 from learning import can_manage, audit
 from document_models import KnowledgeDocument as Doc, KnowledgeChunk as Chunk, DocumentImportSession, DocumentCommandReceipt, DocumentProjectReview
 from document_extract import extract, validate_file, ExtractionError
+from document_analysis import ensure_analysis, overview, fact_answer, report_pages, category_for_question
+from document_context import remember as remember_document, document_question, context_answer
 
 
 PREFIXES = ('นำเข้าเอกสาร', 'หยุดนำเข้าเอกสาร', 'ดูเอกสาร', 'ยืนยันเอกสาร', 'ระบุวันข้อมูล',
             'แทนเอกสาร', 'ยกเลิกเอกสาร', 'อ่านเอกสารใหม่', 'ถามเอกสาร', 'ค้นเอกสาร', 'คำสั่งเอกสาร',
-            'ยืนยันโครงการ', 'เลือกโครงการ', 'เลือกโครงการอื่น')
+            'ยืนยันโครงการ', 'เลือกโครงการ', 'เลือกโครงการอื่น', 'สรุปเอกสาร', 'อ่านหน้า', 'วิเคราะห์เอกสารใหม่')
 HELP = '''คลังเอกสาร — ใช้ในแชตส่วนตัวกับเลขาค่ะ
 1. ส่งไฟล์ PDF / DOCX / XLSX / CSV / JPG / PNG ได้เลย
 2. กดเลือกโครงการที่เลขาเสนอ หรือระบุชื่อโครงการ
@@ -29,6 +31,10 @@ HELP = '''คลังเอกสาร — ใช้ในแชตส่ว�
 อ่านเอกสารใหม่ DOC-xxxxxxxxxxxx
 ยกเลิกเอกสาร DOC-xxxxxxxxxxxx
 หยุดนำเข้าเอกสาร
+สรุปเอกสาร DOC-xxxxxxxxxxxx
+สรุปเอกสาร DOC-xxxxxxxxxxxx 2
+อ่านหน้า DOC-xxxxxxxxxxxx 1
+วิเคราะห์เอกสารใหม่ DOC-xxxxxxxxxxxx
 เลือกโครงการ DOC-xxxxxxxxxxxx งานห่วงใย3
 หากรู้โครงการล่วงหน้า ยังใช้ นำเข้าเอกสาร งานห่วงใย3 ก่อนส่งไฟล์ได้ค่ะ
 
@@ -215,7 +221,7 @@ def apply_extraction(db, doc, result):
         for start in range(0, len(unit.text), 2500):
             db.add(Chunk(document_id=doc.id, location=unit.location, text=unit.text[start:start+2500],
                          cells=json.dumps(unit.cells, ensure_ascii=False) if start == 0 else '{}'))
-    doc.summary = summary_from_units(result.units)
+    doc.summary = overview(ensure_analysis(db, doc, result.units)).replace('<รหัส DOC>', doc.code)
     doc.warnings = json.dumps(result.warnings, ensure_ascii=False)
     doc.status, doc.error = 'DRAFT', ''
     if not doc.project:
@@ -394,6 +400,10 @@ def answer_question(db, question):
         return 'โครงการนี้มีหลายเอกสารค่ะ กรุณาระบุรหัส DOC ของเอกสารที่ต้องการถาม'
     if 'กล้อง' in question and any(word in question for word in ('กี่', 'นับ', 'เปรียบเทียบ')):
         return camera_answer(db, docs, question)
+    if category_for_question(question):
+        answers = [fact_answer(db, doc, question) for doc in docs]
+        return (('มีหลายฉบับที่ยังใช้พร้อมกันค่ะ ตรวจข้อความและฉบับที่มีผลก่อนสรุป:\n' if len(docs)>1 else '')
+                + '\n\n'.join(a for a in answers if a))[:4700]
     matches = retrieve(db, docs, question)
     if not matches:
         return 'ยังไม่พบข้อมูลที่ตอบคำถามนี้ในเอกสารที่ยืนยันค่ะ กรุณาระบุรายละเอียดเพิ่มหรือนำเข้าเอกสารที่เกี่ยวข้อง'
@@ -417,6 +427,40 @@ def answer_question(db, question):
 
 def execute(db, uid, text):
     authorize(db, uid)
+    codes = re.findall(r'DOC-[A-Fa-f0-9]{12}', text)
+    if len(set(c.upper() for c in codes)) == 1:
+        remember_document(db, uid, get_doc(db, codes[0]))
+    if text.startswith(('สรุปเอกสาร ', 'อ่านหน้า ', 'วิเคราะห์เอกสารใหม่ ')):
+        parts = text.split()
+        if len(parts) not in {2,3,4} or (len(parts)==4 and parts[0]!='อ่านหน้า'):
+            raise ValueError('ใช้ สรุปเอกสาร DOC หรือ อ่านหน้า DOC เลขหน้า ค่ะ')
+        doc = get_doc(db, parts[1])
+        if doc.status not in {'DRAFT', 'CONFIRMED', 'SUPERSEDED'}:
+            raise ValueError('ยังอ่านเอกสารไม่สำเร็จค่ะ กรุณา ดูเอกสาร เพื่อตรวจสถานะ')
+        if parts[0] == 'อ่านหน้า':
+            if len(parts) not in {3,4} or not all(part.isdigit() for part in parts[2:]):
+                raise ValueError('ใช้ อ่านหน้า DOC ตามด้วยเลขหน้า เช่น 1 ค่ะ')
+            chunks = list(db.scalars(select(Chunk).where(Chunk.document_id == doc.id,
+                              Chunk.location == 'หน้า '+str(int(parts[2]))).order_by(Chunk.id)))
+            if not chunks:
+                raise ValueError('ไม่พบเลขหน้านี้ค่ะ คำสั่งอ่านหน้าใช้กับ PDF ที่มีเลขหน้า')
+            full_text = '\n'.join(c.text for c in chunks)
+            sections = [full_text[i:i+4000] for i in range(0,len(full_text),4000)] or ['']
+            section = int(parts[3]) if len(parts)==4 else 1
+            if not 1 <= section <= len(sections):
+                raise ValueError(f'หน้านี้มี {len(sections)} ส่วนค่ะ')
+            return (f'{doc.code} — {doc.filename} — หน้า {parts[2]} ส่วน {section}/{len(sections)}\n'+sections[section-1]
+                    + (f'\nอ่านต่อ: อ่านหน้า {doc.code} {parts[2]} {section+1}' if section<len(sections) else ''))
+        analysis = ensure_analysis(db, doc, force=parts[0] == 'วิเคราะห์เอกสารใหม่')
+        if parts[0] == 'วิเคราะห์เอกสารใหม่':
+            doc.summary = overview(analysis).replace('<รหัส DOC>', doc.code)
+            audit(db,uid,'DOCUMENT_REANALYZED',{'code':doc.code})
+        pages = report_pages(analysis, doc)
+        index = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else 1
+        if index < 1 or index > len(pages):
+            raise ValueError(f'รายละเอียดมี {len(pages)} ส่วนค่ะ กรุณาระบุเลขส่วนให้ถูกต้อง')
+        return (f'รายละเอียดส่วน {index}/{len(pages)}\n'+pages[index-1]+
+                (f'\nดูต่อ: สรุปเอกสาร {doc.code} {index+1}' if index < len(pages) else '\nสิ้นสุดรายละเอียดที่จัดเก็บแล้ว'))
     if text.startswith('เลือกโครงการอื่น '):
         doc = get_doc(db, text[len('เลือกโครงการอื่น '):].strip())
         if doc.status != 'DRAFT' or doc.project:
@@ -486,7 +530,10 @@ def execute(db, uid, text):
     if text.startswith('ดูเอกสาร'):
         target = text[len('ดูเอกสาร'):].strip()
         if target.upper().startswith('DOC-'):
-            return detail(db, get_doc(db, target))
+            doc = get_doc(db, target)
+            if doc.status in {'DRAFT','CONFIRMED','SUPERSEDED'}:
+                doc.summary = overview(ensure_analysis(db, doc)).replace('<รหัส DOC>', doc.code)
+            return detail(db, doc)
         query = select(Doc).order_by(Doc.id.desc()).limit(30)
         if target:
             query = query.where(Doc.project == target)
@@ -547,6 +594,8 @@ def execute(db, uid, text):
             return result
     if natural_document_question(db, text):
         return answer_question(db, text)
+    if document_question(text):
+        return context_answer(db, uid, text)
     return HELP
 
 
@@ -583,7 +632,8 @@ async def handle_event(event, factory, push, download):
             await push(uid, 'คลังเอกสารยังไม่ได้เปิดใช้งานค่ะ')
         return attachment or command
     with factory() as db:
-        if not (attachment or command or (can_manage(db, uid) and natural_document_question(db, text))):
+        if not (attachment or command or (can_manage(db, uid) and
+                                         (natural_document_question(db, text) or document_question(text)))):
             return False
         try:
             authorize(db, uid)
@@ -596,6 +646,8 @@ async def handle_event(event, factory, push, download):
             with factory() as db:
                 previous = db.scalar(select(Doc).where(Doc.source_message_id == str(msg.get('id'))))
                 if previous:
+                    remember_document(db, uid, previous, upload=True)
+                    db.commit()
                     await push(uid, detail(db, previous))
                     return True
             if int(msg.get('fileSize') or 0) > settings.document_max_bytes:
@@ -607,6 +659,7 @@ async def handle_event(event, factory, push, download):
                 name = msg.get('fileName') or 'ไม่มีชื่อ'
             with factory() as db:
                 doc, created = reserve_import(db, uid, str(msg.get('id')), name, data)
+                remember_document(db, uid, doc, upload=True)
                 code = doc.code
                 db.commit()
                 if not created:

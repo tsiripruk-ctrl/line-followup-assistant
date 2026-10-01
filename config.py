@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     document_max_pages: int = 40
     document_max_ocr_pages: int = 8
     document_max_rows: int = 10_000
+    document_analysis_max_batches: int = 16
 
     # Reminder policy
     reminder_check_seconds: int = 60
