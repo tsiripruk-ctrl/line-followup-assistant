@@ -1,0 +1,19 @@
+{
+  "version": "0.6.55",
+  "tests_passed": 359,
+  "new_tests": 44,
+  "subtests_passed": 14,
+  "compile": "PASS",
+  "health_http": 200,
+  "production_tested": false,
+  "live_vision_tested": false,
+  "parser_fixtures": [
+    "pdf",
+    "docx",
+    "xlsx",
+    "csv",
+    "scanned_pdf"
+  ],
+  "base_python_verified": true,
+  "base_sha256": "7565e6adafca6dc45e9211748d3323467ddb008e0f37bdcdf3fd8d2ee1bde773"
+}

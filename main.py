@@ -13,6 +13,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 from db import Base, engine, SessionLocal, ensure_people_registry_schema, ensure_task_event_schema, ensure_task_progress_schema
 from models import Message, Task, OutboundTaskMessage, Person, PersonAlias, TaskEvent
+import document_models  # Register additive knowledge tables before startup.
+from document_library import handle_event as handle_document_event
+from line_api import download_message_content
 from config import settings
 import followup_policy as calendar
 from learning import personalize_followup_at, prune_learning_samples
@@ -38,7 +41,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.54.3"
+VERSION = "0.6.55"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -91,6 +94,9 @@ def health():
     dialect = engine.url.get_backend_name()
     return {
         "ok": True, "service": "line-followup-assistant", "version": VERSION,
+        "document_library_enabled": settings.document_library_enabled,
+        "document_import_review": True, "document_source_citations": True,
+        "document_private_only": True, "document_formats": ["pdf", "docx", "xlsx", "csv", "jpg", "png"],
         "scheduler": "external" if settings.cron_secret else "internal",
         "dashboard": bool(settings.dashboard_token),
         "database": "postgresql" if dialect == "postgresql" else dialect,
@@ -941,7 +947,7 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid LINE signature")
     payload = await request.json()
     for event in payload.get("events", []):
-        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+        if event.get("type") == "message" and event.get("message", {}).get("type") in {"text", "file", "image"}:
             asyncio.create_task(process_message(event))
     return {"ok": True}
 
@@ -1309,6 +1315,8 @@ async def process_message(event: dict):
     text = (msg.get("text") or "").strip()
     local_status = infer_local_status_signal(text) if source_type == "group" else "none"
     try:
+        if await handle_document_event(event, SessionLocal, push_text, download_message_content):
+            return
         await _process_message(event)
     except Exception as exc:
         print("process_message failed:", repr(exc), "source_type=", source_type, "text=", repr(text))
@@ -2961,6 +2969,8 @@ async def handle_owner_command(user_id: str, text: str):
         "• บังคับติดตาม FU-xxxxxx-xxxx ทุก 2 ชั่วโมง\n"
         "• ปิดบังคับติดตาม FU-xxxxxx-xxxx\n"
         "• ดูงานบังคับติดตาม\n"
+        "• คำสั่งเอกสาร / นำเข้าเอกสาร งานห่วงใย3\n"
+        "• ถามเอกสาร งานห่วงใย3 หมดสัญญาเมื่อไหร่\n"
         "• ดูรูปแบบการติดตามปัจจุบัน\n"
         "• ตั้งโทนติดตาม: เป็นกันเอง กระชับ ไม่กดดัน\n"
         "• เวลางานเลยกำหนด ให้ถามวันที่คาดว่าจะเสร็จ\n"

@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     rag_embedding_model: str = "text-embedding-3-small"
     rag_max_tasks: int = 200
 
+    document_library_enabled: bool = True
+    document_max_bytes: int = 10_000_000
+    document_max_pages: int = 40
+    document_max_ocr_pages: int = 8
+    document_max_rows: int = 10_000
+
     # Reminder policy
     reminder_check_seconds: int = 60
     remind_before_due_hours: int = 3

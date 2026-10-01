@@ -4,6 +4,26 @@ from config import settings
 
 LINE_API = "https://api.line.me/v2/bot"
 
+async def download_message_content(message_id: str, max_bytes: int):
+    """Stream LINE-hosted content only; bound bytes even without Content-Length."""
+    import re
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', message_id):
+        raise ValueError('รหัสไฟล์ไม่ถูกต้องค่ะ')
+    if not settings.line_channel_access_token:
+        raise ValueError('ยังดาวน์โหลดไฟล์จาก LINE ไม่ได้ค่ะ กรุณาตรวจการเชื่อมต่อของเลขา')
+    headers = {'Authorization': f'Bearer {settings.line_channel_access_token}'}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        async with client.stream('GET', f'https://api-data.line.me/v2/bot/message/{message_id}/content', headers=headers) as response:
+            response.raise_for_status()
+            if int(response.headers.get('content-length', 0)) > max_bytes:
+                raise ValueError('ไฟล์ใหญ่เกินขนาดที่รับได้ค่ะ')
+            result = bytearray()
+            async for block in response.aiter_bytes():
+                result.extend(block)
+                if len(result) > max_bytes:
+                    raise ValueError('ไฟล์ใหญ่เกินขนาดที่รับได้ค่ะ')
+            return bytes(result), response.headers.get('content-type', 'application/octet-stream')
+
 def verify_signature(body: bytes, signature: str | None) -> bool:
     if not signature or not settings.line_channel_secret:
         return False
