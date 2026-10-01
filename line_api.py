@@ -31,12 +31,16 @@ def verify_signature(body: bytes, signature: str | None) -> bool:
     expected = base64.b64encode(digest).decode()
     return hmac.compare_digest(expected, signature)
 
-async def push_text(to: str, text: str) -> str | None:
+async def push_text(to: str, text: str, *, quick_replies=None) -> str | None:
     """Send a LINE push message and return the sent LINE message ID when available."""
     if not settings.line_channel_access_token:
         return None
     headers = {"Authorization": f"Bearer {settings.line_channel_access_token}", "Content-Type": "application/json"}
     payload = {"to": to, "messages": [{"type": "text", "text": text[:5000]}]}
+    if quick_replies:
+        payload['messages'][0]['quickReply'] = {'items': [
+            {'type': 'action', 'action': {'type': 'message', 'label': label[:20], 'text': command[:300]}}
+            for label, command in quick_replies[:13]]}
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(f"{LINE_API}/message/push", headers=headers, json=payload)
         r.raise_for_status()

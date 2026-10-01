@@ -41,7 +41,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.55"
+VERSION = "0.6.55.1"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -95,6 +95,8 @@ def health():
     return {
         "ok": True, "service": "line-followup-assistant", "version": VERSION,
         "document_library_enabled": settings.document_library_enabled,
+        "document_upload_without_command": True, "document_project_confirmation": True,
+        "document_quick_replies": True,
         "document_import_review": True, "document_source_citations": True,
         "document_private_only": True, "document_formats": ["pdf", "docx", "xlsx", "csv", "jpg", "png"],
         "scheduler": "external" if settings.cron_secret else "internal",
@@ -1299,6 +1301,15 @@ async def queue_rag_review(message_id):
     return True
 
 
+async def push_document_reply(user_id: str, text: str):
+    from document_library import quick_replies
+    with SessionLocal() as db:
+        choices = quick_replies(db, text)
+    if choices:
+        return await push_text(user_id, text, quick_replies=choices)
+    return await push_text(user_id, text)
+
+
 async def process_message(event: dict):
     """Process one LINE message without allowing an obvious status update to fail silently.
 
@@ -1315,7 +1326,7 @@ async def process_message(event: dict):
     text = (msg.get("text") or "").strip()
     local_status = infer_local_status_signal(text) if source_type == "group" else "none"
     try:
-        if await handle_document_event(event, SessionLocal, push_text, download_message_content):
+        if await handle_document_event(event, SessionLocal, push_document_reply, download_message_content):
             return
         await _process_message(event)
     except Exception as exc:

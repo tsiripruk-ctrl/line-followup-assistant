@@ -49,3 +49,12 @@ class DocumentCommandReceipt(Base):
     user_id: Mapped[str] = mapped_column(String(128))
     response: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DocumentProjectReview(Base):
+    """Additive proposal table, leaves v0.6.55 document schema unchanged."""
+    __tablename__ = 'document_project_reviews'
+    document_id: Mapped[int] = mapped_column(ForeignKey('knowledge_documents.id', ondelete='CASCADE'), primary_key=True)
+    proposed_project: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    candidates: Mapped[str] = mapped_column(Text, default='[]')
+    evidence: Mapped[str] = mapped_column(Text, default='')

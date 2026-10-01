@@ -9,16 +9,17 @@ from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from config import settings
 from learning import can_manage, audit
-from document_models import KnowledgeDocument as Doc, KnowledgeChunk as Chunk, DocumentImportSession, DocumentCommandReceipt
+from document_models import KnowledgeDocument as Doc, KnowledgeChunk as Chunk, DocumentImportSession, DocumentCommandReceipt, DocumentProjectReview
 from document_extract import extract, validate_file, ExtractionError
 
 
 PREFIXES = ('นำเข้าเอกสาร', 'หยุดนำเข้าเอกสาร', 'ดูเอกสาร', 'ยืนยันเอกสาร', 'ระบุวันข้อมูล',
-            'แทนเอกสาร', 'ยกเลิกเอกสาร', 'อ่านเอกสารใหม่', 'ถามเอกสาร', 'ค้นเอกสาร', 'คำสั่งเอกสาร')
+            'แทนเอกสาร', 'ยกเลิกเอกสาร', 'อ่านเอกสารใหม่', 'ถามเอกสาร', 'ค้นเอกสาร', 'คำสั่งเอกสาร',
+            'ยืนยันโครงการ', 'เลือกโครงการ', 'เลือกโครงการอื่น')
 HELP = '''คลังเอกสาร — ใช้ในแชตส่วนตัวกับเลขาค่ะ
-1. นำเข้าเอกสาร งานห่วงใย3
-2. ส่งไฟล์ PDF / DOCX / XLSX / CSV / JPG / PNG
-3. ตรวจสรุปและส่ง ยืนยันเอกสาร DOC-xxxxxxxxxxxx
+1. ส่งไฟล์ PDF / DOCX / XLSX / CSV / JPG / PNG ได้เลย
+2. กดเลือกโครงการที่เลขาเสนอ หรือระบุชื่อโครงการ
+3. ตรวจสรุปแล้วกด ยืนยันข้อมูลเอกสาร
 4. ถามเอกสาร งานห่วงใย3 หมดสัญญาเมื่อไหร่
 
 ดูเอกสาร งานห่วงใย3
@@ -28,6 +29,8 @@ HELP = '''คลังเอกสาร — ใช้ในแชตส่ว�
 อ่านเอกสารใหม่ DOC-xxxxxxxxxxxx
 ยกเลิกเอกสาร DOC-xxxxxxxxxxxx
 หยุดนำเข้าเอกสาร
+เลือกโครงการ DOC-xxxxxxxxxxxx งานห่วงใย3
+หากรู้โครงการล่วงหน้า ยังใช้ นำเข้าเอกสาร งานห่วงใย3 ก่อนส่งไฟล์ได้ค่ะ
 
 นับกล้อง: ถามเอกสาร งานห่วงใย3 กล้องเสียกี่ตัว
 เทียบรายงาน: ถามเอกสาร งานห่วงใย3 เปรียบเทียบกล้องเสีย
@@ -77,16 +80,84 @@ def get_doc(db, code):
 
 def detail(db, doc):
     warnings = json.loads(doc.warnings or '[]')
-    parts = [f'{doc.code} — {doc.filename}', f'โครงการ: {doc.project}',
+    parts = [f'{doc.code} — {doc.filename}', f'โครงการ: {doc.project or "รอเลือกโครงการ"}',
              f'สถานะ: {doc.status}', f'วันที่ข้อมูล: {doc.effective_date or "ยังไม่ระบุ"}', doc.summary]
+    if not doc.project and doc.status == 'DRAFT':
+        review = db.get(DocumentProjectReview, doc.id)
+        if review and review.proposed_project:
+            parts.insert(2, f'เสนอให้เก็บใน: {review.proposed_project}\n{review.evidence}\n'
+                         f'กดปุ่มเลือกโครงการ หรือส่ง ยืนยันโครงการ {doc.code}')
+        else:
+            parts.insert(2, 'ยังระบุโครงการไม่ได้แน่ชัดค่ะ กรุณากดเลือกโครงการ หรือระบุชื่อโครงการ')
+        parts.insert(3, f'เลือกเอง: เลือกโครงการ {doc.code} ชื่อโครงการ\n'
+                      'ยังไม่ใช้เอกสารนี้ตอบคำถามจนกว่าจะเลือกโครงการและยืนยันข้อมูลค่ะ')
     if doc.error:
         parts.append(doc.error + f'\nลองใหม่: อ่านเอกสารใหม่ {doc.code}')
     if warnings:
         parts.append('ข้อควรตรวจ:\n' + '\n'.join('• ' + w for w in warnings))
-    if doc.status == 'DRAFT':
+    if doc.status == 'DRAFT' and doc.project:
         parts.append(f'ตรวจข้อมูลกับต้นฉบับแล้วส่ง: ยืนยันเอกสาร {doc.code}\n'
                      f'วันที่รายงาน (ถ้ามี): ระบุวันข้อมูล {doc.code} 30/09/2569')
     return '\n'.join(p for p in parts if p)[:4700]
+
+
+def known_projects(db):
+    from models import Task
+    projects = set(db.scalars(select(Doc.project).where(Doc.project != '')))
+    projects.update(p for p in db.scalars(select(Task.project).where(Task.project.is_not(None))) if p)
+    return sorted(projects)
+
+
+def propose_project(db, doc, units):
+    """Exact evidence-based proposals only; never assign without human choice."""
+    haystack = norm(doc.filename + '\n' + '\n'.join(u.text for u in units))
+    candidates = [p for p in known_projects(db) if len(norm(p)) >= 3 and norm(p) in haystack]
+    candidates = [p for p in candidates if not any(norm(p) != norm(q) and norm(p) in norm(q) for q in candidates)]
+    proposed, evidence = None, ''
+    if len(candidates) == 1:
+        proposed = candidates[0]
+        evidence = 'พบชื่อโครงการนี้ในชื่อไฟล์หรือข้อความเอกสารค่ะ โปรดตรวจยืนยัน'
+    elif not candidates:
+        # New project names must occur after an explicit project label. This is
+        # a suggestion, not a model-generated or silently accepted project.
+        names = []
+        for unit in units:
+            for line in unit.text.splitlines():
+                m = re.match(r'^\s*(?:\d+:\s*)?(?:ชื่อ)?โครงการ\s*[:：]\s*([^|\n]{3,120})\s*$', line)
+                if m and m.group(1).strip() not in names:
+                    names.append(m.group(1).strip())
+        if len(names) == 1:
+            proposed, candidates = names[0], names
+            evidence = 'อ่านจากบรรทัดชื่อโครงการในเอกสารค่ะ โปรดตรวจยืนยัน'
+    review = db.get(DocumentProjectReview, doc.id)
+    if not review:
+        review = DocumentProjectReview(document_id=doc.id)
+        db.add(review)
+    review.proposed_project, review.candidates, review.evidence = proposed, json.dumps(candidates, ensure_ascii=False), evidence
+
+
+def project_choices(db, doc):
+    review = db.get(DocumentProjectReview, doc.id)
+    candidates = json.loads(review.candidates or '[]') if review else []
+    return list(dict.fromkeys(candidates + known_projects(db)))[:10]
+
+
+def quick_replies(db, response):
+    codes = re.findall(r'DOC-[A-Fa-f0-9]{12}', response)
+    if not codes:
+        return []
+    doc = db.scalar(select(Doc).where(Doc.code == codes[0].upper()))
+    if not doc or doc.status != 'DRAFT':
+        return []
+    if doc.project:
+        return [('ยืนยันข้อมูลเอกสาร', f'ยืนยันเอกสาร {doc.code}'), ('ยกเลิกเอกสาร', f'ยกเลิกเอกสาร {doc.code}')]
+    review = db.get(DocumentProjectReview, doc.id)
+    if review and review.proposed_project and not response.startswith('เลือกโครงการให้'):
+        return [('ยืนยัน ' + review.proposed_project, f'ยืนยันโครงการ {doc.code}'),
+                ('เลือกโครงการอื่น', f'เลือกโครงการอื่น {doc.code}'),
+                ('ยกเลิกเอกสาร', f'ยกเลิกเอกสาร {doc.code}')]
+    choices = [(p, f'เลือกโครงการ {doc.code} {p}') for p in project_choices(db, doc)]
+    return choices + [('ยกเลิกเอกสาร', f'ยกเลิกเอกสาร {doc.code}')]
 
 
 class Evidence(BaseModel):
@@ -147,6 +218,8 @@ def apply_extraction(db, doc, result):
     doc.summary = summary_from_units(result.units)
     doc.warnings = json.dumps(result.warnings, ensure_ascii=False)
     doc.status, doc.error = 'DRAFT', ''
+    if not doc.project:
+        propose_project(db, doc, result.units)
     db.flush()
 
 
@@ -157,13 +230,17 @@ def reserve_import(db, uid, message_id, name, data):
     if existing:
         return existing, False
     session = db.get(DocumentImportSession, uid)
-    if not session or session.expires_at <= datetime.utcnow():
-        raise ValueError('กรุณาส่ง นำเข้าเอกสาร ตามด้วยชื่อโครงการ ก่อนส่งไฟล์ค่ะ เช่น นำเข้าเอกสาร งานห่วงใย3')
+    project = session.project if session and session.expires_at > datetime.utcnow() else ''
     digest = hashlib.sha256(data).hexdigest()
-    existing = db.scalar(select(Doc).where(Doc.project == session.project, Doc.sha256 == digest))
+    if not project:
+        uploaded = list(db.scalars(select(Doc).where(Doc.uploader_id == uid, Doc.sha256 == digest,
+                                                   Doc.status.not_in(['REJECTED', 'SUPERSEDED']))))
+        if len(uploaded) == 1:
+            return uploaded[0], False
+    existing = db.scalar(select(Doc).where(Doc.project == project, Doc.sha256 == digest))
     if existing:
         return existing, False
-    doc = Doc(code='DOC-' + uuid4().hex[:12].upper(), project=session.project,
+    doc = Doc(code='DOC-' + uuid4().hex[:12].upper(), project=project,
               filename=re.split(r'[/\\]', name)[-1][:255], sha256=digest, original=data,
               source_message_id=message_id, uploader_id=uid, status='EXTRACTING')
     # Savepoint handles concurrent redelivery and identical files before costly OCR.
@@ -173,7 +250,7 @@ def reserve_import(db, uid, message_id, name, data):
             db.flush()
     except IntegrityError:
         existing = db.scalar(select(Doc).where(Doc.source_message_id == message_id)) or db.scalar(
-            select(Doc).where(Doc.project == session.project, Doc.sha256 == digest))
+            select(Doc).where(Doc.project == project, Doc.sha256 == digest))
         if existing:
             return existing, False
         raise
@@ -340,6 +417,52 @@ def answer_question(db, question):
 
 def execute(db, uid, text):
     authorize(db, uid)
+    if text.startswith('เลือกโครงการอื่น '):
+        doc = get_doc(db, text[len('เลือกโครงการอื่น '):].strip())
+        if doc.status != 'DRAFT' or doc.project:
+            raise ValueError('เอกสารนี้ไม่อยู่ในขั้นตอนรอเลือกโครงการค่ะ ใช้ ดูเอกสาร เพื่อตรวจสถานะ')
+        choices = project_choices(db, doc)
+        return (f'เลือกโครงการให้ {doc.code} — {doc.filename}\nกดชื่อโครงการด้านล่างได้ค่ะ\n'
+                + '\n'.join('• ' + p for p in choices)
+                + f'\nโครงการใหม่หรือไม่มีในรายการ: เลือกโครงการ {doc.code} ชื่อโครงการ')
+    if text.startswith(('เลือกโครงการ ', 'ยืนยันโครงการ ')):
+        if text.startswith('ยืนยันโครงการ '):
+            doc = get_doc(db, text[len('ยืนยันโครงการ '):].strip())
+            review = db.get(DocumentProjectReview, doc.id)
+            if not review or not review.proposed_project:
+                raise ValueError('ยังไม่มีโครงการที่เสนออย่างชัดเจนค่ะ กรุณาระบุชื่อโครงการ')
+            project = review.proposed_project
+            if doc.project and doc.project != project:
+                raise ValueError('เลือกโครงการอื่นให้เอกสารนี้แล้วค่ะ ปุ่มเดิมใช้ไม่ได้ กรุณา ดูเอกสาร เพื่อตรวจข้อมูล')
+        else:
+            parts = text.split(' ', 2)
+            if len(parts) != 3:
+                raise ValueError('ใช้ เลือกโครงการ ตามด้วยรหัส DOC และชื่อโครงการค่ะ')
+            doc, project = get_doc(db, parts[1]), parts[2].strip()
+        if doc.status != 'DRAFT':
+            raise ValueError('เลือกโครงการได้เฉพาะเอกสารที่อ่านสำเร็จและยังไม่ยืนยันข้อมูลค่ะ')
+        if not project or len(project) > 255 or '\n' in project or '\r' in project:
+            raise ValueError('กรุณาระบุชื่อโครงการหนึ่งชื่อ ไม่เกิน 255 ตัวอักษรค่ะ')
+        if doc.project == project:
+            return detail(db, doc)
+        duplicate = db.scalar(select(Doc).where(Doc.project == project, Doc.sha256 == doc.sha256, Doc.id != doc.id))
+        if duplicate:
+            doc.status = 'REJECTED'
+            audit(db, uid, 'DOCUMENT_DUPLICATE_PROJECT', {'code': doc.code, 'existing': duplicate.code})
+            return f'มีเอกสารนี้ใน {project} แล้วค่ะ ใช้ {duplicate.code}\n' + detail(db, duplicate)
+        previous = doc.project
+        try:
+            with db.begin_nested():
+                changed = db.execute(update(Doc).where(Doc.id == doc.id, Doc.project == previous, Doc.status == 'DRAFT')
+                                     .values(project=project))
+                if changed.rowcount != 1:
+                    raise ValueError('สถานะเอกสารเพิ่งเปลี่ยนค่ะ กรุณา ดูเอกสาร ก่อนเลือกอีกครั้ง')
+                db.flush()
+        except IntegrityError as exc:
+            raise ValueError('มีไฟล์เดียวกันในโครงการนี้แล้วค่ะ กรุณา ดูเอกสาร เพื่อตรวจรายการ') from exc
+        db.expire(doc)
+        audit(db, uid, 'DOCUMENT_PROJECT_SELECTED', {'code': doc.code, 'project': project})
+        return 'เลือกโครงการแล้วค่ะ กรุณาตรวจสรุปและกด ยืนยันข้อมูลเอกสาร\n' + detail(db, doc)
     if text == 'คำสั่งเอกสาร':
         return HELP
     if text == 'หยุดนำเข้าเอกสาร':
@@ -403,6 +526,8 @@ def execute(db, uid, text):
                     return 'เอกสารนี้ยืนยันแล้วค่ะ'
                 if doc.status != 'DRAFT':
                     raise ValueError('ยืนยันได้เฉพาะเอกสารที่อ่านสำเร็จและรอตรวจค่ะ')
+                if not doc.project:
+                    raise ValueError('กรุณาเลือกโครงการก่อนยืนยันข้อมูลเอกสารค่ะ')
                 doc.status, doc.confirmed_by, doc.confirmed_at = 'CONFIRMED', uid, datetime.utcnow()
                 result = f'ยืนยัน {doc.code} ของ {doc.project} แล้วค่ะ ใช้ถามเอกสารได้ในแชตส่วนตัว'
             elif prefix == 'ยกเลิกเอกสาร ':
@@ -473,9 +598,6 @@ async def handle_event(event, factory, push, download):
                 if previous:
                     await push(uid, detail(db, previous))
                     return True
-                session = db.get(DocumentImportSession, uid)
-                if not session or session.expires_at <= datetime.utcnow():
-                    raise ValueError('ส่ง นำเข้าเอกสาร ตามด้วยชื่อโครงการ ก่อนส่งไฟล์ค่ะ')
             if int(msg.get('fileSize') or 0) > settings.document_max_bytes:
                 raise ValueError('ไฟล์ใหญ่เกิน 10 MB ค่ะ กรุณาแบ่งไฟล์')
             data, mime = await download(str(msg.get('id')), settings.document_max_bytes)
