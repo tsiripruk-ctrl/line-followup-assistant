@@ -18,7 +18,7 @@ from document_context import remember as remember_document, document_question, c
 PREFIXES = ('นำเข้าเอกสาร', 'หยุดนำเข้าเอกสาร', 'ดูเอกสาร', 'ยืนยันเอกสาร', 'ระบุวันข้อมูล',
             'แทนเอกสาร', 'ยกเลิกเอกสาร', 'อ่านเอกสารใหม่', 'ถามเอกสาร', 'ค้นเอกสาร', 'คำสั่งเอกสาร',
             'ยืนยันโครงการ', 'เลือกโครงการ', 'เลือกโครงการอื่น', 'สรุปเอกสาร', 'อ่านหน้า', 'วิเคราะห์เอกสารใหม่')
-HELP = '''คลังเอกสาร — ใช้ในแชตส่วนตัวกับเลขาค่ะ
+HELP = '''ใช้ชื่อโครงการแทนรหัสได้ เช่น ดูเอกสาร วังเย็น / สรุปเอกสาร วังเย็น / ยืนยันเอกสาร วังเย็น\nหลายไฟล์: ดูเอกสาร วังเย็น | สัญญาวังเย็น.pdf\nหลังส่งไฟล์เดียว: เลือกโครงการ วังเย็น\nคลังเอกสาร — ใช้ในแชตส่วนตัวกับเลขาค่ะ
 1. ส่งไฟล์ PDF / DOCX / XLSX / CSV / JPG / PNG ได้เลย
 2. กดเลือกโครงการที่เลขาเสนอ หรือระบุชื่อโครงการ
 3. ตรวจสรุปแล้วกด ยืนยันข้อมูลเอกสาร
@@ -425,8 +425,57 @@ def answer_question(db, question):
         f'• {c.text[:650]}\n  อ้างอิง {d.code} {d.filename} — {c.location}' for _, d, c in matches[:4]))[:4700]
 
 
+def project_command(db, uid, text):
+    """Resolve exact project/file selectors before any document mutation."""
+    from document_models import DocumentChatContext
+    if re.search(r'DOC-[A-Fa-f0-9]{12}', text):
+        return text, None
+    if text.startswith('เลือกโครงการ '):
+        name = text[len('เลือกโครงการ '):].strip()
+        ctx = db.get(DocumentChatContext, uid)
+        if not ctx or ctx.expires_at <= datetime.utcnow() or ctx.ambiguous or not ctx.document_id:
+            return text, 'กรุณาเลือกเอกสารที่จะจัดเข้าโครงการก่อนค่ะ หากมีหลายไฟล์ ใช้ ดูเอกสาร เพื่อดูรายการ'
+        doc = db.get(Doc, ctx.document_id)
+        if not doc or doc.status != 'DRAFT':
+            return text, 'เอกสารที่เลือกไม่อยู่ในสถานะรอเลือกโครงการค่ะ กรุณาเลือกฉบับที่ต้องการก่อน'
+        return f'เลือกโครงการ {doc.code} {name}', None
+    commands = ('ดูเอกสาร ', 'สรุปเอกสาร ', 'อ่านหน้า ', 'วิเคราะห์เอกสารใหม่ ', 'ยืนยันเอกสาร ', 'ยกเลิกเอกสาร ', 'อ่านเอกสารใหม่ ', 'ระบุวันข้อมูล ')
+    prefix = next((p for p in commands if text.startswith(p)), None)
+    if not prefix:
+        return text, None
+    target = text[len(prefix):].strip()
+    suffix = ''
+    exact_project = db.scalar(select(Doc.id).where(Doc.project == target).limit(1))
+    if prefix in ('อ่านหน้า ', 'สรุปเอกสาร ', 'ระบุวันข้อมูล ') and not (prefix == 'สรุปเอกสาร ' and exact_project):
+        pattern = r'^(.*?)\s+(\d+(?:\s+\d+)?)$' if prefix != 'ระบุวันข้อมูล ' else r'^(.*?)\s+(\d{1,2}/\d{1,2}/\d{4})$'
+        match = re.fullmatch(pattern,target)
+        if match:
+            target, suffix = match[1], ' '+match[2]
+        projects = list(db.scalars(select(Doc.project).distinct()))
+        for project in sorted((p for p in projects if p), key=len, reverse=True):
+            remainder = text[len(prefix):].strip()
+            if remainder.startswith(project+' ') and re.fullmatch(r'\d+(?:\s+\d+)?', remainder[len(project)+1:]):
+                target, suffix = project, ' '+remainder[len(project)+1:]
+                break
+    name, sep, filename = target.partition(' | ')
+    docs = list(db.scalars(select(Doc).where(Doc.project == name, Doc.status.notin_(['REJECTED','SUPERSEDED'])).order_by(Doc.id)))
+    replaced = set(db.scalars(select(Doc.replaces_id).where(Doc.status=='CONFIRMED',Doc.replaces_id.is_not(None))))
+    docs = [d for d in docs if d.id not in replaced and (not sep or d.filename == filename)]
+    if not docs:
+        return text, 'ไม่พบเอกสารที่ใช้งานของโครงการ/ชื่อไฟล์นี้ค่ะ ตรวจชื่อด้วย ดูเอกสาร'
+    if len(docs) != 1:
+        choices = [f'{prefix}{name} | {d.filename}{suffix}' for d in docs]
+        if len({d.filename for d in docs}) != len(docs):
+            choices = [f'{prefix}{d.code}{suffix} — {d.filename}' for d in docs]
+        return text, ('โครงการนี้มีหลายฉบับค่ะ เลือกไฟล์ก่อน ไม่มีการแก้ไขหรือยืนยันเอกสาร:\n'+'\n'.join(choices))[:4700]
+    return prefix+docs[0].code+suffix, None
+
+
 def execute(db, uid, text):
     authorize(db, uid)
+    text, clarification = project_command(db, uid, text)
+    if clarification:
+        return clarification
     codes = re.findall(r'DOC-[A-Fa-f0-9]{12}', text)
     if len(set(c.upper() for c in codes)) == 1:
         remember_document(db, uid, get_doc(db, codes[0]))
