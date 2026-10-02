@@ -1,3 +1,4 @@
+from progress_facts import ambiguous_checkpoints
 import random
 import json
 import re
@@ -41,7 +42,7 @@ from service import (
     get_forced_followup_config, enable_forced_followup, disable_forced_followup, list_forced_followups
 )
 
-VERSION = "0.6.58"
+VERSION = "0.6.60"
 app = FastAPI(title="LINE Follow-up Assistant", version=VERSION)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -162,7 +163,7 @@ def health():
         "private_manager_permissions": True, "personalized_followup_schedule": True,
         "quoted_progress_receipt": True, "procurement_waiting_update": True,
         "future_commitment_extraction": True, "task_context_isolation": True,
-        "date_aware_followup": True, "future_commitment_memory": True,
+        "date_aware_followup": True, "dated_progress_group_receipt": True, "multiple_checkpoint_guard": True, "human_quote_followup_context": True, "future_commitment_memory": True,
         "weekday_followup_scheduling": True,
         "task_event_message_trace": True,
         "structured_task_progress": True, "progressive_followup_context": True,
@@ -285,6 +286,7 @@ async def handle_multi_topic_update(
     sender_name: str | None,
     reply_token: str | None,
     text: str,
+    message_id: str | None = None,
 ) -> bool:
     """Safely ingest a multi-topic reply without mixing projects together.
 
@@ -326,7 +328,7 @@ async def handle_multi_topic_update(
             used_task_ids.add(target.id)
             record_task_event(
                 db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
-                text=seg, new_status=target.status, commit=False,
+                text=seg, new_status=target.status, commit=False, message_id=message_id,
             )
             memory = summarize_progress_update(seg)
             if memory:
@@ -993,16 +995,24 @@ async def acknowledge_task_reply(reply_token: str | None, group_id: str, status_
         print("task reply acknowledgement failed:", repr(exc))
 
 
-async def acknowledge_committed_quoted_update(reply_token: str | None, group_id: str, message_id: str):
+async def acknowledge_committed_quoted_update(reply_token: str | None, group_id: str, message_id: str, *, dated_only=False):
     """Confirm only a durable update, using the task actually changed by this message."""
     with SessionLocal() as db:
         tasks = list(db.scalars(select(Task).join(TaskEvent, TaskEvent.task_id == Task.id).where(
             Task.group_id == group_id, TaskEvent.message_id == message_id,
-            TaskEvent.event_type.in_(["PROGRESS_UPDATE", "COMPLETION_CONFIRMATION"]),
+            TaskEvent.event_type.in_(["PROGRESS_UPDATE", "COMPLETION_CONFIRMATION", "COMMENT"]),
         )).unique().all())
         if len(tasks) != 1:
             return
         task = tasks[0]
+        event = db.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id, TaskEvent.message_id == message_id).order_by(TaskEvent.id))
+        source_text = event.text if event else ''
+        unclear = ambiguous_checkpoints(source_text)
+        dated = extract_followup_commitment_at(source_text, clamp_to_work_window=False)
+        if event and event.event_type == 'COMMENT' and not dated and not unclear:
+            return False
+        if dated_only and not dated and not unclear:
+            return False
         if task.status == "COMPLETED":
             text = f"บันทึกแล้วค่ะ เรื่อง{task.title} เสร็จเรียบร้อยแล้ว"
         else:
@@ -1013,12 +1023,15 @@ async def acknowledge_committed_quoted_update(reply_token: str | None, group_id:
                 parts.append(f"ตอนนี้: {task.waiting_on}")
             if task.next_action:
                 parts.append(f"ขั้นตอนถัดไป: {task.next_action}")
-            if task.next_reminder_at:
+            if unclear:
+                parts.append("บันทึกวันของแต่ละขั้นตอนไว้แล้วค่ะ แต่ยังไม่เปลี่ยนวันติดตามตามข้อความนี้ จะเข้าดำเนินการวันไหน และต้องการให้ตามขั้นตอนไหนก่อนคะ?")
+            elif task.next_reminder_at:
                 parts.append(f"จะติดตามต่อ {_fmt_local_dt(task.next_reminder_at)} ค่ะ")
             text = "\n".join(parts)
         task_id = task.id
     await safe_reply_or_push_task(reply_token, group_id, text, task_id,
                                  message_kind="PROGRESS_RECEIPT", label="quoted update receipt")
+    return True
 
 
 async def safe_push_text(to: str | None, text: str, *, label: str = "notification") -> bool:
@@ -1191,14 +1204,55 @@ async def handle_query_or_followup_intent(
         ambiguous = []
         confidence = float(getattr(intent_result, "confidence", 0.0) or 0.0)
 
-        # 1) Exact quoted/replied assistant message.
+        # Both human and assistant replies carry the original context.
         if quoted_message_id:
-            link = db.scalar(select(OutboundTaskMessage).where(
-                OutboundTaskMessage.line_message_id == str(quoted_message_id),
-                OutboundTaskMessage.group_id == group_id,
-            ))
-            if link:
-                target = db.get(Task, link.task_id)
+            from service import resolve_quoted_task_context
+            target, reason, quote_confidence = resolve_quoted_task_context(db, group_id, quoted_message_id)
+            quoted = db.scalar(select(Message).where(Message.line_message_id == str(quoted_message_id), Message.source_id == group_id))
+            quote_segments = split_operational_update_segments(quoted.text) if quoted else []
+            if len(quote_segments) > 1:
+                target = None  # One topic match cannot silently stand for a multi-topic quote.
+            scope = explicit_task_scope(db, text)
+            if target and scope is not None and target not in scope:
+                target = None
+            if not target:
+                linked = list(db.scalars(select(Task).join(TaskEvent, TaskEvent.task_id == Task.id).where(
+                    Task.group_id == group_id, Task.status.in_(['OPEN','IN_PROGRESS','WAITING','OVERDUE']),
+                    TaskEvent.message_id == str(quoted_message_id))).unique())
+                if not linked and quoted:
+                    candidates = []
+                    for segment in quote_segments:
+                        found, score, competing = find_task_for_explicit_query(db,group_id,segment)
+                        if found and score >= 0.85 and not competing:
+                            candidates.append(found)
+                    linked = list({t.id:t for t in candidates}.values())
+                if scope is not None:
+                    linked = [t for t in linked if t in scope]
+                if scope is None and len(quote_segments) > 1 and len(linked) < len(quote_segments):
+                    await safe_reply_or_push(reply_token,group_id,'ข้อความเดิมมีหลายเรื่องและยังเชื่อมได้ไม่ครบค่ะ ต้องการติดตามเรื่องใดก่อนคะ?\n'+'\n'.join('• '+segment[:200] for segment in quote_segments),label='partially matched quoted topics')
+                    return 'ambiguous'
+                if len(linked)==1:
+                    target = linked[0]
+                elif len(linked)>1:
+                    if intent_result.intent == 'FOLLOW_UP' and scope is None and not re.search(r'(?:เฉพาะ|เรื่องเดียว|อันแรก|อันที่สอง|แรก|หลัง)',text):
+                        for task in linked:
+                            record_task_event(db,task,'FOLLOW_UP',actor_name=sender_name,actor_user_id=user_id,text=text,
+                                new_status=task.status,commit=False,message_id=message_id,confidence=1.0)
+                        db.commit()
+                        await safe_reply_or_push(reply_token,group_id,'รับทราบค่ะ จะติดตามต่อจากข้อมูลที่แจ้งไว้ทั้ง '+str(len(linked))+' เรื่อง และถามความคืบหน้าส่วนที่ยังค้างค่ะ\n'+'\n'.join('• '+t.title for t in linked),label='quoted multi followup')
+                        return 'matched'
+                    await safe_reply_or_push(reply_token,group_id,'ข้อความที่ตอบกลับมีหลายเรื่องค่ะ ต้องการตามเรื่องใดคะ?\n'+'\n'.join('• '+t.title for t in linked),label='quoted topic clarification')
+                    return 'ambiguous'
+                if not target:
+                    response = ('เห็นข้อความที่ตอบกลับแล้วค่ะ แต่ยังเชื่อมกับงานเดิมไม่แน่ชัด จะเก็บบริบทนี้ให้ผู้จัดการตรวจต่อค่ะ' if quoted
+                                else 'ยังไม่พบข้อความต้นทางที่ตอบกลับค่ะ กรุณา Reply ข้อความติดตามของเรื่องนั้นอีกครั้ง')
+                    if quoted:
+                        response += '\nเรื่องที่อ้างถึง: '+quoted.text[:220]
+                    await safe_reply_or_push(reply_token,group_id,response,label='unresolved human followup quote')
+                    if settings.owner_line_user_id:
+                        await safe_push_text(settings.owner_line_user_id,'คำสั่งติดตามต่อยังไม่ผูกงานค่ะ\nข้อความต้นทาง: '+(quoted.text if quoted else str(quoted_message_id))+'\nคำสั่ง: '+text,label='unresolved quoted followup owner')
+                    return 'handled'
+            confidence = quote_confidence or 1.0
 
         scope = explicit_task_scope(db, text)
         if target and scope is not None and target not in scope:
@@ -1497,11 +1551,13 @@ async def _process_message(event: dict):
     # is an actionable request even if the sentence also contains progress/follow-up
     # wording.  Duplicate prevention still runs before creation, so an existing
     # matching task is updated rather than duplicated.
-    if direct_human_task_request and intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
+    if direct_human_task_request and not quoted_message_id and intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
         reason = "natural_mentioned_assignment" if natural_mentioned_assignment else "explicit_human_action_request"
         print("[INTENT_OVERRIDE]", {"from": intent_result.intent, "to": "NEW_TASK", "reason": reason})
         intent_result = type(intent_result)("NEW_TASK", 0.98, reason)
 
+    if quoted_message_id and re.match(r'^(?:ให้|ช่วย|ฝาก|รบกวน|เลขา)?\s*(?:ติดตาม|ตาม)(?:งาน)?ต่อ', text) and forced_command_intent != 'NEW_TASK':
+        intent_result = type(intent_result)('FOLLOW_UP',1.0,'quoted_continuation_command')
     print("[INTENT]", {"message": text, "intent": intent_result.intent, "confidence": intent_result.confidence, "reason": intent_result.reason})
     if intent_result.intent in {"STATUS_QUERY", "FOLLOW_UP"}:
         query_outcome = await handle_query_or_followup_intent(
@@ -1635,7 +1691,7 @@ async def _process_message(event: dict):
     # Long replies can contain updates for several projects. Never feed the full
     # mixed message into a single-task matcher; split and attach only strong segments.
     if not quoted_message_id and extraction.is_task_reply:
-        if await handle_multi_topic_update(source_id, user_id, display_name, reply_token, text):
+        if await handle_multi_topic_update(source_id, user_id, display_name, reply_token, text, msg["id"]):
             return
 
     if extraction.status_signal != "none":
@@ -1643,7 +1699,9 @@ async def _process_message(event: dict):
         if changed is not None:
             if changed == "":
                 return
-            await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
+            receipt = await acknowledge_committed_quoted_update(reply_token, source_id, msg["id"], dated_only=True)
+            if not receipt:
+                await acknowledge_task_reply(reply_token, source_id, extraction.status_signal)
             if changed and settings.owner_status_updates and settings.owner_line_user_id:
                 await safe_push_text(settings.owner_line_user_id, changed, label="status owner")
             return
@@ -1701,9 +1759,13 @@ async def _process_message(event: dict):
             if target:
                 record_task_event(
                     db, target, "COMMENT", actor_name=canonical_sender, actor_user_id=user_id,
-                    text=text, new_status=target.status, commit=False,
+                    text=text, new_status=target.status, commit=False, message_id=msg["id"],
                 )
                 target.notes = ((target.notes or "") + f"\n{datetime.now()}: {canonical_sender or '-'}: {text}").strip()
+                commitment = message_commitment(db, text, msg["id"])
+                if commitment:
+                    target.next_reminder_at = commitment
+                    update_task_progress_snapshot(db, target, text, actor_name=canonical_sender, actor_user_id=user_id, message_id=msg["id"], confidence=1.0, commit=False)
                 db.commit()
                 print("task comment recorded silently:", target.task_code)
                 # Progress-only comments are learned silently. Acknowledgements are
@@ -1717,6 +1779,7 @@ async def _process_message(event: dict):
                         f"ข้อความ: {text}\n\n"
                         f"สถานะยังเป็น: {STATUS_THAI.get(target.status, target.status)}"
                     )
+                await acknowledge_committed_quoted_update(reply_token, source_id, msg["id"], dated_only=True)
                 return
             # Ambiguous operational chatter stays silent in the group. The message is
             # already persisted and can inform future context; diagnostics are private.
@@ -1904,6 +1967,8 @@ async def handle_quoted_task_reply(
                 forced_cfg = get_forced_followup_config(db, target)
                 if new_status == "COMPLETED":
                     target.next_reminder_at = None
+                elif ambiguous_checkpoints(text):
+                    pass  # Keep the existing queue until the manager/assignee clarifies.
                 elif commitment_at:
                     # A concrete human checkpoint always wins, even in forced mode.
                     target.next_reminder_at = commitment_at
@@ -1951,6 +2016,10 @@ async def handle_quoted_task_reply(
             if new_status != "COMPLETED":
                 commitment_at = message_commitment(db, text, message_id)
                 if commitment_at:
+                    if not new_status:
+                        target.next_reminder_at = commitment_at
+                        update_task_progress_snapshot(db, target, text, actor_name=canonical_sender,
+                            actor_user_id=user_id, message_id=message_id, confidence=1.0, commit=False)
                     local_commitment = commitment_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo(settings.timezone))
                     record_task_event(
                         db, target, "FOLLOW_UP_SCHEDULED", actor_name=canonical_sender, actor_user_id=user_id,
@@ -2014,12 +2083,17 @@ async def handle_quoted_task_reply(
                       "task_id=", task_id, "user_id=", user_id)
 
     status_th = STATUS_THAI.get(final_status, final_status)
+    with SessionLocal() as db:
+        saved = db.get(Task, task_id)
+        appointment_notice = ("มีหลายขั้นตอนและวันนัดไม่ชัด ยังไม่เปลี่ยนวันติดตามตามข้อความนี้ค่ะ" if ambiguous_checkpoints(text)
+                              else f"ติดตามถัดไป: {_fmt_local_dt(saved.next_reminder_at)}" if saved and saved.next_reminder_at else "ไม่มีวันติดตามถัดไป")
     return (
         f"มีการตอบกลับงานแล้วค่ะ\n\n"
         f"{task_code} {task_title}\n"
         f"ผู้ตอบ: {canonical_sender}\n"
         f"ข้อความ: {text}\n"
-        f"สถานะ: {status_th}"
+        f"สถานะ: {status_th}\n"
+        f"{appointment_notice}"
     )
 
 
@@ -2123,6 +2197,8 @@ async def try_update_task_from_status(group_id: str, user_id: str | None, sender
             forced_cfg = get_forced_followup_config(db, target)
             if new_status == "COMPLETED":
                 target.next_reminder_at = None
+            elif ambiguous_checkpoints(text):
+                pass  # Preserve the existing queue until the checkpoint is clarified.
             elif commitment_at:
                 # A human supplied a concrete future checkpoint (e.g. "นัดเซ็นวันศุกร์").
                 # Respect that checkpoint even when forced follow-up is enabled.

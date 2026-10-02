@@ -49,3 +49,11 @@ def extract_facts(text):
     # A component shipment is not a whole-project delivery commitment.
     facts['date_scope'] = 'component' if re.search(r'UPS\s*จัดส่งวันที่', value, re.I) else 'update'
     return facts
+
+
+def ambiguous_checkpoints(text):
+    """Two distinct future actions, one date and one vague week: do not merge."""
+    x = normalize_language(text)
+    return bool(re.search(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', x)
+                and re.search(r'(?:อาทิตย์|สัปดาห์)หน้า', x)
+                and re.search(r'(?:ไป|ลง|เข้า)(?:ดำเนินการ|พื้นที่|ติดตั้ง|ทำ)', x))

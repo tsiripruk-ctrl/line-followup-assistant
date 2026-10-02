@@ -198,6 +198,9 @@ def extract_followup_commitment_at(text: str | None, *, now_local: datetime | No
     """
     if not text:
         return None
+    from progress_facts import ambiguous_checkpoints
+    if ambiguous_checkpoints(text):
+        return None
     if extract_facts(text)['date_scope'] == 'component':
         return None
     x = " ".join(normalize_month_date(normalize_language(str(text))).replace("\n", " ").split())
